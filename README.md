@@ -2,6 +2,8 @@
 
 A compact local desktop task list, built in milestones. See [PLAN.md](PLAN.md) for the intended behavior and [PROGRESS.md](PROGRESS.md) for implementation status.
 
+Licensed under the [MIT License](LICENSE).
+
 The current checkpoint is a **local editing preview plus a Windows release build**. It can create, edit, reorder, move, and delete categories and tasks, and it supports concrete work dates plus independent deadlines. Changes autosave locally: the desktop build writes a versioned JSON file in its Tauri app-data directory, while the browser preview uses local storage. JSON export/import, explicit backup recovery, save retry, and native single-instance enforcement are implemented.
 
 ## Browser preview
