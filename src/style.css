@@ -75,12 +75,20 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
 .bottom-actions { padding-top: 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .add-category { padding: 8px 0; border: 0; background: transparent; color: var(--muted); font-size: 12px; }
 .add-category:hover { color: var(--text); }
-.status { width: 100%; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.status-bar { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; padding: 9px 0 7px; background: var(--bg); color: var(--muted); font-size: 12px; line-height: 1.5; }
+.status { min-width: 0; overflow-wrap: anywhere; }
 .status:empty { display: none; }
+.status-actions { display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
 .empty-notebook { padding: 38px 0 22px; color: var(--muted); font-size: 13px; }
 .preview-notice { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); font-size: 12px; line-height: 1.5; margin: 8px 0; }
 .preview-notice span { color: var(--muted); }
 .storage-actions { display: flex; gap: 6px; }
+.sync-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.conflict-list { display: grid; gap: 14px; }
+.conflict-item { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.conflict-item strong { font-size: 12px; font-weight: 600; }
+.conflict-values { display: grid; gap: 4px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.conflict-values p { font-size: 11px; }
 .editor { color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px; width: min(440px, calc(100% - 24px)); max-height: calc(100% - 24px); overflow-y: auto; box-shadow: var(--shadow); }
 .editor::backdrop { background: #0008; }
 .editor h2 { font-size: 18px; font-weight: 600; margin: 0 0 24px; overflow-wrap: anywhere; letter-spacing: -.3px; }

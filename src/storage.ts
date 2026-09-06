@@ -167,3 +167,13 @@ export async function writeStoredDocument(document: StoredDocument): Promise<voi
     window.localStorage.setItem(BROWSER_STORAGE_KEY, raw);
   }
 }
+
+export async function readDocumentFile(path: string): Promise<string> {
+  if (!isTauriRuntime()) throw new Error('Native file reading is unavailable in the browser preview.');
+  return invoke<string>('read_document_file', { path });
+}
+
+export async function writeDocumentFile(path: string, raw: string): Promise<void> {
+  if (!isTauriRuntime()) throw new Error('Native file writing is unavailable in the browser preview.');
+  await invoke('write_document_file', { path, document: raw });
+}

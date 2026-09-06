@@ -4,7 +4,7 @@ A compact local desktop task list, built in milestones. See [PLAN.md](PLAN.md) f
 
 Licensed under the [MIT License](LICENSE).
 
-The current checkpoint is a **local editing preview plus a Windows release build**. It can create, edit, reorder, move, and delete categories and tasks, and it supports concrete work dates plus independent deadlines. Changes autosave locally: the desktop build writes a versioned JSON file in its Tauri app-data directory, while the browser preview uses local storage. JSON export/import, explicit backup recovery, save retry, and native single-instance enforcement are implemented.
+The current checkpoint is a **local editing preview plus a Windows release build**. It can create, edit, reorder, move, and delete categories and tasks, and it supports concrete work dates plus independent deadlines. Changes autosave locally: the desktop build writes a versioned JSON file in its Tauri app-data directory, while the browser preview uses local storage. JSON export/import, sync-snapshot recovery import, explicit backup recovery, save retry, native single-instance enforcement, session-based folder sync, startup fetch locking, delayed-update notices, close-time publication, stale-descendant protection, three-way merging, durable conflict choices, versioned checkpoint retention, and local folder-health reporting are implemented. Provider-specific two-device verification remains a separate release check.
 
 ## Browser preview
 
@@ -52,4 +52,5 @@ The current installer is an unsigned local release candidate. Windows may show t
 - `src/`: plain TypeScript/CSS interface and isolated sample fixtures.
 - `src-tauri/`: native window host and configuration.
 - `src/storage.ts`: versioned document validation, import parsing, backup handling, and browser/desktop storage routing.
+- `src/sync.ts`: local sync identity, immutable snapshot/manifest validation, pending publication state, and provider-folder paths.
 - `src-tauri/`: native window host plus atomic-ish app-data writes with a last-known-good backup.

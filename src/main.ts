@@ -1,7 +1,10 @@
 import './style.css';
+import { open as openNativeFile, save as saveNativeFile } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { compactDate, compactDateList, dateLabel, localToday, normalizeDates, parseDate, shiftDate, weekStart } from './dates';
 import type { Category, Notebook, Task } from './model';
-import { makeStoredDocument, parseStoredText, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
+import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
+import { applySyncConflict, ensureSyncDirectory, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, hasValidSnapshotParentRevisions, isSnapshotAncestor, listSyncFiles, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncManifest, parseSyncSnapshot, readOptionalSyncFile, removeSyncFile, saveSyncState, snapshotFingerprint, storedDocumentFromSyncSnapshot, syncManifestPath, syncRootPath, syncSnapshotPath, syncSnapshotsPath, SYNC_SNAPSHOT_RETENTION_LIMIT, writeSyncJson, type SyncConflict, type SyncManifest, type SyncSnapshot, type SyncState } from './sync';
 
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('App container is missing.');
@@ -16,6 +19,27 @@ let saveSequence = 0;
 let saveQueue: Promise<void> = Promise.resolve();
 let undoState: Notebook | null = null;
 let undoTimer: ReturnType<typeof setTimeout> | undefined;
+let syncState: SyncState = makeSyncState('pending');
+let syncReady = false;
+let syncLoadError: string | null = null;
+let syncQueue: Promise<void> = Promise.resolve();
+let syncDialogElement: HTMLDialogElement | null = null;
+let syncDeferred = false;
+type SessionPhase = 'loading' | 'fetching' | 'ready' | 'offline' | 'closing';
+interface AvailableUpdate {
+  snapshot: SyncSnapshot;
+  branchCount: number;
+}
+let sessionPhase: SessionPhase = 'loading';
+let sessionContentDirty = false;
+let statusMessage = '';
+let availableUpdate: AvailableUpdate | null = null;
+let ignoredUpdateIds = new Set<string>();
+let closeInProgress = false;
+let syncRetentionMessage = '';
+let sessionFetchInFlight: Promise<void> | null = null;
+const SYNC_CHECK_TIMEOUT_MS = 8_000;
+const CLOSE_OPERATION_TIMEOUT_MS = 12_000;
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text?: string) {
   const node = document.createElement(tag);
@@ -82,7 +106,7 @@ const headerActions = element('div', 'header-actions');
 const themeButton = iconButton('sun', 'Switch to light mode', () => {
   theme = theme === 'dark' ? 'light' : 'dark';
   applyTheme();
-  queueSave();
+  queueSave(false);
 });
 headerActions.append(themeButton);
 titleBar.append(headerActions);
@@ -105,10 +129,25 @@ recoverButton.hidden = true;
 retrySaveButton.hidden = true;
 noticeActions.append(recoverButton, retrySaveButton);
 notice.append(noticeTitle, noticeDetail, noticeActions);
+const statusBar = element('aside', 'status-bar');
+statusBar.setAttribute('aria-label', 'Activity status');
+const status = element('div', 'status');
+status.setAttribute('role', 'status');
+status.setAttribute('aria-live', 'polite');
+const statusActions = element('div', 'status-actions');
+const fetchUpdateButton = button('Fetch', () => void fetchAvailableUpdate(), 'quiet-button');
+const ignoreUpdateButton = button('Ignore', () => ignoreAvailableUpdate(), 'quiet-button');
+const retryFetchButton = button('Retry fetch', () => void retrySessionFetch(), 'quiet-button');
+fetchUpdateButton.hidden = true;
+ignoreUpdateButton.hidden = true;
+retryFetchButton.hidden = true;
+statusActions.append(fetchUpdateButton, ignoreUpdateButton, retryFetchButton);
+statusBar.append(status, statusActions);
 const list = element('div', 'categories');
 const addCategory = button('+ Add category', () => editCategory(), 'add-category');
 const exportButton = button('Export', exportCurrentDocument);
-const importButton = button('Import', () => importInput.click());
+const importButton = button('Import', () => void startImport());
+const syncButton = button('Sync', () => void openSyncDialog());
 const importInput = element('input');
 importInput.type = 'file';
 importInput.accept = 'application/json,.json';
@@ -118,23 +157,42 @@ importInput.addEventListener('change', () => {
   importInput.value = '';
   if (file) void inspectImport(file);
 });
-const status = element('div', 'status');
-status.setAttribute('role', 'status');
 const undoButton = button('Undo', () => {
-  if (!undoState) return;
+  if (!undoState || storageBlocked || closeInProgress || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
   notebook = undoState;
   clearUndo();
+  sessionContentDirty = true;
   render();
   queueSave();
-  status.textContent = 'Deletion undone.';
+  setStatusMessage('Deletion undone.');
   addCategory.focus();
 });
 undoButton.hidden = true;
 const actions = element('div', 'bottom-actions');
-headerActions.append(actionMenu('Backlogger options', [importButton, exportButton]));
-actions.append(addCategory, importInput, undoButton, status);
-main.append(header, notice, list, actions);
+headerActions.append(actionMenu('Backlogger options', [syncButton, importButton, exportButton]));
+actions.append(addCategory, importInput, undoButton);
+main.append(header, notice, statusBar, list, actions);
 root.append(main);
+
+function setStatusMessage(message: string) {
+  statusMessage = message;
+  renderStatusBar();
+}
+
+function renderStatusBar() {
+  const update = availableUpdate;
+  status.textContent = update
+    ? update.branchCount > 1 ? `${update.branchCount} shared updates available.` : 'Shared update available.'
+    : statusMessage;
+  fetchUpdateButton.hidden = !update;
+  ignoreUpdateButton.hidden = !update;
+  retryFetchButton.hidden = sessionPhase !== 'offline' || !syncState.lastError;
+  const editingReady = sessionPhase === 'ready' || sessionPhase === 'offline';
+  fetchUpdateButton.disabled = !editingReady;
+  ignoreUpdateButton.disabled = !editingReady;
+  retryFetchButton.disabled = sessionPhase === 'fetching' || sessionPhase === 'closing';
+  statusBar.hidden = !status.textContent && statusActions.querySelector('button:not([hidden])') === null;
+}
 
 function setStorageNotice(title: string, detail: string) {
   noticeTitle.textContent = title;
@@ -151,52 +209,1105 @@ function applyTheme() {
 function setView(mode: ViewMode) {
   viewMode = mode;
   render();
-  queueSave();
+  queueSave(false);
 }
 
 function taskCount(categories: Notebook['categories']): number {
   return categories.reduce((total, category) => total + category.tasks.length, 0);
 }
 
-function exportCurrentDocument() {
+async function exportCurrentDocument() {
   const stored = makeStoredDocument(notebook, revision, viewMode, theme);
-  const blob = new Blob([JSON.stringify(stored, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = element('a');
-  link.href = url;
-  link.download = `backlogger-${localToday()}.json`;
-  link.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  status.textContent = `Exported ${taskCount(stored.categories)} task(s) in ${stored.categories.length} categor${stored.categories.length === 1 ? 'y' : 'ies'}.`;
+  const raw = JSON.stringify(stored, null, 2);
+  try {
+    if (storageKind() === 'desktop') {
+      const path = await saveNativeFile({
+        title: 'Export Backlogger',
+        defaultPath: `backlogger-${localToday()}.json`,
+        filters: [{ name: 'Backlogger JSON', extensions: ['json'] }],
+      });
+      if (!path) return;
+      await writeDocumentFile(path, raw);
+    } else {
+      const blob = new Blob([raw], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = element('a');
+      link.href = url;
+      link.download = `backlogger-${localToday()}.json`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+    setStatusMessage(`Exported ${taskCount(stored.categories)} task(s) in ${stored.categories.length} categor${stored.categories.length === 1 ? 'y' : 'ies'}.`);
+  } catch (error) {
+    setStatusMessage(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
-function showImportDialog(fileName: string, imported: StoredDocument) {
+interface ImportPayload {
+  document: StoredDocument;
+  syncSnapshot: SyncSnapshot | null;
+}
+
+function parseImportPayload(raw: string): ImportPayload {
+  try {
+    return { document: parseStoredText(raw), syncSnapshot: null };
+  } catch (storedError) {
+    let value: unknown;
+    try {
+      value = JSON.parse(raw) as unknown;
+    } catch {
+      throw storedError;
+    }
+    try {
+      const snapshot = parseSyncSnapshot(value, 'Sync snapshot');
+      return { document: storedDocumentFromSyncSnapshot(snapshot, viewMode, theme), syncSnapshot: snapshot };
+    } catch {
+      throw storedError;
+    }
+  }
+}
+
+function showImportDialog(fileName: string, imported: StoredDocument, syncSnapshot: SyncSnapshot | null = null) {
   const editor = openDialog('Import backlog?');
   editor.body.append(
     element('p', '', `Import “${fileName}” and replace the current list?`),
     element('p', 'import-summary', `${imported.categories.length} categor${imported.categories.length === 1 ? 'y' : 'ies'} and ${taskCount(imported.categories)} task(s) were validated.`),
   );
-  editor.save.textContent = 'Import and save';
+  if (syncSnapshot) {
+    editor.body.append(element('p', 'advisory', `This is a Backlogger sync snapshot from ${formatSyncCheckTime(syncSnapshot.createdAt) || 'an earlier time'}. It was converted to a normal local import; device theme and view stay local.`));
+  }
+  editor.save.textContent = syncSnapshot ? 'Import snapshot and save' : 'Import and save';
   editor.form.addEventListener('submit', event => {
     event.preventDefault();
     commit(() => {
       notebook = { categories: imported.categories };
       viewMode = imported.preferences.viewMode;
       revision = Math.max(revision, imported.revision);
+      if (syncSnapshot && storageKind() === 'desktop' && syncState.status !== 'disconnected') {
+        syncState.currentSnapshotId = syncSnapshot.snapshotId;
+        syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, syncSnapshot.snapshotId])];
+        syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, syncSnapshot.snapshotId])];
+        syncState.pendingSnapshots = [];
+        syncState.mergeParentSnapshotIds = [];
+        syncState.conflicts = [];
+        syncState.lastError = null;
+      }
       storageBlocked = false;
       recoverButton.hidden = true;
-    }, `Imported ${fileName}.`, true);
+    }, syncSnapshot ? `Recovered ${fileName} as a local import.` : `Imported ${fileName}.`, true);
     editor.dialog.close();
   });
 }
 
 async function inspectImport(file: File) {
   try {
-    const imported = parseStoredText(await file.text());
-    showImportDialog(file.name, imported);
+    const imported = parseImportPayload(await file.text());
+    showImportDialog(file.name, imported.document, imported.syncSnapshot);
   } catch (error) {
-    status.textContent = `Import rejected: ${error instanceof Error ? error.message : String(error)}`;
+    setStatusMessage(`Import rejected: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function startImport() {
+  if (storageKind() !== 'desktop') {
+    importInput.click();
+    return;
+  }
+  try {
+    const path = await openNativeFile({
+      title: 'Import Backlogger',
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'Backlogger JSON', extensions: ['json'] }],
+    });
+    if (typeof path !== 'string') return;
+    const imported = parseImportPayload(await readDocumentFile(path));
+    showImportDialog(path.split(/[\\/]/).pop() ?? path, imported.document, imported.syncSnapshot);
+  } catch (error) {
+    setStatusMessage(`Import failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function syncCheckTime(): string {
+  return new Date().toISOString();
+}
+
+function formatSyncCheckTime(value: string | null): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function startSyncCheck(): string {
+  const checkedAt = syncCheckTime();
+  syncState.lastCheckedAt = checkedAt;
+  return checkedAt;
+}
+
+function finishSyncCheck(checkedAt: string) {
+  syncState.lastCheckedAt = checkedAt;
+  syncState.lastSuccessfulCheckAt = checkedAt;
+  syncState.lastError = null;
+}
+
+function enqueueSyncMutation<T>(action: () => Promise<T>): Promise<T> {
+  const next = syncQueue.catch(() => undefined).then(action);
+  syncQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function withSyncTimeout<T>(operation: Promise<T>): Promise<T> {
+  return withTimeout(operation, SYNC_CHECK_TIMEOUT_MS, 'The shared-folder check timed out.');
+}
+
+function syncStatusLabel(): string {
+  if (storageKind() !== 'desktop') return 'Desktop app only';
+  if (!syncReady) return syncLoadError ? 'Unavailable' : 'Loading…';
+  if (!syncState.folderPath || syncState.status === 'disconnected') return 'Not connected';
+  if (syncState.status === 'paused') return 'Paused';
+  if (syncState.conflicts.length) return 'Conflicts';
+  if (syncState.lastError) return 'Folder unavailable';
+  return 'Connected';
+}
+
+function syncStatusDetail(): string {
+  if (storageKind() !== 'desktop') return 'Folder sync is available in the installed desktop app.';
+  if (syncLoadError) return `Sync settings could not be loaded: ${syncLoadError}`;
+  if (!syncState.folderPath || syncState.status === 'disconnected') return 'Choose a folder managed by OneDrive or Google Drive for desktop.';
+  const pending = syncState.pendingSnapshots.length;
+  if (syncState.conflicts.length) return `${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`;
+  if (syncState.lastError) return `Folder check failed: ${syncState.lastError}`;
+  if (syncState.status === 'paused') return `${pending} pending snapshot${pending === 1 ? '' : 's'} saved locally.`;
+  const checked = formatSyncCheckTime(syncState.lastSuccessfulCheckAt);
+  const checkedDetail = checked ? ` Folder checked locally ${checked}.` : '';
+  const retentionDetail = syncRetentionMessage ? ` ${syncRetentionMessage}` : '';
+  return pending
+    ? `${pending} snapshot${pending === 1 ? '' : 's'} waiting for the folder.${checkedDetail}${retentionDetail}`
+    : `Local changes publish when you close the app.${checkedDetail}${retentionDetail} Provider upload/download is handled by its desktop app.`;
+}
+
+async function readSyncManifest(folderPath: string): Promise<SyncManifest | null> {
+  const raw = await readOptionalSyncFile(syncManifestPath(folderPath));
+  if (!raw) return null;
+  try {
+    return parseSyncManifest(JSON.parse(raw) as unknown);
+  } catch (error) {
+    throw new Error(`The selected folder has an invalid notebook manifest: ${errorText(error)}`);
+  }
+}
+
+async function writeSnapshotIfNeeded(folderPath: string, snapshot: SyncSnapshot): Promise<void> {
+  const path = syncSnapshotPath(folderPath, snapshot.snapshotId);
+  const serialized = JSON.stringify(snapshot, null, 2);
+  const existing = await readOptionalSyncFile(path);
+  if (existing !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(existing) as unknown;
+    } catch {
+      throw new Error(`Snapshot ${snapshot.snapshotId} is not valid JSON.`);
+    }
+    if (JSON.stringify(parsed) !== JSON.stringify(snapshot)) {
+      throw new Error(`Snapshot ${snapshot.snapshotId} already exists with different content.`);
+    }
+    return;
+  }
+  await writeSyncJson(path, JSON.parse(serialized) as unknown);
+}
+
+async function compactSyncHistory(folderPath: string): Promise<boolean> {
+  if (!syncState.notebookId || syncState.pendingSnapshots.length || syncState.conflicts.length) return false;
+  let createdSnapshots: SyncSnapshot[] = [];
+  let manifestPublished = false;
+  try {
+    const snapshots = await readSnapshotIndex(folderPath);
+    if (snapshots.size <= SYNC_SNAPSHOT_RETENTION_LIMIT) return false;
+    const originalManifest = await readSyncManifest(folderPath);
+    if (!originalManifest || originalManifest.notebookId !== syncState.notebookId) return false;
+    const currentId = syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
+    const leaves = snapshotLeaves(snapshots);
+    if (!currentId || leaves.length !== 1 || leaves[0].snapshotId !== currentId) return false;
+    const lineage: SyncSnapshot[] = [];
+    const visited = new Set<string>();
+    let cursor: SyncSnapshot | undefined = leaves[0];
+    while (cursor) {
+      if (visited.has(cursor.snapshotId) || cursor.parentSnapshotIds.length > 1) return false;
+      visited.add(cursor.snapshotId);
+      lineage.push(cursor);
+      const parentId: string | undefined = cursor.parentSnapshotIds[0];
+      cursor = parentId ? snapshots.get(parentId) : undefined;
+      if (parentId && !cursor) return false;
+    }
+    lineage.reverse();
+    if (lineage.length !== snapshots.size) return false;
+
+    const retainedDescendantCount = SYNC_SNAPSHOT_RETENTION_LIMIT - 1;
+    const boundaryIndex = lineage.length - retainedDescendantCount - 1;
+    if (boundaryIndex < 0) return false;
+    const boundary = lineage[boundaryIndex];
+    const checkpointDocument = storedDocumentFromSyncSnapshot(boundary, viewMode, theme);
+    const checkpoint = makeCheckpointSnapshot(checkpointDocument, syncState);
+    createdSnapshots = [checkpoint];
+    let parentId = checkpoint.snapshotId;
+    for (const original of lineage.slice(boundaryIndex + 1)) {
+      const rebased: SyncSnapshot = {
+        protocolVersion: original.protocolVersion,
+        type: 'snapshot',
+        snapshotId: crypto.randomUUID(),
+        notebookId: original.notebookId,
+        deviceId: original.deviceId,
+        parentSnapshotIds: [parentId],
+        createdAt: original.createdAt,
+        revision: original.revision,
+        categories: original.categories.map(category => ({
+          ...category,
+          tasks: category.tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })),
+        })),
+      };
+      createdSnapshots.push(rebased);
+      parentId = rebased.snapshotId;
+    }
+    for (const snapshot of createdSnapshots) await writeSnapshotIfNeeded(folderPath, snapshot);
+
+    const latestSnapshots = await readSnapshotIndex(folderPath);
+    const latestManifest = await readSyncManifest(folderPath);
+    const manifestsMatch = latestManifest
+      && JSON.stringify([...latestManifest.headSnapshotIds].sort()) === JSON.stringify([...originalManifest.headSnapshotIds].sort())
+      && JSON.stringify([...latestManifest.prunedSnapshotIds].sort()) === JSON.stringify([...originalManifest.prunedSnapshotIds].sort());
+    const unchangedHistory = latestManifest
+      && latestManifest.notebookId === syncState.notebookId
+      && manifestsMatch
+      && latestSnapshots.size === snapshots.size + createdSnapshots.length
+      && [...snapshots.keys()].every(snapshotId => latestSnapshots.has(snapshotId));
+    if (!unchangedHistory) {
+      for (const snapshot of createdSnapshots) await removeSyncFile(syncSnapshotPath(folderPath, snapshot.snapshotId));
+      return false;
+    }
+
+    const newHead = createdSnapshots.at(-1)!;
+    await writeSyncJson(syncManifestPath(folderPath), {
+      ...latestManifest,
+      headSnapshotIds: [newHead.snapshotId],
+      prunedSnapshotIds: [...new Set([...latestManifest.prunedSnapshotIds, ...snapshots.keys()])],
+    });
+    manifestPublished = true;
+    for (const snapshotId of snapshots.keys()) {
+      try {
+        await removeSyncFile(syncSnapshotPath(folderPath, snapshotId));
+      } catch (error) {
+        console.warn(`Could not remove old sync snapshot ${snapshotId}:`, error);
+      }
+    }
+    syncState.currentSnapshotId = newHead.snapshotId;
+    syncState.lastPublishedSnapshotId = newHead.snapshotId;
+    syncState.lastPublishedRevision = newHead.revision;
+    syncState.lastPublishedContentFingerprint = snapshotFingerprint(newHead);
+    syncState.lastPublishedAt = new Date().toISOString();
+    syncState.knownHeadSnapshotIds = [newHead.snapshotId];
+    syncState.processedSnapshotIds = createdSnapshots.map(snapshot => snapshot.snapshotId);
+    syncState.mergeParentSnapshotIds = [];
+    syncRetentionMessage = '';
+    await saveSyncState(syncState);
+    return true;
+  } catch (error) {
+    if (!manifestPublished) {
+      for (const snapshot of createdSnapshots) {
+        try { await removeSyncFile(syncSnapshotPath(folderPath, snapshot.snapshotId)); } catch { /* best-effort cleanup */ }
+      }
+    }
+    console.warn('Could not compact sync history:', error);
+    return false;
+  }
+}
+
+async function publishPendingSnapshots(): Promise<number> {
+  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId || syncState.conflicts.length) return 0;
+  const checkedAt = startSyncCheck();
+  const folderPath = syncState.folderPath;
+  await ensureSyncDirectory(syncRootPath(folderPath));
+  await ensureSyncDirectory(syncSnapshotsPath(folderPath));
+  let manifest = await readSyncManifest(folderPath);
+  if (!manifest) throw new Error('The connected folder is missing its notebook manifest.');
+  if (manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder belongs to a different notebook.');
+  let published = 0;
+  for (const snapshot of [...syncState.pendingSnapshots]) {
+    if (snapshot.notebookId !== syncState.notebookId) throw new Error('A pending snapshot belongs to a different notebook.');
+    const availableSnapshots = await readSnapshotIndex(folderPath, new Set(manifest.prunedSnapshotIds));
+    const missingParent = snapshot.parentSnapshotIds.find(parentId => !availableSnapshots.has(parentId));
+    if (missingParent) {
+      throw new Error(`The pending snapshot is based on history that is no longer available (${missingParent}). Fetch the shared checkpoint before publishing local work.`);
+    }
+    await writeSnapshotIfNeeded(folderPath, snapshot);
+    const latestManifest = await readSyncManifest(folderPath);
+    if (!latestManifest || latestManifest.notebookId !== syncState.notebookId) {
+      throw new Error('The notebook manifest changed while publishing.');
+    }
+    manifest = {
+      ...latestManifest,
+      headSnapshotIds: [...new Set([...latestManifest.headSnapshotIds, ...snapshot.parentSnapshotIds, snapshot.snapshotId])],
+    };
+    await writeSyncJson(syncManifestPath(folderPath), manifest);
+    syncState.pendingSnapshots = syncState.pendingSnapshots.filter(item => item.snapshotId !== snapshot.snapshotId);
+    syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds])];
+    syncState.lastPublishedSnapshotId = snapshot.snapshotId;
+    syncState.lastPublishedRevision = snapshot.revision;
+    syncState.lastPublishedContentFingerprint = snapshotFingerprint(snapshot);
+    syncState.lastPublishedAt = new Date().toISOString();
+    syncState.currentSnapshotId = snapshot.snapshotId;
+    syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, snapshot.snapshotId])];
+    syncState.mergeParentSnapshotIds = [];
+    finishSyncCheck(checkedAt);
+    await saveSyncState(syncState);
+    published += 1;
+  }
+  if (published === 0) {
+    finishSyncCheck(checkedAt);
+    await saveSyncState(syncState);
+  }
+  await compactSyncHistory(folderPath);
+  return published;
+}
+
+async function readSnapshotIndex(folderPath: string, excludedSnapshotIds = new Set<string>()): Promise<Map<string, SyncSnapshot>> {
+  const files = await listSyncFiles(syncSnapshotsPath(folderPath));
+  const snapshots = new Map<string, SyncSnapshot>();
+  for (const fileName of files.filter(name => name.toLowerCase().endsWith('.json'))) {
+    const path = syncSnapshotsPath(folderPath).replace(/[\\/]$/, '') + (syncSnapshotsPath(folderPath).includes('\\') ? '\\' : '/') + fileName;
+    const raw = await readOptionalSyncFile(path);
+    if (raw === null) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      continue;
+    }
+    let snapshot: SyncSnapshot;
+    try {
+      snapshot = parseSyncSnapshot(parsed, `Snapshot ${fileName}`);
+    } catch {
+      continue;
+    }
+    if (snapshot.notebookId !== syncState.notebookId) throw new Error(`Snapshot ${fileName} belongs to a different notebook.`);
+    const existing = snapshots.get(snapshot.snapshotId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(snapshot)) {
+      throw new Error(`Snapshot ${snapshot.snapshotId} has conflicting copies.`);
+    }
+    snapshots.set(snapshot.snapshotId, snapshot);
+  }
+  for (const [snapshotId, snapshot] of snapshots) {
+    if (!hasValidSnapshotParentRevisions(snapshot, snapshots)) snapshots.delete(snapshotId);
+  }
+  excludedSnapshotIds.forEach(snapshotId => snapshots.delete(snapshotId));
+  return snapshots;
+}
+
+function snapshotAncestry(snapshotId: string, snapshots: Map<string, SyncSnapshot>): string[] {
+  const result: string[] = [];
+  const visited = new Set<string>();
+  const pending = [snapshotId];
+  while (pending.length) {
+    const currentId = pending.pop()!;
+    if (visited.has(currentId)) continue;
+    visited.add(currentId);
+    const snapshot = snapshots.get(currentId);
+    if (!snapshot) continue;
+    result.push(currentId);
+    pending.push(...snapshot.parentSnapshotIds);
+  }
+  return result;
+}
+
+function snapshotLeaves(snapshots: Map<string, SyncSnapshot>): SyncSnapshot[] {
+  const parents = new Set<string>();
+  snapshots.forEach(snapshot => snapshot.parentSnapshotIds.forEach(parentId => parents.add(parentId)));
+  return [...snapshots.values()]
+    .filter(snapshot => !parents.has(snapshot.snapshotId) && hasCompleteSnapshotAncestry(snapshot, snapshots))
+    .sort((first, second) => first.createdAt.localeCompare(second.createdAt));
+}
+
+function taskEditorIsOpen(): boolean {
+  return [...document.querySelectorAll<HTMLDialogElement>('dialog[open]')].some(dialog => dialog !== syncDialogElement);
+}
+
+function acceptedSnapshotId(): string | null {
+  return syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
+}
+
+async function scanSharedUpdate(includeIgnored = false): Promise<AvailableUpdate | null> {
+  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return null;
+  const folderPath = syncState.folderPath;
+  const manifest = await readSyncManifest(folderPath);
+  if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder has no matching notebook manifest.');
+  const snapshots = await readSnapshotIndex(folderPath, new Set(manifest.prunedSnapshotIds));
+  updateRetentionStatus(snapshots);
+  const leaves = snapshotLeaves(snapshots);
+  syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds, ...leaves.map(snapshot => snapshot.snapshotId)])];
+  const currentId = acceptedSnapshotId();
+  const candidates = leaves.filter(snapshot => {
+    if (snapshot.snapshotId === currentId || syncState.processedSnapshotIds.includes(snapshot.snapshotId) || (!includeIgnored && ignoredUpdateIds.has(snapshot.snapshotId))) return false;
+    if (currentId && snapshots.has(currentId) && isSnapshotAncestor(snapshot.snapshotId, currentId, snapshots)) return false;
+    return true;
+  });
+  if (!candidates.length) return null;
+  candidates.sort((first, second) => first.createdAt.localeCompare(second.createdAt));
+  return { snapshot: candidates[candidates.length - 1], branchCount: candidates.length };
+}
+
+function updateRetentionStatus(snapshots: Map<string, SyncSnapshot>) {
+  if (snapshots.size <= SYNC_SNAPSHOT_RETENTION_LIMIT) {
+    syncRetentionMessage = '';
+    return;
+  }
+  const leaves = snapshotLeaves(snapshots);
+  if (syncState.conflicts.length) {
+    syncRetentionMessage = `History retention is waiting for ${syncState.conflicts.length} unresolved conflict${syncState.conflicts.length === 1 ? '' : 's'}.`;
+  } else if (syncState.pendingSnapshots.length) {
+    syncRetentionMessage = 'History retention is waiting for pending publication.';
+  } else if (leaves.length !== 1) {
+    syncRetentionMessage = 'History retention is waiting for shared branches to be resolved.';
+  } else {
+    syncRetentionMessage = 'History will compact to a checkpoint after the next successful close.';
+  }
+}
+
+async function checkForSharedUpdate(allowFetching = false) {
+  if (!syncReady || syncState.status !== 'connected' || sessionPhase === 'closing' || (sessionPhase === 'fetching' && !allowFetching)) return null;
+  const checkedAt = startSyncCheck();
+  try {
+    const update = await withSyncTimeout(scanSharedUpdate());
+    finishSyncCheck(checkedAt);
+    await saveSyncState(syncState);
+    if (update) {
+      availableUpdate = update;
+      setStatusMessage('');
+      render();
+    }
+    return update;
+  } catch (error) {
+    syncState.lastCheckedAt = checkedAt;
+    syncState.lastError = errorText(error);
+    sessionPhase = 'offline';
+    try { await saveSyncState(syncState); } catch { /* preserve the local backlog if metadata cannot be written */ }
+    setStatusMessage(`Could not check for shared updates: ${syncState.lastError}`);
+    render();
+    return null;
+  }
+}
+
+async function applyFetchedSnapshot(snapshot: SyncSnapshot): Promise<void> {
+  const localDocument = makeStoredDocument(notebook, revision, viewMode, theme);
+  await writeStoredDocument(localDocument);
+  notebook = notebookFromSnapshot(snapshot);
+  revision = Math.max(revision, snapshot.revision);
+  syncState.currentSnapshotId = snapshot.snapshotId;
+  syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, snapshot.snapshotId])];
+  syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, snapshot.snapshotId])];
+  syncState.pendingSnapshots = [];
+  syncState.mergeParentSnapshotIds = [];
+  syncState.conflicts = [];
+  syncState.lastPublishedContentFingerprint = snapshotFingerprint(snapshot);
+  syncState.lastError = null;
+  sessionContentDirty = false;
+  availableUpdate = null;
+  queueSave(false);
+  await saveQueue;
+  await saveSyncState(syncState);
+}
+
+async function runSessionFetch() {
+  if (!syncReady || syncState.status !== 'connected') {
+    sessionPhase = 'ready';
+    render();
+    return;
+  }
+  sessionPhase = 'fetching';
+  setStatusMessage('Fetching shared updates…');
+  render();
+  const update = await checkForSharedUpdate(true);
+  if (!update) {
+    sessionPhase = syncState.lastError ? 'offline' : 'ready';
+    setStatusMessage(syncState.lastError ? 'Working offline. Shared updates will be checked again.' : 'Ready.');
+    render();
+    return;
+  }
+  if (update.branchCount > 1 || sessionContentDirty || syncState.pendingSnapshots.length) {
+    sessionPhase = 'ready';
+    setStatusMessage('A shared update is available.');
+    render();
+    return;
+  }
+  try {
+    await applyFetchedSnapshot(update.snapshot);
+    sessionPhase = 'ready';
+    setStatusMessage(`Fetched the shared backlog from ${formatSyncCheckTime(update.snapshot.createdAt) || 'another device'}.`);
+    render();
+  } catch (error) {
+    sessionPhase = 'offline';
+    syncState.lastError = errorText(error);
+    try { await saveSyncState(syncState); } catch { /* local data remains available */ }
+    setStatusMessage(`Could not fetch the shared backlog: ${syncState.lastError}`);
+    render();
+  }
+}
+
+function startSessionFetch(): Promise<void> {
+  if (sessionFetchInFlight) return sessionFetchInFlight;
+  const operation = runSessionFetch();
+  let tracked: Promise<void>;
+  tracked = operation.finally(() => {
+    if (sessionFetchInFlight === tracked) sessionFetchInFlight = null;
+  });
+  sessionFetchInFlight = tracked;
+  return tracked;
+}
+
+async function retrySessionFetch() {
+  syncState.lastError = null;
+  await startSessionFetch();
+}
+
+function askFetchConfirmation(): Promise<boolean> {
+  return new Promise(resolve => {
+    const editor = openDialog('Replace local backlog?');
+    editor.body.append(
+      element('p', '', 'Fetching this shared version will replace the visible list with the validated shared snapshot.'),
+      element('p', 'advisory', 'Your current local backlog will be backed up first. Continue only if you want to discard the local edits from this session.'),
+    );
+    editor.save.textContent = 'Fetch and replace';
+    let settled = false;
+    const finish = (choice: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(choice);
+    };
+    editor.dialog.addEventListener('close', () => finish(false), { once: true });
+    editor.form.addEventListener('submit', event => {
+      event.preventDefault();
+      finish(true);
+      editor.dialog.close();
+    });
+  });
+}
+
+async function fetchAvailableUpdate() {
+  if (!availableUpdate || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
+  const requestedId = availableUpdate.snapshot.snapshotId;
+  sessionPhase = 'fetching';
+  setStatusMessage('Fetching shared update…');
+  render();
+  const fresh = await checkForSharedUpdate(true);
+  if (!fresh || fresh.snapshot.snapshotId !== requestedId) {
+    if (!fresh) availableUpdate = null;
+    sessionPhase = syncState.lastError ? 'offline' : 'ready';
+    setStatusMessage(syncState.lastError ? 'Could not recheck the shared update. Retry when the folder is available.' : fresh ? 'A newer shared update is available.' : 'That shared update is no longer available.');
+    render();
+    return;
+  }
+  if (fresh.branchCount > 1) {
+    sessionPhase = 'ready';
+    setStatusMessage('Multiple shared branches are available. Open Sync to resolve them explicitly.');
+    render();
+    return;
+  }
+  if (sessionContentDirty && !(await askFetchConfirmation())) {
+    sessionPhase = 'ready';
+    availableUpdate = fresh;
+    setStatusMessage('Fetch canceled; local edits were kept.');
+    render();
+    return;
+  }
+  try {
+    await applyFetchedSnapshot(fresh.snapshot);
+    sessionPhase = 'ready';
+    setStatusMessage('Shared update fetched.');
+    render();
+  } catch (error) {
+    sessionPhase = 'offline';
+    syncState.lastError = errorText(error);
+    try { await saveSyncState(syncState); } catch { /* local data remains available */ }
+    setStatusMessage(`Could not fetch the shared update: ${syncState.lastError}`);
+    render();
+  }
+}
+
+function ignoreAvailableUpdate() {
+  if (!availableUpdate) return;
+  ignoredUpdateIds.add(availableUpdate.snapshot.snapshotId);
+  availableUpdate = null;
+  setStatusMessage('Shared update ignored for this session.');
+  render();
+}
+
+async function reconcileSync(): Promise<{ applied: number; conflicts: number }> {
+  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return { applied: 0, conflicts: 0 };
+  if (taskEditorIsOpen()) {
+    syncDeferred = true;
+    return { applied: 0, conflicts: syncState.conflicts.length };
+  }
+  if (syncState.conflicts.length) return { applied: 0, conflicts: syncState.conflicts.length };
+  const folderPath = syncState.folderPath;
+  const manifest = await readSyncManifest(folderPath);
+  if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder has no matching notebook manifest.');
+  const snapshots = await readSnapshotIndex(folderPath, new Set(manifest.prunedSnapshotIds));
+  syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds, ...snapshotLeaves(snapshots).map(snapshot => snapshot.snapshotId)])];
+  const currentId = syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
+  const completeLeaves = snapshotLeaves(snapshots);
+  if (!currentId || !snapshots.has(currentId)) {
+    if (!syncState.pendingSnapshots.length) {
+      const fallback = completeLeaves.at(-1);
+      if (fallback) {
+        notebook = notebookFromSnapshot(fallback);
+        revision = Math.max(revision, fallback.revision);
+        syncState.currentSnapshotId = fallback.snapshotId;
+        syncState.lastPublishedContentFingerprint = snapshotFingerprint(fallback);
+        syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(fallback.snapshotId, snapshots)])];
+        syncState.lastError = null;
+        await saveSyncState(syncState);
+        queueSave(false);
+        render();
+        setStatusMessage('Recovered the latest validated shared snapshot.');
+        return { applied: 1, conflicts: 0 };
+      }
+    }
+    await saveSyncState(syncState);
+    return { applied: 0, conflicts: 0 };
+  }
+  const leaves = completeLeaves.filter(snapshot => snapshot.snapshotId !== currentId);
+  let workingNotebook = notebook;
+  let workingId = currentId;
+  let applied = 0;
+  for (const candidate of leaves) {
+    if (syncState.processedSnapshotIds.includes(candidate.snapshotId)) continue;
+    if (isSnapshotAncestor(candidate.snapshotId, workingId, snapshots)) {
+      syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(candidate.snapshotId, snapshots)])];
+      continue;
+    }
+    if (isSnapshotAncestor(workingId, candidate.snapshotId, snapshots)) {
+      if (syncState.pendingSnapshots.length) {
+        const baseSnapshot = snapshots.get(workingId);
+        const merge = mergeNotebooks(
+          baseSnapshot ? { categories: baseSnapshot.categories } : null,
+          workingNotebook,
+          { categories: candidate.categories },
+          workingId,
+          candidate.snapshotId,
+        );
+        workingNotebook = merge.notebook;
+        syncState.pendingSnapshots = [];
+        syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(candidate.snapshotId, snapshots)])];
+        syncState.mergeParentSnapshotIds = [...new Set([...syncState.mergeParentSnapshotIds, workingId, candidate.snapshotId])];
+        if (merge.conflicts.length) {
+          syncState.conflicts = merge.conflicts;
+          syncState.lastError = null;
+          syncState.currentSnapshotId = null;
+          notebook = workingNotebook;
+          revision = Math.max(revision, candidate.revision);
+          await saveSyncState(syncState);
+          queueSave(false);
+          render();
+          setStatusMessage(`${merge.conflicts.length} sync conflict${merge.conflicts.length === 1 ? '' : 's'} need attention.`);
+          return { applied, conflicts: merge.conflicts.length };
+        }
+        syncState.currentSnapshotId = null;
+        applied += 1;
+        break;
+      }
+      workingNotebook = { categories: candidate.categories.map(category => ({ ...category, tasks: category.tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })) })) };
+      workingId = candidate.snapshotId;
+      syncState.currentSnapshotId = candidate.snapshotId;
+      syncState.lastPublishedContentFingerprint = snapshotFingerprint(candidate);
+      syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(candidate.snapshotId, snapshots)])];
+      applied += 1;
+      continue;
+    }
+    const baseId = findCommonSnapshotAncestor(workingId, candidate.snapshotId, snapshots);
+    const base = baseId ? snapshots.get(baseId) : null;
+    const merge = mergeNotebooks(
+      base ? { categories: base.categories } : null,
+      workingNotebook,
+      { categories: candidate.categories },
+      workingId,
+      candidate.snapshotId,
+    );
+    workingNotebook = merge.notebook;
+    if (syncState.pendingSnapshots.length) syncState.pendingSnapshots = [];
+    syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(candidate.snapshotId, snapshots)])];
+    syncState.mergeParentSnapshotIds = [...new Set([...syncState.mergeParentSnapshotIds, workingId, candidate.snapshotId])];
+    if (merge.conflicts.length) {
+      syncState.conflicts = merge.conflicts;
+      syncState.lastError = null;
+      notebook = workingNotebook;
+      revision = Math.max(revision, candidate.revision);
+      await saveSyncState(syncState);
+      queueSave(false);
+      render();
+      setStatusMessage(`${merge.conflicts.length} sync conflict${merge.conflicts.length === 1 ? '' : 's'} need attention.`);
+      return { applied, conflicts: merge.conflicts.length };
+    }
+    syncState.currentSnapshotId = null;
+    applied += 1;
+    break;
+  }
+  if (applied && !syncState.conflicts.length) {
+    notebook = workingNotebook;
+    revision = Math.max(revision, ...leaves.map(snapshot => snapshot.revision), revision);
+    if (syncState.currentSnapshotId) {
+      syncState.lastPublishedRevision = revision + 1;
+      await saveSyncState(syncState);
+      queueSave(false);
+      render();
+      setStatusMessage(`Applied ${applied} remote snapshot${applied === 1 ? '' : 's'}.`);
+    } else {
+      await saveSyncState(syncState);
+      queueSave(true);
+      render();
+      setStatusMessage('Merged a remote snapshot; publishing the merged backlog.');
+    }
+  } else {
+    await saveSyncState(syncState);
+  }
+  return { applied, conflicts: syncState.conflicts.length };
+}
+
+async function queueSyncSnapshot(document: StoredDocument): Promise<void> {
+  if (!syncReady || storageKind() !== 'desktop' || !syncState.notebookId || !syncState.folderPath || syncState.status === 'disconnected' || syncState.conflicts.length) return;
+  try {
+    await enqueueSyncMutation(async () => {
+      if (!syncState.notebookId || !syncState.folderPath || syncState.status === 'disconnected') return;
+      const previousPending = syncState.pendingSnapshots.at(-1)?.snapshotId;
+      const parents = syncState.mergeParentSnapshotIds.length
+        ? syncState.mergeParentSnapshotIds
+        : previousPending
+          ? [previousPending]
+          : syncState.currentSnapshotId
+            ? [syncState.currentSnapshotId]
+            : syncState.knownHeadSnapshotIds;
+      const snapshot = makeSyncSnapshot(document, syncState, parents);
+      syncState.pendingSnapshots.push(snapshot);
+      syncState.lastError = null;
+      await saveSyncState(syncState);
+    });
+  } catch (error) {
+    syncState.lastError = errorText(error);
+    try { await saveSyncState(syncState); } catch { /* keep the local notebook usable if sync metadata is unavailable */ }
+    throw error;
+  }
+}
+
+async function connectSyncFolder(folderPath: string): Promise<boolean> {
+  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
+  const trimmedPath = folderPath.trim();
+  if (!trimmedPath) throw new Error('Choose a folder first.');
+  return enqueueSyncMutation(async () => {
+    const checkedAt = startSyncCheck();
+    await ensureSyncDirectory(syncRootPath(trimmedPath));
+    await ensureSyncDirectory(syncSnapshotsPath(trimmedPath));
+    const existingManifest = await readSyncManifest(trimmedPath);
+    if (existingManifest && syncState.notebookId && existingManifest.notebookId !== syncState.notebookId) {
+      throw new Error('This folder belongs to a different Backlogger notebook.');
+    }
+    const existing = Boolean(existingManifest);
+    if (!syncState.notebookId) syncState.notebookId = existingManifest?.notebookId ?? crypto.randomUUID();
+    const manifest = existingManifest ?? makeSyncManifest(syncState.notebookId, syncState.deviceId);
+    let sharedHead: SyncSnapshot | null = null;
+    let sharedSnapshots: Map<string, SyncSnapshot> | null = null;
+    if (existingManifest && !syncState.currentSnapshotId && notebook.categories.length === 0) {
+      sharedSnapshots = await readSnapshotIndex(trimmedPath, new Set(manifest.prunedSnapshotIds));
+      sharedHead = snapshotLeaves(sharedSnapshots).at(-1) ?? null;
+    }
+    syncState.folderPath = trimmedPath;
+    syncState.status = 'connected';
+    syncState.knownHeadSnapshotIds = [...new Set(manifest.headSnapshotIds)];
+    syncState.lastError = null;
+    await saveSyncState(syncState);
+    if (!existingManifest) await writeSyncJson(syncManifestPath(trimmedPath), manifest);
+    if (sharedHead) {
+      notebook = { categories: sharedHead.categories.map(category => ({ ...category, tasks: category.tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })) })) };
+      revision = Math.max(revision, sharedHead.revision);
+      syncState.currentSnapshotId = sharedHead.snapshotId;
+      syncState.lastPublishedRevision = revision + 1;
+      syncState.lastPublishedContentFingerprint = snapshotFingerprint(sharedHead);
+      syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(sharedHead.snapshotId, sharedSnapshots!)])];
+      syncState.pendingSnapshots = [];
+      finishSyncCheck(checkedAt);
+      await saveSyncState(syncState);
+      render();
+      queueSave(false);
+      return existing;
+    }
+    if (existingManifest && (syncState.currentSnapshotId || syncState.lastPublishedSnapshotId)) {
+      const result = await reconcileSync();
+      if (result.conflicts) return existing;
+    }
+    const currentDocument = makeStoredDocument(notebook, revision, viewMode, theme);
+    if (!syncState.pendingSnapshots.length && (!existingManifest || syncState.lastPublishedRevision !== currentDocument.revision)) {
+      const parents = syncState.mergeParentSnapshotIds.length
+        ? syncState.mergeParentSnapshotIds
+        : syncState.currentSnapshotId
+          ? [syncState.currentSnapshotId]
+          : syncState.lastPublishedSnapshotId
+            ? [syncState.lastPublishedSnapshotId]
+            : manifest.headSnapshotIds;
+      syncState.pendingSnapshots.push(makeSyncSnapshot(currentDocument, syncState, parents));
+      await saveSyncState(syncState);
+    }
+    try {
+      await publishPendingSnapshots();
+    } catch (error) {
+      syncState.lastError = errorText(error);
+      await saveSyncState(syncState);
+      throw error;
+    }
+    return existing;
+  });
+}
+
+async function disconnectSync(): Promise<void> {
+  await enqueueSyncMutation(async () => {
+    syncState.status = 'disconnected';
+    syncState.folderPath = null;
+    syncState.lastError = null;
+    await saveSyncState(syncState);
+  });
+}
+
+async function toggleSyncPause(): Promise<void> {
+  await enqueueSyncMutation(async () => {
+    if (!syncState.folderPath || syncState.status === 'disconnected') throw new Error('Connect a folder first.');
+    syncState.status = syncState.status === 'paused' ? 'connected' : 'paused';
+    syncState.lastError = null;
+    await saveSyncState(syncState);
+    if (syncState.status === 'connected') await checkForSharedUpdate();
+  });
+}
+
+async function syncNow(): Promise<number> {
+  if (syncState.status === 'paused') throw new Error('Resume folder checks before searching for updates.');
+  if (syncState.status === 'disconnected') throw new Error('Connect a folder first.');
+  const update = await checkForSharedUpdate();
+  return update ? 1 : 0;
+}
+
+function openSyncDialog() {
+  const editor = openDialog('Sync');
+  syncDialogElement = editor.dialog;
+  editor.dialog.addEventListener('close', () => {
+    if (syncDialogElement === editor.dialog) syncDialogElement = null;
+  }, { once: true });
+  let selectedFolder = syncState.folderPath;
+  let createNotebookConfirmed = false;
+  const intro = element('p', '', 'Use a local folder already synchronized by OneDrive or Google Drive for desktop.');
+  const statusLine = element('p', 'import-summary');
+  const folderLine = element('p', 'import-summary');
+  const controls = element('div', 'sync-controls');
+  const choose = button('Choose folder', () => void chooseFolder());
+  const syncNowButton = button('Check for updates', () => void runSyncNow());
+  const pauseButton = button(syncState.status === 'paused' ? 'Resume' : 'Pause', () => void togglePause());
+  const disconnectButton = button('Disconnect', () => void disconnect());
+  const resolveButton = button('Resolve conflicts', () => void resolveConflicts());
+  controls.append(choose, syncNowButton, pauseButton, disconnectButton, resolveButton);
+  editor.body.append(intro, statusLine, folderLine, controls);
+  editor.save.textContent = syncState.folderPath && syncState.status !== 'disconnected' ? 'Done' : 'Connect';
+
+  function refresh() {
+    statusLine.textContent = `${syncStatusLabel()} · ${syncStatusDetail()}`;
+    folderLine.textContent = selectedFolder ? `Folder: ${selectedFolder}` : 'No folder selected.';
+    const connected = syncState.status !== 'disconnected' && Boolean(syncState.folderPath);
+    choose.disabled = storageKind() !== 'desktop' || !syncReady;
+    syncNowButton.disabled = !connected || syncState.status === 'paused';
+    pauseButton.disabled = !connected;
+    disconnectButton.disabled = !connected;
+    resolveButton.disabled = !syncState.conflicts.length;
+    pauseButton.textContent = syncState.status === 'paused' ? 'Resume' : 'Pause';
+    editor.save.textContent = connected && selectedFolder === syncState.folderPath ? 'Done' : 'Connect';
+    editor.save.disabled = storageKind() !== 'desktop' || !syncReady;
+  }
+
+  async function chooseFolder() {
+    try {
+      const path = await openNativeFile({ title: 'Choose Backlogger sync folder', directory: true, multiple: false });
+      if (typeof path === 'string') {
+        selectedFolder = path;
+        createNotebookConfirmed = false;
+        refresh();
+      }
+    } catch (error) {
+      editor.error.textContent = `Folder picker failed: ${errorText(error)}`;
+    }
+  }
+
+  async function connect() {
+    if (!selectedFolder) { editor.error.textContent = 'Choose a folder first.'; return; }
+    editor.error.textContent = '';
+    editor.save.disabled = true;
+    try {
+      const existingManifest = await readSyncManifest(selectedFolder);
+      if (!existingManifest && !createNotebookConfirmed) {
+        createNotebookConfirmed = true;
+        editor.error.textContent = 'No shared notebook was found. Press Connect again to create a new notebook here, or cancel and wait for the provider to finish downloading.';
+        refresh();
+        return;
+      }
+      const joinedExisting = await connectSyncFolder(selectedFolder);
+      setStatusMessage(joinedExisting
+        ? 'Connected. Local snapshots are publishing; checking the shared notebook for remote changes.'
+        : 'Connected. The initial snapshot was published.');
+      refresh();
+      editor.dialog.close();
+      void attemptPendingSync();
+    } catch (error) {
+      syncState.lastCheckedAt = syncState.lastCheckedAt ?? syncCheckTime();
+      syncState.lastError = errorText(error);
+      try { await saveSyncState(syncState); } catch { /* keep the connection error visible in the dialog */ }
+      editor.error.textContent = `Could not connect: ${errorText(error)}`;
+      refresh();
+    }
+  }
+
+  async function runSyncNow() {
+    editor.error.textContent = '';
+    try {
+      const count = await syncNow();
+      setStatusMessage(syncState.conflicts.length
+        ? `${syncState.conflicts.length} sync conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`
+        : count ? 'Shared update available.' : 'No shared update found.');
+      refresh();
+    } catch (error) {
+      editor.error.textContent = `Sync failed: ${errorText(error)}`;
+      refresh();
+    }
+  }
+
+  async function resolveConflicts() {
+    editor.dialog.close();
+    openConflictDialog();
+  }
+
+  async function togglePause() {
+    editor.error.textContent = '';
+    try {
+      await toggleSyncPause();
+      setStatusMessage(syncState.status === 'paused' ? 'Folder sync paused; local saves continue.' : 'Folder sync resumed.');
+      refresh();
+    } catch (error) {
+      editor.error.textContent = `Could not change sync state: ${errorText(error)}`;
+      refresh();
+    }
+  }
+
+  async function disconnect() {
+    editor.error.textContent = '';
+    try {
+      await disconnectSync();
+      selectedFolder = null;
+      setStatusMessage('Disconnected. Local tasks and pending snapshots were kept.');
+      refresh();
+    } catch (error) {
+      editor.error.textContent = `Could not disconnect: ${errorText(error)}`;
+      refresh();
+    }
+  }
+
+  editor.form.addEventListener('submit', event => {
+    event.preventDefault();
+    if (syncState.status !== 'disconnected' && selectedFolder === syncState.folderPath) {
+      editor.dialog.close();
+      return;
+    }
+    void connect();
+  });
+  refresh();
+}
+
+function conflictValueLabel(value: unknown): string {
+  if (value === null || value === undefined) return 'Deleted';
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  return serialized.length > 220 ? `${serialized.slice(0, 217)}…` : serialized;
+}
+
+function conflictLabel(conflict: SyncConflict): string {
+  if (conflict.target === 'category-order') return 'Category order changed on both devices.';
+  if (conflict.target === 'task-order') return 'Task order changed on both devices.';
+  const record = conflict.target === 'task' ? `Task ${conflict.recordId}` : `Category ${conflict.recordId}`;
+  return conflict.field === 'record' ? `${record} was deleted on one device and edited on the other.` : `${record} has two values for ${conflict.field}.`;
+}
+
+function openConflictDialog() {
+  if (!syncState.conflicts.length) return;
+  const editor = openDialog(`Resolve ${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'}`);
+  editor.save.textContent = 'Close';
+  const list = element('div', 'conflict-list');
+  editor.body.append(element('p', '', 'Choose which value should become the shared value. Each choice is saved locally; the final choice publishes a merge snapshot.'), list);
+
+  function draw() {
+    list.replaceChildren();
+    syncState.conflicts.forEach(conflict => {
+      const item = element('section', 'conflict-item');
+      item.append(element('strong', '', conflictLabel(conflict)));
+      const values = element('div', 'conflict-values');
+      values.append(
+        element('p', '', `Mine: ${conflictValueLabel(conflict.localValue)}`),
+        element('p', '', `Other: ${conflictValueLabel(conflict.remoteValue)}`),
+      );
+      const actions = element('div', 'sync-controls');
+      actions.append(
+        button('Keep mine', () => void resolve(conflict, conflict.localValue)),
+        button('Use other', () => void resolve(conflict, conflict.remoteValue)),
+      );
+      item.append(values, actions);
+      list.append(item);
+    });
+  }
+
+  async function resolve(conflict: SyncConflict, value: unknown) {
+    notebook = applySyncConflict(notebook, conflict, value);
+    syncState.conflicts = syncState.conflicts.filter(item => item.conflictId !== conflict.conflictId);
+    syncState.lastError = null;
+    render();
+    try {
+      await saveSyncState(syncState);
+      queueSave(syncState.conflicts.length === 0);
+      if (syncState.conflicts.length === 0) {
+        setStatusMessage('Conflicts resolved; publishing the merge.');
+        editor.dialog.close();
+      } else {
+        setStatusMessage(`${syncState.conflicts.length} sync conflict${syncState.conflicts.length === 1 ? '' : 's'} remain.`);
+        draw();
+      }
+    } catch (error) {
+      editor.error.textContent = `Could not save the conflict choice: ${errorText(error)}`;
+      syncState.conflicts.push(conflict);
+      render();
+      draw();
+    }
+  }
+
+  editor.form.addEventListener('submit', event => {
+    event.preventDefault();
+    editor.dialog.close();
+  });
+  draw();
 }
 
 async function recoverBackup() {
@@ -204,7 +1315,7 @@ async function recoverBackup() {
   try {
     const backup = await readStoredBackup();
     if (!backup) {
-      status.textContent = 'No valid local backup was found.';
+      setStatusMessage('No valid local backup was found.');
       return;
     }
     const editor = openDialog('Recover backup?');
@@ -225,19 +1336,19 @@ async function recoverBackup() {
       editor.dialog.close();
     });
   } catch (error) {
-    status.textContent = `Backup recovery failed: ${error instanceof Error ? error.message : String(error)}`;
+    setStatusMessage(`Backup recovery failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     recoverButton.disabled = false;
   }
 }
 
-function queueSave() {
+function queueSave(publishSync = false) {
   if (!storageReady) return;
   hasUnsavedChanges = true;
   retrySaveButton.hidden = true;
   if (storageBlocked) {
     setStorageNotice('Saved data needs attention', 'Your edits remain open but are not being overwritten.');
-    status.textContent = 'Saving is paused because the existing local data could not be validated.';
+    setStatusMessage('Saving is paused because the existing local data could not be validated.');
     return;
   }
   const documentToSave = makeStoredDocument(notebook, ++revision, viewMode, theme);
@@ -246,7 +1357,8 @@ function queueSave() {
   saveQueue = saveQueue
     .catch(() => undefined)
     .then(() => writeStoredDocument(documentToSave))
-    .then(() => {
+    .then(async () => {
+      if (publishSync) await queueSyncSnapshot(documentToSave);
       if (sequence === saveSequence) {
         hasUnsavedChanges = false;
         retrySaveButton.hidden = true;
@@ -257,7 +1369,7 @@ function queueSave() {
       if (sequence === saveSequence) {
         retrySaveButton.hidden = false;
         setStorageNotice('Save failed', 'Your changes remain open. Retry the local save when ready.');
-        status.textContent = `Could not save local data: ${error instanceof Error ? error.message : String(error)}`;
+        setStatusMessage(`Could not save local data: ${error instanceof Error ? error.message : String(error)}`);
       }
     });
 }
@@ -269,18 +1381,20 @@ function clearUndo() {
 }
 
 function commit(change: () => void, message: string, canUndo = false) {
+  if (storageBlocked || closeInProgress || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
   clearUndo();
   if (canUndo) undoState = structuredClone(notebook);
   change();
+  sessionContentDirty = true;
   render();
-  queueSave();
-  status.textContent = canUndo ? message : '';
+  queueSave(false);
+  setStatusMessage(canUndo ? message : '');
   undoButton.hidden = !canUndo;
   if (canUndo) {
     undoTimer = setTimeout(() => {
       const focused = document.activeElement === undoButton;
       clearUndo();
-      status.textContent = '';
+      setStatusMessage('');
       if (focused) addCategory.focus();
     }, 15_000);
     undoButton.focus();
@@ -312,6 +1426,10 @@ function openDialog(title: string) {
     else if (previousFocus?.isConnected) previousFocus.focus();
     else if (undoState) undoButton.focus();
     else addCategory.focus();
+    if (syncDeferred) {
+      syncDeferred = false;
+      void attemptPendingSync();
+    }
   }, { once: true });
   dialog.showModal();
   return { dialog, form, body, error, save };
@@ -486,14 +1604,18 @@ function editTask(category: Category, task?: Task) {
 function render() {
   list.replaceChildren();
   const today = localToday();
+  const editingReady = storageReady && !storageBlocked && !closeInProgress && (sessionPhase === 'ready' || sessionPhase === 'offline');
   allView.setAttribute('aria-pressed', String(viewMode === 'all'));
   todayView.setAttribute('aria-pressed', String(viewMode === 'today'));
   todayView.textContent = 'Today';
   todayView.title = dateLabel(today);
-  addCategory.disabled = !storageReady;
-  themeButton.disabled = !storageReady;
-  allView.disabled = todayView.disabled = !storageReady;
-  importButton.disabled = exportButton.disabled = !storageReady;
+  addCategory.disabled = !editingReady;
+  themeButton.disabled = !editingReady;
+  allView.disabled = todayView.disabled = !editingReady;
+  importButton.disabled = exportButton.disabled = !editingReady;
+  syncButton.disabled = !storageReady || closeInProgress || (storageKind() === 'desktop' && !syncReady);
+  undoButton.disabled = !editingReady;
+  renderStatusBar();
   if (notebook.categories.length === 0) {
     const empty = element('section', 'empty-notebook');
     empty.append(element('p', '', storageReady ? 'No categories yet.' : 'Loading…'));
@@ -512,15 +1634,18 @@ function render() {
     const controls = element('div', 'row-actions');
     const categoryIndex = notebook.categories.indexOf(category);
     const upCategory = button('Move up', () => moveCategory(category, -1));
-    upCategory.disabled = categoryIndex === 0;
+    upCategory.disabled = !editingReady || categoryIndex === 0;
     upCategory.setAttribute('aria-label', `Move ${category.name} up`);
     const downCategory = button('Move down', () => moveCategory(category, 1));
-    downCategory.disabled = categoryIndex === notebook.categories.length - 1;
+    downCategory.disabled = !editingReady || categoryIndex === notebook.categories.length - 1;
     downCategory.setAttribute('aria-label', `Move ${category.name} down`);
     const add = iconButton('plus', `Add task to ${category.name}`, () => editTask(category));
+    add.disabled = !editingReady;
     const rename = button('Rename', () => editCategory(category));
+    rename.disabled = !editingReady;
     rename.setAttribute('aria-label', `Rename ${category.name}`);
     const remove = button('Delete', () => removeCategory(category));
+    remove.disabled = !editingReady;
     remove.setAttribute('aria-label', `Delete category ${category.name}`);
     remove.classList.add('destructive');
     controls.append(add, actionMenu(`Options for ${category.name}`, [rename, upCategory, downCategory, remove]));
@@ -532,6 +1657,7 @@ function render() {
       const row = element('li', 'task');
       const scheduledToday = isScheduledToday(task, today);
       const edit = button(task.title, () => editTask(category, task), `task-title task-edit${scheduledToday ? ' scheduled-today' : ''}`);
+      edit.disabled = !editingReady;
       edit.setAttribute('aria-label', `Edit task ${task.title}${scheduledToday ? '; Scheduled today' : ''}`);
       const content = element('div', 'task-content');
       content.append(edit);
@@ -550,15 +1676,18 @@ function render() {
       const remove = button('Delete', () => commit(() => {
         category.tasks = category.tasks.filter(item => item.id !== task.id);
       }, `Deleted ${task.title}.`, true), 'quiet-button task-delete');
+      remove.disabled = !editingReady;
       remove.setAttribute('aria-label', `Delete task ${task.title}`);
       const upTask = button('Move up', () => moveTask(category, task, -1));
-      upTask.disabled = taskIndex === 0;
+      upTask.disabled = !editingReady || taskIndex === 0;
       upTask.setAttribute('aria-label', `Move task ${task.title} up`);
       const downTask = button('Move down', () => moveTask(category, task, 1));
-      downTask.disabled = taskIndex === category.tasks.length - 1;
+      downTask.disabled = !editingReady || taskIndex === category.tasks.length - 1;
       downTask.setAttribute('aria-label', `Move task ${task.title} down`);
       remove.className = 'quiet-button destructive';
-      row.append(content, actionMenu(`Options for ${task.title}`, [button('Edit', () => editTask(category, task)), upTask, downTask, remove]));
+      const taskEditAction = button('Edit', () => editTask(category, task));
+      taskEditAction.disabled = !editingReady;
+      row.append(content, actionMenu(`Options for ${task.title}`, [taskEditAction, upTask, downTask, remove]));
       tasks.append(row);
     });
     section.append(tasks);
@@ -569,6 +1698,207 @@ function render() {
     empty.append(element('p', '', 'Nothing scheduled today.'));
     list.append(empty);
   }
+}
+
+type CloseSyncChoice = 'fetch' | 'keep' | 'cancel';
+
+function askCloseSyncChoice(update: AvailableUpdate): Promise<CloseSyncChoice> {
+  return new Promise(resolve => {
+    const editor = openDialog('Shared update available');
+    const cancel = editor.form.querySelector<HTMLButtonElement>('button:not([type="submit"])');
+    if (cancel) cancel.textContent = 'Cancel close';
+    editor.save.textContent = 'Keep mine and close';
+    editor.body.append(
+      element('p', '', update.branchCount > 1
+        ? `${update.branchCount} shared branches are available while this device has local changes.`
+        : 'Another device changed the shared backlog while this device has local changes.'),
+      element('p', 'advisory', 'Fetch shared version backs up this device and replaces the visible list. Keep mine publishes this device as an explicit new branch.'),
+    );
+    const fetchButton = button('Fetch shared version', () => {
+      resolve('fetch');
+      editor.dialog.close();
+    }, 'quiet-button');
+    fetchButton.disabled = update.branchCount > 1;
+    if (update.branchCount > 1) {
+      editor.body.append(element('p', 'advisory', 'Fetch is unavailable while multiple shared branches exist. Use Sync to resolve the branches, or keep this device’s version as an explicit branch.'));
+    }
+    editor.body.append(fetchButton);
+    let settled = false;
+    const finish = (choice: CloseSyncChoice) => {
+      if (settled) return;
+      settled = true;
+      resolve(choice);
+    };
+    editor.dialog.addEventListener('close', () => finish('cancel'), { once: true });
+    editor.form.addEventListener('submit', event => {
+      event.preventDefault();
+      finish('keep');
+      editor.dialog.close();
+    });
+  });
+}
+
+function askCloseAfterSaveTimeout(): Promise<boolean> {
+  return new Promise(resolve => {
+    const editor = openDialog('Save is taking too long');
+    const cancel = editor.form.querySelector<HTMLButtonElement>('button:not([type="submit"])');
+    if (cancel) cancel.textContent = 'Keep app open';
+    editor.save.textContent = 'Close with last saved copy';
+    editor.body.append(
+      element('p', '', 'The local save did not finish in time.'),
+      element('p', 'advisory', 'Keep the app open to retry. Closing now preserves the last completed local copy; any unsaved edit may need to be entered again.'),
+    );
+    let settled = false;
+    const finish = (choice: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(choice);
+    };
+    editor.dialog.addEventListener('close', () => finish(false), { once: true });
+    editor.form.addEventListener('submit', event => {
+      event.preventDefault();
+      finish(true);
+      editor.dialog.close();
+    });
+  });
+}
+
+async function closeSession(): Promise<boolean> {
+  if (sessionFetchInFlight) {
+    try {
+      await withTimeout(sessionFetchInFlight, CLOSE_OPERATION_TIMEOUT_MS, 'The startup fetch did not finish before closing.');
+    } catch (error) {
+      sessionFetchInFlight = null;
+      setStatusMessage(`The startup fetch did not finish: ${errorText(error)}`);
+    }
+  }
+  try {
+    await withTimeout(saveQueue, CLOSE_OPERATION_TIMEOUT_MS, 'The local save did not finish before closing.');
+  } catch {
+    retrySaveButton.hidden = false;
+    setStatusMessage('The local save is taking too long.');
+    const closeWithLastSavedCopy = await askCloseAfterSaveTimeout();
+    if (!closeWithLastSavedCopy) {
+      closeInProgress = false;
+      sessionPhase = 'ready';
+      render();
+      return false;
+    }
+    return true;
+  }
+  if (hasUnsavedChanges || storageBlocked) {
+    setStatusMessage('Local changes are not saved. Retry the local save before closing.');
+    sessionPhase = 'ready';
+    render();
+    return false;
+  }
+  if (syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return true;
+
+  const localNeedsPublish = sessionContentDirty || syncState.pendingSnapshots.length > 0;
+  const checkedAt = startSyncCheck();
+  let update: AvailableUpdate | null = null;
+  try {
+    update = await withSyncTimeout(scanSharedUpdate(true));
+    finishSyncCheck(checkedAt);
+    await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.');
+  } catch (error) {
+    const checkError = errorText(error);
+    syncState.lastCheckedAt = checkedAt;
+    syncState.lastError = checkError;
+    try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve local data and pending work */ }
+    if (localNeedsPublish && !syncState.pendingSnapshots.length) {
+      try { await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme)); } catch { /* local fingerprint remains as a retry signal */ }
+    }
+    syncState.lastError = checkError;
+    try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve the local notebook if metadata cannot be written */ }
+    setStatusMessage(`Could not check the shared folder before closing: ${checkError}`);
+    sessionPhase = 'offline';
+    render();
+    return true;
+  }
+
+  let choice: CloseSyncChoice = 'keep';
+  if (update) {
+    choice = await askCloseSyncChoice(update);
+    if (choice === 'cancel') {
+      availableUpdate = update;
+      sessionPhase = 'ready';
+      closeInProgress = false;
+      render();
+      return false;
+    }
+    if (choice === 'fetch') {
+      try {
+        await withTimeout(applyFetchedSnapshot(update.snapshot), CLOSE_OPERATION_TIMEOUT_MS, 'Fetching before close timed out.');
+        sessionContentDirty = false;
+        return true;
+      } catch (error) {
+        syncState.lastError = errorText(error);
+        try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve local data */ }
+        setStatusMessage(`Could not fetch before closing: ${syncState.lastError}`);
+        sessionPhase = 'offline';
+        closeInProgress = false;
+        render();
+        return false;
+      }
+    }
+    const baseId = acceptedSnapshotId();
+    syncState.mergeParentSnapshotIds = [...new Set([...(baseId ? [baseId] : []), update.snapshot.snapshotId])];
+  }
+
+  if (localNeedsPublish || (update && choice === 'keep')) {
+    try {
+      syncState.pendingSnapshots = [];
+      await withTimeout(
+        queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme)),
+        CLOSE_OPERATION_TIMEOUT_MS,
+        'The local sync queue did not finish before closing.',
+      );
+      await withTimeout(
+        publishPendingSnapshots(),
+        CLOSE_OPERATION_TIMEOUT_MS,
+        'The shared-folder publication timed out.',
+      );
+      sessionContentDirty = false;
+      return true;
+    } catch (error) {
+      syncState.lastError = errorText(error);
+      try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve pending publication */ }
+      setStatusMessage(`Saved locally, but shared publication is pending: ${syncState.lastError}`);
+      sessionPhase = 'offline';
+      closeInProgress = false;
+      render();
+      return true;
+    }
+  }
+  return true;
+}
+
+async function installNativeCloseHandler() {
+  if (storageKind() !== 'desktop') return;
+  await getCurrentWindow().onCloseRequested(async event => {
+    if (closeInProgress) return;
+    event.preventDefault();
+    closeInProgress = true;
+    sessionPhase = 'closing';
+    setStatusMessage('Saving before closing…');
+    render();
+    let shouldClose = false;
+    try {
+      shouldClose = await closeSession();
+    } catch (error) {
+      closeInProgress = false;
+      sessionPhase = 'offline';
+      setStatusMessage(`Could not finish closing safely: ${errorText(error)}`);
+      render();
+    }
+    if (shouldClose) await getCurrentWindow().destroy();
+    else {
+      closeInProgress = false;
+      if (sessionPhase === 'closing') sessionPhase = 'ready';
+      render();
+    }
+  });
 }
 
 window.addEventListener('beforeunload', event => {
@@ -583,11 +1913,28 @@ const refreshDateState = () => {
     render();
   }
 };
-window.addEventListener('focus', refreshDateState);
+window.addEventListener('focus', () => {
+  refreshDateState();
+  void checkForSharedUpdate();
+});
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') refreshDateState();
+  if (document.visibilityState === 'visible') {
+    refreshDateState();
+    void checkForSharedUpdate();
+  }
 });
 setInterval(refreshDateState, 30_000);
+
+async function attemptPendingSync() {
+  if (taskEditorIsOpen()) {
+    syncDeferred = true;
+    return;
+  }
+  await checkForSharedUpdate();
+}
+
+setInterval(() => void attemptPendingSync(), 15_000);
+
 async function loadInitialData() {
   try {
     const stored = await readStoredDocument();
@@ -598,16 +1945,34 @@ async function loadInitialData() {
       applyTheme();
       revision = stored.revision;
     }
+    try {
+      syncState = await loadSyncState();
+      syncReady = true;
+      syncLoadError = null;
+    } catch (error) {
+      syncReady = false;
+      syncLoadError = errorText(error);
+    }
     storageReady = true;
+    const localContentFingerprint = notebookFingerprint(notebook);
+    const fingerprintChanged = syncState.lastPublishedContentFingerprint
+      ? syncState.lastPublishedContentFingerprint !== localContentFingerprint
+      : syncState.lastPublishedRevision !== null && revision > syncState.lastPublishedRevision;
+    sessionContentDirty = syncState.pendingSnapshots.length > 0 || (syncState.status === 'connected' && fingerprintChanged);
     recoverButton.hidden = true;
     setStorageNotice(stored ? 'Saved locally' : 'Local data ready', storageKind() === 'desktop' ? 'Your backlog is stored on this device.' : 'Preview data will be stored in this browser.');
+    sessionPhase = syncReady && syncState.status === 'connected' ? 'fetching' : syncLoadError ? 'offline' : 'ready';
     render();
+    if (syncReady && syncState.status === 'connected') void startSessionFetch();
+    else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : 'Ready.');
   } catch (error) {
     storageReady = true;
+    syncReady = false;
+    sessionPhase = 'offline';
     storageBlocked = true;
     recoverButton.hidden = false;
     setStorageNotice('Saved data needs attention', 'The existing local data was preserved and was not replaced.');
-    status.textContent = `Could not load local data: ${error instanceof Error ? error.message : String(error)}`;
+    setStatusMessage(`Could not load local data: ${error instanceof Error ? error.message : String(error)}`);
     render();
   }
 }
@@ -615,3 +1980,4 @@ applyTheme();
 render();
 setStorageNotice('Loading local data…', 'Checking this device for a saved backlog.');
 void loadInitialData();
+void installNativeCloseHandler();
