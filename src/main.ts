@@ -135,7 +135,8 @@ viewSwitch.setAttribute('role', 'group');
 viewSwitch.setAttribute('aria-label', 'Task view');
 const allView = button('All', () => setView('all'), 'view-button');
 const todayView = button('Today', () => setView('today'), 'view-button');
-viewSwitch.append(allView, todayView);
+const tomorrowView = button('Tomorrow', () => setView('tomorrow'), 'view-button');
+viewSwitch.append(allView, todayView, tomorrowView);
 header.append(viewSwitch);
 const notice = element('aside', 'preview-notice');
 notice.setAttribute('aria-label', 'Storage status');
@@ -1519,7 +1520,11 @@ function moveTask(category: Category, task: Task, direction: -1 | 1) {
 }
 
 function isScheduledToday(task: Task, today = localToday()): boolean {
-  return task.scheduledDates.includes(today);
+  return isScheduledOn(task, today);
+}
+
+function isScheduledOn(task: Task, date: string): boolean {
+  return task.scheduledDates.includes(date);
 }
 
 function markTaskDone(task: Task, today = localToday()) {
@@ -1633,14 +1638,18 @@ function render() {
   const scrollPosition = readScrollPosition();
   list.replaceChildren();
   const today = localToday();
+  const tomorrow = shiftDate(today, 1);
   const editingReady = storageReady && !storageBlocked && !closeInProgress && (sessionPhase === 'ready' || sessionPhase === 'offline');
   allView.setAttribute('aria-pressed', String(viewMode === 'all'));
   todayView.setAttribute('aria-pressed', String(viewMode === 'today'));
+  tomorrowView.setAttribute('aria-pressed', String(viewMode === 'tomorrow'));
   todayView.textContent = 'Today';
   todayView.title = dateLabel(today);
+  tomorrowView.textContent = 'Tomorrow';
+  tomorrowView.title = dateLabel(tomorrow);
   addCategory.disabled = !editingReady;
   themeButton.disabled = !editingReady;
-  allView.disabled = todayView.disabled = !editingReady;
+  allView.disabled = todayView.disabled = tomorrowView.disabled = !editingReady;
   importButton.disabled = exportButton.disabled = !editingReady;
   syncButton.disabled = !storageReady || closeInProgress || (storageKind() === 'desktop' && !syncReady);
   undoButton.disabled = !editingReady;
@@ -1652,8 +1661,9 @@ function render() {
   }
   let visibleCategoryCount = 0;
   notebook.categories.forEach(category => {
-    const visibleTasks = viewMode === 'today' ? category.tasks.filter(task => isScheduledToday(task, today)) : category.tasks;
-    if (viewMode === 'today' && visibleTasks.length === 0) return;
+    const filteredDate = viewMode === 'today' ? today : viewMode === 'tomorrow' ? tomorrow : null;
+    const visibleTasks = filteredDate ? category.tasks.filter(task => isScheduledOn(task, filteredDate)) : category.tasks;
+    if (filteredDate && visibleTasks.length === 0) return;
     visibleCategoryCount += 1;
     const section = element('section', 'category');
     const heading = element('h2', 'category-heading', category.name);
@@ -1730,9 +1740,9 @@ function render() {
     section.append(tasks);
     list.append(section);
   });
-  if (viewMode === 'today' && visibleCategoryCount === 0 && notebook.categories.length > 0) {
+  if (viewMode !== 'all' && visibleCategoryCount === 0 && notebook.categories.length > 0) {
     const empty = element('section', 'empty-notebook');
-    empty.append(element('p', '', 'Nothing scheduled today.'));
+    empty.append(element('p', '', `Nothing scheduled ${viewMode}.`));
     list.append(empty);
   }
   restoreScrollPosition(scrollPosition);

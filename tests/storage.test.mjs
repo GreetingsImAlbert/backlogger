@@ -23,6 +23,8 @@ test('existing backlogs without a theme stay readable and light mode round-trips
   assert.deepEqual(loaded.categories, original.categories);
   const light = makeStoredDocument(notebook, 5, 'all', 'light');
   assert.equal(parseStoredText(JSON.stringify(light)).preferences.theme, 'light');
+  const tomorrow = makeStoredDocument(notebook, 6, 'tomorrow');
+  assert.equal(parseStoredText(JSON.stringify(tomorrow)).preferences.viewMode, 'tomorrow');
   assert.throws(() => parseStoredDocument({ ...original, preferences: { viewMode: 'all', theme: 'invalid' } }), /theme/);
 });
 

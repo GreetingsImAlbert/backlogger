@@ -6,7 +6,7 @@ export const SCHEMA_VERSION = 1 as const;
 const BROWSER_STORAGE_KEY = 'backlogger.document.v1';
 const BROWSER_BACKUP_KEY = `${BROWSER_STORAGE_KEY}.bak`;
 
-export type ViewMode = 'all' | 'today';
+export type ViewMode = 'all' | 'today' | 'tomorrow';
 export type Theme = 'dark' | 'light';
 
 export interface StoredDocument {
@@ -34,6 +34,10 @@ export async function setNativeTheme(theme: Theme): Promise<void> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isViewMode(value: unknown): value is ViewMode {
+  return value === 'all' || value === 'today' || value === 'tomorrow';
 }
 
 function requiredString(value: unknown, field: string): string {
@@ -83,7 +87,7 @@ export function parseStoredDocument(value: unknown): StoredDocument {
     throw new Error('Stored data has an invalid revision.');
   }
   if (!Array.isArray(value.categories)) throw new Error('Stored data has invalid categories.');
-  if (!isRecord(value.preferences) || (value.preferences.viewMode !== 'all' && value.preferences.viewMode !== 'today')) {
+  if (!isRecord(value.preferences) || !isViewMode(value.preferences.viewMode)) {
     throw new Error('Stored data has invalid preferences.');
   }
   if (value.preferences.theme !== undefined && value.preferences.theme !== 'dark' && value.preferences.theme !== 'light') {
