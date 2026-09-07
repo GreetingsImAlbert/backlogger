@@ -50,11 +50,21 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
 .view-button { border: 0; border-radius: 7px; padding: 6px 16px; background: transparent; color: var(--muted); font-size: 12px; }
 .view-button[aria-pressed='true'] { background: var(--hover); color: var(--text); }
 .categories { padding-top: 2px; }
-.category { padding: 16px 0 12px; }
+.category { position: relative; padding: 16px 0 12px; }
 .category-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 3px; }
+.category-label { display: flex; align-items: center; gap: 2px; min-width: 0; }
 .category-heading { margin: 0; font-size: 13px; font-weight: 600; color: var(--muted); overflow-wrap: anywhere; min-width: 0; }
 .tasks { list-style: none; margin: 0; padding: 0; }
-.task { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0 5px 10px; border-radius: 8px; font-size: 14px; line-height: 1.65; }
+.task { position: relative; display: flex; align-items: flex-start; gap: 2px; padding: 5px 0 5px 8px; border-radius: 8px; font-size: 14px; line-height: 1.65; }
+.drag-handle { width: 24px; height: 28px; padding: 5px; color: var(--muted); cursor: grab; touch-action: none; user-select: none; }
+.drag-handle svg { width: 16px; height: 16px; }
+.drag-handle:active { cursor: grabbing; }
+.is-dragging { opacity: .45; }
+.drop-before::before, .drop-after::after { content: ''; position: absolute; left: 0; right: 0; height: 2px; border-radius: 2px; background: var(--primary); pointer-events: none; z-index: 1; }
+.task.drop-before::before { top: -1px; }
+.task.drop-after::after { bottom: -1px; }
+.category.drop-before::before { top: -1px; }
+.category.drop-after::after { bottom: -1px; }
 .task-content { flex: 1; min-width: 0; padding-top: 3px; overflow-wrap: anywhere; }
 .task-edit { padding: 0; border: 0; color: var(--text); background: transparent; text-align: left; line-height: inherit; overflow-wrap: anywhere; }
 .task-edit:hover { color: var(--muted); }
@@ -112,8 +122,12 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
 .advisory:empty, .form-error:empty { display: none; }
 .editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
 @media (hover: hover) and (pointer: fine) {
+  .category > .category-top .drag-handle,
+  .task > .drag-handle,
   .task > .task-complete,
   .task > .action-menu > summary { opacity: 0; }
+  .category:hover > .category-top .drag-handle,
+  .task:hover > .drag-handle,
   .task:hover > .task-complete,
   .task:focus-within > .task-complete,
   .task:hover > .action-menu > summary,

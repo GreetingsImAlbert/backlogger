@@ -3,6 +3,7 @@ import { open as openNativeFile, save as saveNativeFile } from '@tauri-apps/plug
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { compactDate, compactDateList, dateLabel, localToday, normalizeDates, parseDate, shiftDate, weekStart } from './dates';
 import type { Category, Notebook, Task } from './model';
+import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
 import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
 import { applySyncConflict, ensureSyncDirectory, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, hasValidSnapshotParentRevisions, isSnapshotAncestor, listSyncFiles, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncManifest, parseSyncSnapshot, readOptionalSyncFile, removeSyncFile, saveSyncState, snapshotFingerprint, storedDocumentFromSyncSnapshot, syncManifestPath, syncRootPath, syncSnapshotPath, syncSnapshotsPath, SYNC_SNAPSHOT_RETENTION_LIMIT, writeSyncJson, type SyncConflict, type SyncManifest, type SyncSnapshot, type SyncState } from './sync';
 
@@ -38,6 +39,14 @@ let ignoredUpdateIds = new Set<string>();
 let closeInProgress = false;
 let syncRetentionMessage = '';
 let sessionFetchInFlight: Promise<void> | null = null;
+type DragState =
+  | { kind: 'category'; categoryId: string }
+  | { kind: 'task'; categoryId: string; taskId: string };
+let dragState: DragState | null = null;
+let dropTarget: HTMLElement | null = null;
+let activeDropPosition: DropPosition | null = null;
+let dragPointerId: number | null = null;
+let dragHandleElement: HTMLElement | null = null;
 const SYNC_CHECK_TIMEOUT_MS = 8_000;
 const CLOSE_OPERATION_TIMEOUT_MS = 12_000;
 const CLOSE_SNAPSHOT_TIMEOUT_MS = 2_000;
@@ -77,6 +86,7 @@ const icons = {
   more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   check: '<path d="m5 12 4 4L19 6"/>',
+  grip: '<path d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
   moon: '<path d="M20 14a8 8 0 0 1-10-10 8.5 8.5 0 1 0 10 10Z"/>',
 };
@@ -104,6 +114,165 @@ function actionMenu(label: string, items: HTMLButtonElement[]) {
   menu.append(trigger, panel);
   return menu;
 }
+
+function editingIsReady(): boolean {
+  return storageReady && !storageBlocked && !closeInProgress && (sessionPhase === 'ready' || sessionPhase === 'offline');
+}
+
+function clearDropIndicator() {
+  document.querySelectorAll<HTMLElement>('.drop-before, .drop-after').forEach(node => {
+    node.classList.remove('drop-before', 'drop-after');
+  });
+  dropTarget = null;
+  activeDropPosition = null;
+}
+
+function clearDragSession() {
+  if (dragPointerId !== null && dragHandleElement?.hasPointerCapture(dragPointerId)) {
+    dragHandleElement.releasePointerCapture(dragPointerId);
+  }
+  clearDropIndicator();
+  document.querySelectorAll<HTMLElement>('.is-dragging').forEach(node => node.classList.remove('is-dragging'));
+  dragState = null;
+  dragPointerId = null;
+  dragHandleElement = null;
+}
+
+function dropPositionFor(clientY: number, target: HTMLElement): DropPosition {
+  const bounds = target.getBoundingClientRect();
+  return clientY < bounds.top + bounds.height / 2 ? 'before' : 'after';
+}
+
+function showDropIndicator(target: HTMLElement, position: DropPosition) {
+  if (dropTarget === target && activeDropPosition === position) return;
+  clearDropIndicator();
+  dropTarget = target;
+  activeDropPosition = position;
+  target.classList.add(position === 'before' ? 'drop-before' : 'drop-after');
+}
+
+function startPointerDrag(event: PointerEvent, source: HTMLElement, state: DragState, handle: HTMLElement) {
+  if (event.button !== 0 || !editingIsReady()) {
+    event.preventDefault();
+    return;
+  }
+  event.preventDefault();
+  clearDragSession();
+  dragState = state;
+  dragPointerId = event.pointerId;
+  dragHandleElement = handle;
+  source.classList.add('is-dragging');
+  handle.setPointerCapture(event.pointerId);
+}
+
+function dragHandle(label: string, source: HTMLElement, state: DragState, enabled: boolean) {
+  const handle = element('button', 'icon-button drag-handle');
+  handle.type = 'button';
+  handle.draggable = false;
+  handle.disabled = !enabled;
+  decorateIcon(handle, 'grip', label);
+  handle.addEventListener('pointerdown', event => startPointerDrag(event, source, state, handle));
+  return handle;
+}
+
+function updatePointerDrop(event: PointerEvent) {
+  if (!dragState) return;
+  event.preventDefault();
+  const hovered = document.elementFromPoint(event.clientX, event.clientY);
+  if (!hovered || !editingIsReady()) {
+    clearDropIndicator();
+    return;
+  }
+
+  if (dragState.kind === 'category') {
+    const target = hovered.closest<HTMLElement>('.category');
+    const targetCategoryId = target?.dataset.categoryId;
+    if (!target || !targetCategoryId) {
+      clearDropIndicator();
+      return;
+    }
+    const position = dropPositionFor(event.clientY, target);
+    if (reorderCategories(notebook.categories, dragState.categoryId, targetCategoryId, position)) {
+      showDropIndicator(target, position);
+    } else {
+      clearDropIndicator();
+    }
+    return;
+  }
+
+  const target = hovered.closest<HTMLElement>('.task');
+  const targetCategoryId = target?.dataset.categoryId;
+  const targetTaskId = target?.dataset.taskId;
+  if (!target || !targetCategoryId || !targetTaskId || dragState.categoryId !== targetCategoryId) {
+    clearDropIndicator();
+    return;
+  }
+  const position = dropPositionFor(event.clientY, target);
+  if (reorderTasksWithinCategory(
+    notebook.categories,
+    dragState.categoryId,
+    dragState.taskId,
+    targetCategoryId,
+    targetTaskId,
+    position,
+  )) {
+    showDropIndicator(target, position);
+  } else {
+    clearDropIndicator();
+  }
+}
+
+function commitPointerDrop(state: DragState, target: HTMLElement, position: DropPosition) {
+  if (state.kind === 'category') {
+    const targetCategoryId = target.dataset.categoryId;
+    const sourceCategory = notebook.categories.find(category => category.id === state.categoryId);
+    const targetCategory = notebook.categories.find(category => category.id === targetCategoryId);
+    const reordered = targetCategoryId
+      ? reorderCategories(notebook.categories, state.categoryId, targetCategoryId, position)
+      : null;
+    if (!sourceCategory || !targetCategory || !reordered) return;
+    commit(() => {
+      notebook.categories = reordered;
+    }, `Moved ${sourceCategory.name} ${position} ${targetCategory.name}.`);
+    return;
+  }
+
+  const targetCategoryId = target.dataset.categoryId;
+  const targetTaskId = target.dataset.taskId;
+  const category = notebook.categories.find(item => item.id === state.categoryId);
+  const sourceTask = category?.tasks.find(task => task.id === state.taskId);
+  const targetTask = category?.tasks.find(task => task.id === targetTaskId);
+  const reordered = targetCategoryId && targetTaskId
+    ? reorderTasksWithinCategory(
+      notebook.categories,
+      state.categoryId,
+      state.taskId,
+      targetCategoryId,
+      targetTaskId,
+      position,
+    )
+    : null;
+  if (!sourceTask || !targetTask || !reordered) return;
+  commit(() => {
+    notebook.categories = reordered;
+  }, `Moved ${sourceTask.title} ${position} ${targetTask.title}.`);
+}
+
+function finishPointerDrag(event: PointerEvent) {
+  if (!dragState || event.pointerId !== dragPointerId) return;
+  event.preventDefault();
+  updatePointerDrop(event);
+  const state = dragState;
+  const target = dropTarget;
+  const position = activeDropPosition;
+  clearDragSession();
+  if (target && position) commitPointerDrop(state, target, position);
+}
+
+document.addEventListener('pointermove', updatePointerDrop, { passive: false });
+document.addEventListener('pointerup', finishPointerDrag, { passive: false });
+document.addEventListener('pointercancel', clearDragSession);
+
 document.addEventListener('click', event => {
   document.querySelectorAll<HTMLDetailsElement>('.action-menu[open]').forEach(menu => {
     if (!menu.contains(event.target as Node)) menu.open = false;
@@ -767,7 +936,7 @@ async function runSessionFetch() {
   const update = await checkForSharedUpdate(true);
   if (!update) {
     sessionPhase = syncState.lastError ? 'offline' : 'ready';
-    setStatusMessage(syncState.lastError ? 'Working offline. Shared updates will be checked again.' : 'Ready.');
+    setStatusMessage(syncState.lastError ? 'Working offline. Shared updates will be checked again.' : '');
     render();
     return;
   }
@@ -1635,6 +1804,7 @@ function editTask(category: Category, task?: Task) {
 }
 
 function render() {
+  if (dragState) clearDragSession();
   const scrollPosition = readScrollPosition();
   list.replaceChildren();
   const today = localToday();
@@ -1666,10 +1836,13 @@ function render() {
     if (filteredDate && visibleTasks.length === 0) return;
     visibleCategoryCount += 1;
     const section = element('section', 'category');
+    section.dataset.categoryId = category.id;
     const heading = element('h2', 'category-heading', category.name);
     heading.id = `category-${category.id}`;
     section.setAttribute('aria-labelledby', heading.id);
     const top = element('div', 'category-top');
+    const categoryLabel = element('div', 'category-label');
+    categoryLabel.append(dragHandle(`Reorder ${category.name}`, section, { kind: 'category', categoryId: category.id }, editingReady));
     const controls = element('div', 'row-actions');
     const categoryIndex = notebook.categories.indexOf(category);
     const upCategory = button('Move up', () => moveCategory(category, -1));
@@ -1688,12 +1861,15 @@ function render() {
     remove.setAttribute('aria-label', `Delete category ${category.name}`);
     remove.classList.add('destructive');
     controls.append(add, actionMenu(`Options for ${category.name}`, [rename, upCategory, downCategory, remove]));
-    top.append(heading, controls);
+    categoryLabel.append(heading);
+    top.append(categoryLabel, controls);
     section.append(top);
     const tasks = element('ul', 'tasks');
     visibleTasks.forEach(task => {
       const taskIndex = category.tasks.indexOf(task);
       const row = element('li', 'task');
+      row.dataset.categoryId = category.id;
+      row.dataset.taskId = task.id;
       const scheduledToday = isScheduledToday(task, today);
       const edit = button(task.title, () => editTask(category, task), `task-title task-edit${scheduledToday ? ' scheduled-today' : ''}`);
       edit.disabled = !editingReady;
@@ -1713,6 +1889,8 @@ function render() {
         content.append(due);
       }
       const complete = scheduledToday ? iconButton('check', `Mark ${task.title} done`, () => markTaskDone(task, today)) : null;
+      const handle = dragHandle(`Reorder ${task.title}`, row, { kind: 'task', categoryId: category.id, taskId: task.id }, editingReady);
+      row.append(handle);
       if (complete) {
         complete.classList.add('task-complete');
         complete.disabled = !editingReady;
@@ -1935,7 +2113,7 @@ async function loadInitialData() {
     sessionPhase = syncReady && syncState.status === 'connected' ? 'fetching' : syncLoadError ? 'offline' : 'ready';
     render();
     if (syncReady && syncState.status === 'connected') void startSessionFetch();
-    else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : 'Ready.');
+    else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : '');
   } catch (error) {
     storageReady = true;
     syncReady = false;
