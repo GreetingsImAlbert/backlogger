@@ -40,6 +40,7 @@ let syncRetentionMessage = '';
 let sessionFetchInFlight: Promise<void> | null = null;
 const SYNC_CHECK_TIMEOUT_MS = 8_000;
 const CLOSE_OPERATION_TIMEOUT_MS = 12_000;
+const CLOSE_SNAPSHOT_TIMEOUT_MS = 2_000;
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text?: string) {
   const node = document.createElement(tag);
@@ -58,6 +59,7 @@ function button(text: string, action: () => void, className = 'quiet-button') {
 const icons = {
   more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  check: '<path d="m5 12 4 4L19 6"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
   moon: '<path d="M20 14a8 8 0 0 1-10-10 8.5 8.5 0 1 0 10 10Z"/>',
 };
@@ -1501,6 +1503,13 @@ function isScheduledToday(task: Task, today = localToday()): boolean {
   return task.scheduledDates.includes(today);
 }
 
+function markTaskDone(task: Task, today = localToday()) {
+  if (!isScheduledToday(task, today)) return;
+  commit(() => {
+    task.scheduledDates = task.scheduledDates.filter(date => date !== today);
+  }, `Marked ${task.title} done.`);
+}
+
 function editTask(category: Category, task?: Task) {
   const editor = openDialog(task ? 'Edit task' : `Add task to ${category.name}`);
   const title = textField('Task title', task?.title ?? '');
@@ -1673,6 +1682,14 @@ function render() {
         due.setAttribute('aria-label', due.title);
         content.append(due);
       }
+      const complete = scheduledToday ? iconButton('check', `Mark ${task.title} done`, () => markTaskDone(task, today)) : null;
+      if (complete) {
+        complete.classList.add('task-complete');
+        complete.disabled = !editingReady;
+        row.append(content, complete);
+      } else {
+        row.append(content);
+      }
       const remove = button('Delete', () => commit(() => {
         category.tasks = category.tasks.filter(item => item.id !== task.id);
       }, `Deleted ${task.title}.`, true), 'quiet-button task-delete');
@@ -1687,7 +1704,7 @@ function render() {
       remove.className = 'quiet-button destructive';
       const taskEditAction = button('Edit', () => editTask(category, task));
       taskEditAction.disabled = !editingReady;
-      row.append(content, actionMenu(`Options for ${task.title}`, [taskEditAction, upTask, downTask, remove]));
+      row.append(actionMenu(`Options for ${task.title}`, [taskEditAction, upTask, downTask, remove]));
       tasks.append(row);
     });
     section.append(tasks);
@@ -1698,44 +1715,6 @@ function render() {
     empty.append(element('p', '', 'Nothing scheduled today.'));
     list.append(empty);
   }
-}
-
-type CloseSyncChoice = 'fetch' | 'keep' | 'cancel';
-
-function askCloseSyncChoice(update: AvailableUpdate): Promise<CloseSyncChoice> {
-  return new Promise(resolve => {
-    const editor = openDialog('Shared update available');
-    const cancel = editor.form.querySelector<HTMLButtonElement>('button:not([type="submit"])');
-    if (cancel) cancel.textContent = 'Cancel close';
-    editor.save.textContent = 'Keep mine and close';
-    editor.body.append(
-      element('p', '', update.branchCount > 1
-        ? `${update.branchCount} shared branches are available while this device has local changes.`
-        : 'Another device changed the shared backlog while this device has local changes.'),
-      element('p', 'advisory', 'Fetch shared version backs up this device and replaces the visible list. Keep mine publishes this device as an explicit new branch.'),
-    );
-    const fetchButton = button('Fetch shared version', () => {
-      resolve('fetch');
-      editor.dialog.close();
-    }, 'quiet-button');
-    fetchButton.disabled = update.branchCount > 1;
-    if (update.branchCount > 1) {
-      editor.body.append(element('p', 'advisory', 'Fetch is unavailable while multiple shared branches exist. Use Sync to resolve the branches, or keep this device’s version as an explicit branch.'));
-    }
-    editor.body.append(fetchButton);
-    let settled = false;
-    const finish = (choice: CloseSyncChoice) => {
-      if (settled) return;
-      settled = true;
-      resolve(choice);
-    };
-    editor.dialog.addEventListener('close', () => finish('cancel'), { once: true });
-    editor.form.addEventListener('submit', event => {
-      event.preventDefault();
-      finish('keep');
-      editor.dialog.close();
-    });
-  });
 }
 
 function askCloseAfterSaveTimeout(): Promise<boolean> {
@@ -1763,15 +1742,41 @@ function askCloseAfterSaveTimeout(): Promise<boolean> {
   });
 }
 
+async function writeCloseSnapshot(): Promise<void> {
+  if (!syncState.folderPath || !syncState.notebookId || syncState.conflicts.length) return;
+  const pendingBaseParents = syncState.pendingSnapshots[0]?.parentSnapshotIds ?? [];
+  const parents = syncState.mergeParentSnapshotIds.length
+    ? syncState.mergeParentSnapshotIds
+    : syncState.currentSnapshotId
+      ? [syncState.currentSnapshotId]
+      : pendingBaseParents.length
+        ? pendingBaseParents
+        : syncState.knownHeadSnapshotIds;
+  const snapshot = makeSyncSnapshot(
+    makeStoredDocument(notebook, revision, viewMode, theme),
+    syncState,
+    parents,
+  );
+
+  // Closing performs one shared-folder operation: write the immutable snapshot.
+  // If this does not finish, the unchanged content fingerprint makes the next
+  // session recognize that the local notebook still needs publication.
+  await writeSyncJson(syncSnapshotPath(syncState.folderPath, snapshot.snapshotId), snapshot);
+
+  syncState.pendingSnapshots = [];
+  syncState.currentSnapshotId = snapshot.snapshotId;
+  syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, snapshot.snapshotId])];
+  syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, snapshot.snapshotId])];
+  syncState.lastPublishedSnapshotId = snapshot.snapshotId;
+  syncState.lastPublishedRevision = snapshot.revision;
+  syncState.lastPublishedContentFingerprint = snapshotFingerprint(snapshot);
+  syncState.lastPublishedAt = new Date().toISOString();
+  syncState.mergeParentSnapshotIds = [];
+  syncState.lastError = null;
+  await saveSyncState(syncState);
+}
+
 async function closeSession(): Promise<boolean> {
-  if (sessionFetchInFlight) {
-    try {
-      await withTimeout(sessionFetchInFlight, CLOSE_OPERATION_TIMEOUT_MS, 'The startup fetch did not finish before closing.');
-    } catch (error) {
-      sessionFetchInFlight = null;
-      setStatusMessage(`The startup fetch did not finish: ${errorText(error)}`);
-    }
-  }
   try {
     await withTimeout(saveQueue, CLOSE_OPERATION_TIMEOUT_MS, 'The local save did not finish before closing.');
   } catch {
@@ -1795,79 +1800,17 @@ async function closeSession(): Promise<boolean> {
   if (syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return true;
 
   const localNeedsPublish = sessionContentDirty || syncState.pendingSnapshots.length > 0;
-  const checkedAt = startSyncCheck();
-  let update: AvailableUpdate | null = null;
-  try {
-    update = await withSyncTimeout(scanSharedUpdate(true));
-    finishSyncCheck(checkedAt);
-    await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.');
-  } catch (error) {
-    const checkError = errorText(error);
-    syncState.lastCheckedAt = checkedAt;
-    syncState.lastError = checkError;
-    try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve local data and pending work */ }
-    if (localNeedsPublish && !syncState.pendingSnapshots.length) {
-      try { await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme)); } catch { /* local fingerprint remains as a retry signal */ }
-    }
-    syncState.lastError = checkError;
-    try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve the local notebook if metadata cannot be written */ }
-    setStatusMessage(`Could not check the shared folder before closing: ${checkError}`);
-    sessionPhase = 'offline';
-    render();
-    return true;
-  }
-
-  let choice: CloseSyncChoice = 'keep';
-  if (update) {
-    choice = await askCloseSyncChoice(update);
-    if (choice === 'cancel') {
-      availableUpdate = update;
-      sessionPhase = 'ready';
-      closeInProgress = false;
-      render();
-      return false;
-    }
-    if (choice === 'fetch') {
-      try {
-        await withTimeout(applyFetchedSnapshot(update.snapshot), CLOSE_OPERATION_TIMEOUT_MS, 'Fetching before close timed out.');
-        sessionContentDirty = false;
-        return true;
-      } catch (error) {
-        syncState.lastError = errorText(error);
-        try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve local data */ }
-        setStatusMessage(`Could not fetch before closing: ${syncState.lastError}`);
-        sessionPhase = 'offline';
-        closeInProgress = false;
-        render();
-        return false;
-      }
-    }
-    const baseId = acceptedSnapshotId();
-    syncState.mergeParentSnapshotIds = [...new Set([...(baseId ? [baseId] : []), update.snapshot.snapshotId])];
-  }
-
-  if (localNeedsPublish || (update && choice === 'keep')) {
+  if (localNeedsPublish) {
     try {
-      syncState.pendingSnapshots = [];
       await withTimeout(
-        queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme)),
-        CLOSE_OPERATION_TIMEOUT_MS,
-        'The local sync queue did not finish before closing.',
-      );
-      await withTimeout(
-        publishPendingSnapshots(),
-        CLOSE_OPERATION_TIMEOUT_MS,
-        'The shared-folder publication timed out.',
+        writeCloseSnapshot(),
+        CLOSE_SNAPSHOT_TIMEOUT_MS,
+        'The snapshot write did not finish before closing.',
       );
       sessionContentDirty = false;
       return true;
     } catch (error) {
       syncState.lastError = errorText(error);
-      try { await withTimeout(saveSyncState(syncState), CLOSE_OPERATION_TIMEOUT_MS, 'Saving sync state timed out.'); } catch { /* preserve pending publication */ }
-      setStatusMessage(`Saved locally, but shared publication is pending: ${syncState.lastError}`);
-      sessionPhase = 'offline';
-      closeInProgress = false;
-      render();
       return true;
     }
   }
@@ -1877,27 +1820,24 @@ async function closeSession(): Promise<boolean> {
 async function installNativeCloseHandler() {
   if (storageKind() !== 'desktop') return;
   await getCurrentWindow().onCloseRequested(async event => {
-    if (closeInProgress) return;
-    event.preventDefault();
+    if (closeInProgress) {
+      event.preventDefault();
+      return;
+    }
     closeInProgress = true;
     sessionPhase = 'closing';
-    setStatusMessage('Saving before closing…');
+    setStatusMessage('Closing…');
     render();
-    let shouldClose = false;
     try {
-      shouldClose = await closeSession();
+      if (await closeSession()) return;
     } catch (error) {
-      closeInProgress = false;
       sessionPhase = 'offline';
       setStatusMessage(`Could not finish closing safely: ${errorText(error)}`);
-      render();
     }
-    if (shouldClose) await getCurrentWindow().destroy();
-    else {
-      closeInProgress = false;
-      if (sessionPhase === 'closing') sessionPhase = 'ready';
-      render();
-    }
+    event.preventDefault();
+    closeInProgress = false;
+    if (sessionPhase === 'closing') sessionPhase = 'ready';
+    render();
   });
 }
 

@@ -112,8 +112,13 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
 .advisory:empty, .form-error:empty { display: none; }
 .editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
 @media (hover: hover) and (pointer: fine) {
+  .task > .task-complete,
   .task > .action-menu > summary { opacity: 0; }
-  .task:hover > .action-menu > summary, .task:focus-within > .action-menu > summary, .task > .action-menu[open] > summary { opacity: 1; }
+  .task:hover > .task-complete,
+  .task:focus-within > .task-complete,
+  .task:hover > .action-menu > summary,
+  .task:focus-within > .action-menu > summary,
+  .task > .action-menu[open] > summary { opacity: 1; }
 }
 @media (max-width: 400px) {
   .notebook { padding: 18px 18px 32px; }
