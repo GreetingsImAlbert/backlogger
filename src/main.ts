@@ -49,6 +49,23 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', 
   return node;
 }
 
+interface ScrollPosition {
+  left: number;
+  top: number;
+}
+
+function readScrollPosition(): ScrollPosition {
+  return { left: window.scrollX, top: window.scrollY };
+}
+
+function restoreScrollPosition(position: ScrollPosition) {
+  window.scrollTo(position.left, position.top);
+}
+
+function focusWithoutScrolling(node: HTMLElement | null) {
+  node?.focus({ preventScroll: true });
+}
+
 function button(text: string, action: () => void, className = 'quiet-button') {
   const node = element('button', className, text);
   node.type = 'button';
@@ -96,7 +113,7 @@ document.addEventListener('keydown', event => {
   if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
   document.querySelectorAll<HTMLDetailsElement>('.action-menu[open]').forEach(menu => {
     menu.open = false;
-    menu.querySelector('summary')?.focus();
+    focusWithoutScrolling(menu.querySelector('summary'));
   });
 });
 
@@ -167,7 +184,7 @@ const undoButton = button('Undo', () => {
   render();
   queueSave();
   setStatusMessage('Deletion undone.');
-  addCategory.focus();
+  focusWithoutScrolling(addCategory);
 });
 undoButton.hidden = true;
 const actions = element('div', 'bottom-actions');
@@ -1397,15 +1414,16 @@ function commit(change: () => void, message: string, canUndo = false) {
       const focused = document.activeElement === undoButton;
       clearUndo();
       setStatusMessage('');
-      if (focused) addCategory.focus();
+      if (focused) focusWithoutScrolling(addCategory);
     }, 15_000);
-    undoButton.focus();
+    focusWithoutScrolling(undoButton);
   }
 }
 
 function openDialog(title: string) {
   const previousFocus = document.activeElement as HTMLElement | null;
   const menuTrigger = previousFocus?.closest('details')?.querySelector('summary');
+  const scrollPosition = readScrollPosition();
   const dialog = element('dialog', 'editor');
   const heading = element('h2', '', title);
   heading.id = 'dialog-title';
@@ -1424,10 +1442,11 @@ function openDialog(title: string) {
   document.body.append(dialog);
   dialog.addEventListener('close', () => {
     dialog.remove();
-    if (menuTrigger?.isConnected) menuTrigger.focus();
-    else if (previousFocus?.isConnected) previousFocus.focus();
-    else if (undoState) undoButton.focus();
-    else addCategory.focus();
+    if (menuTrigger?.isConnected) focusWithoutScrolling(menuTrigger);
+    else if (previousFocus?.isConnected) focusWithoutScrolling(previousFocus);
+    else if (undoState) focusWithoutScrolling(undoButton);
+    else focusWithoutScrolling(addCategory);
+    restoreScrollPosition(scrollPosition);
     if (syncDeferred) {
       syncDeferred = false;
       void attemptPendingSync();
@@ -1611,6 +1630,7 @@ function editTask(category: Category, task?: Task) {
 }
 
 function render() {
+  const scrollPosition = readScrollPosition();
   list.replaceChildren();
   const today = localToday();
   const editingReady = storageReady && !storageBlocked && !closeInProgress && (sessionPhase === 'ready' || sessionPhase === 'offline');
@@ -1715,6 +1735,7 @@ function render() {
     empty.append(element('p', '', 'Nothing scheduled today.'));
     list.append(empty);
   }
+  restoreScrollPosition(scrollPosition);
 }
 
 function askCloseAfterSaveTimeout(): Promise<boolean> {
