@@ -3,5 +3,6 @@
   "identifier": "default",
   "description": "Default desktop capability",
   "windows": ["main"],
+  "platforms": ["windows", "macOS", "linux"],
   "permissions": ["core:default", "core:window:allow-destroy", "dialog:default"]
 }

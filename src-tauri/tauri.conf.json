@@ -23,7 +23,6 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": ["nsis"]
+    "active": true
   }
 }

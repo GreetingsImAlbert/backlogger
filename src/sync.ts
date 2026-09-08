@@ -2,12 +2,30 @@ import { invoke } from '@tauri-apps/api/core';
 import type { Category, Notebook, Task } from './model.ts';
 import { parseStoredDocument, SCHEMA_VERSION, storageKind, type StoredDocument, type Theme, type ViewMode } from './storage.ts';
 
-export const SYNC_SCHEMA_VERSION = 1 as const;
+export const LEGACY_SYNC_SCHEMA_VERSION = 1 as const;
+export const SYNC_SCHEMA_VERSION = 2 as const;
 export const SYNC_PROTOCOL_VERSION = 1 as const;
 export const SYNC_SNAPSHOT_RETENTION_LIMIT = 30 as const;
 export const SYNC_CHECKPOINT_VERSION = 1 as const;
 
 export type SyncConnectionStatus = 'disconnected' | 'connected' | 'paused';
+
+export interface LocalFolderLocation {
+  kind: 'local-folder';
+  /** Parent directory selected by the Windows folder picker. */
+  parentPath: string;
+}
+
+export interface OneDriveLocation {
+  kind: 'onedrive';
+  accountId: string;
+  driveId: string;
+  rootItemId: string;
+  /** `/backlogger-sync` or the explicit debug path used for isolated tests. */
+  displayPath: string;
+}
+
+export type SyncLocation = LocalFolderLocation | OneDriveLocation;
 
 export interface SyncSnapshot {
   protocolVersion: typeof SYNC_PROTOCOL_VERSION;
@@ -53,7 +71,7 @@ export interface SyncState {
   schemaVersion: typeof SYNC_SCHEMA_VERSION;
   deviceId: string;
   notebookId: string | null;
-  folderPath: string | null;
+  location: SyncLocation | null;
   status: SyncConnectionStatus;
   pendingSnapshots: SyncSnapshot[];
   knownHeadSnapshotIds: string[];
@@ -89,6 +107,26 @@ function stringArray(value: unknown, field: string): string[] {
     throw new Error(`Sync data has invalid ${field}.`);
   }
   return [...new Set(value)];
+}
+
+function parseSyncLocation(value: unknown, field = 'sync location'): SyncLocation {
+  if (!isRecord(value) || (value.kind !== 'local-folder' && value.kind !== 'onedrive')) {
+    throw new Error(`Sync data has an invalid ${field}.`);
+  }
+  if (value.kind === 'local-folder') {
+    return { kind: 'local-folder', parentPath: requiredString(value.parentPath, `${field} parent path`) };
+  }
+  return {
+    kind: 'onedrive',
+    accountId: requiredString(value.accountId, `${field} account id`),
+    driveId: requiredString(value.driveId, `${field} drive id`),
+    rootItemId: requiredString(value.rootItemId, `${field} root item id`),
+    displayPath: requiredString(value.displayPath, `${field} display path`),
+  };
+}
+
+export function localFolderLocation(location: SyncLocation | null): LocalFolderLocation | null {
+  return location?.kind === 'local-folder' ? location : null;
 }
 
 function cloneCategories(categories: Category[]): Category[] {
@@ -163,7 +201,7 @@ export function makeSyncState(deviceId: string = crypto.randomUUID()): SyncState
     schemaVersion: SYNC_SCHEMA_VERSION,
     deviceId,
     notebookId: null,
-    folderPath: null,
+    location: null,
     status: 'disconnected',
     pendingSnapshots: [],
     knownHeadSnapshotIds: [],
@@ -183,7 +221,9 @@ export function makeSyncState(deviceId: string = crypto.randomUUID()): SyncState
 
 export function parseSyncState(value: unknown): SyncState {
   if (!isRecord(value)) throw new Error('Sync data is not an object.');
-  if (value.schemaVersion !== SYNC_SCHEMA_VERSION) throw new Error('This sync data uses an unsupported version.');
+  if (value.schemaVersion !== SYNC_SCHEMA_VERSION && value.schemaVersion !== LEGACY_SYNC_SCHEMA_VERSION) {
+    throw new Error('This sync data uses an unsupported version.');
+  }
   const status = value.status;
   if (status !== 'disconnected' && status !== 'connected' && status !== 'paused') {
     throw new Error('Sync data has an invalid connection status.');
@@ -198,11 +238,18 @@ export function parseSyncState(value: unknown): SyncState {
   });
   const conflictsValue = value.conflicts ?? [];
   if (!Array.isArray(conflictsValue)) throw new Error('Sync data has invalid conflicts.');
+  const legacyFolderPath = value.folderPath === undefined ? null : optionalString(value.folderPath, 'folder path');
+  const parsedLocation = value.location === undefined || value.location === null
+    ? null
+    : parseSyncLocation(value.location);
+  if (parsedLocation && legacyFolderPath && parsedLocation.kind === 'local-folder' && parsedLocation.parentPath !== legacyFolderPath) {
+    throw new Error('Sync data has conflicting location and folder path values.');
+  }
   return {
     schemaVersion: SYNC_SCHEMA_VERSION,
     deviceId: requiredString(value.deviceId, 'device id'),
     notebookId: optionalString(value.notebookId, 'notebook id'),
-    folderPath: optionalString(value.folderPath, 'folder path'),
+    location: parsedLocation ?? (legacyFolderPath ? { kind: 'local-folder', parentPath: legacyFolderPath } : null),
     status,
     pendingSnapshots,
     knownHeadSnapshotIds: stringArray(value.knownHeadSnapshotIds ?? [], 'known heads'),
@@ -275,63 +322,28 @@ export function makeSyncManifest(notebookId: string, deviceId: string, headSnaps
   };
 }
 
-export function syncRootPath(folderPath: string): string {
-  return joinPath(folderPath, 'backlogger-sync');
-}
-
-export function syncSnapshotsPath(folderPath: string): string {
-  return joinPath(syncRootPath(folderPath), 'snapshots');
-}
-
-export function syncManifestPath(folderPath: string): string {
-  return joinPath(syncRootPath(folderPath), 'notebook.json');
-}
-
-export function syncSnapshotPath(folderPath: string, snapshotId: string): string {
-  return joinPath(syncSnapshotsPath(folderPath), `${snapshotId}.json`);
-}
-
-function joinPath(root: string, ...parts: string[]): string {
-  const separator = root.includes('\\') ? '\\' : '/';
-  return [root.replace(/[\\/]+$/, ''), ...parts].join(separator);
-}
-
 export async function loadSyncState(): Promise<SyncState> {
-  if (storageKind() !== 'desktop') return makeSyncState('browser-preview');
+  if (storageKind() === 'browser') return makeSyncState('browser-preview');
   const raw = await invoke<string | null>('load_sync_state');
   if (!raw) return makeSyncState();
-  return parseSyncState(JSON.parse(raw) as unknown);
+  const parsed = JSON.parse(raw) as unknown;
+  const state = parseSyncState(parsed);
+  const legacy = isRecord(parsed) && (parsed.schemaVersion === LEGACY_SYNC_SCHEMA_VERSION || ('folderPath' in parsed && !('location' in parsed)));
+  if (legacy) {
+    // Preserve the old state before writing the versioned location shape.
+    await invoke('backup_sync_state');
+    await invoke('save_sync_state', { state: JSON.stringify(state, null, 2) });
+  }
+  return state;
 }
 
 export async function saveSyncState(state: SyncState): Promise<void> {
-  if (storageKind() !== 'desktop') return;
+  if (storageKind() === 'browser') return;
   await invoke('save_sync_state', { state: JSON.stringify(state, null, 2) });
 }
 
-export async function ensureSyncDirectory(path: string): Promise<void> {
-  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
-  await invoke('ensure_directory', { path });
-}
-
-export async function readOptionalSyncFile(path: string): Promise<string | null> {
-  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
-  return invoke<string | null>('read_optional_file', { path });
-}
-
-export async function listSyncFiles(path: string): Promise<string[]> {
-  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
-  return invoke<string[]>('list_directory_files', { path });
-}
-
-export async function removeSyncFile(path: string): Promise<void> {
-  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
-  await invoke('remove_file', { path });
-}
-
-export async function writeSyncJson(path: string, value: unknown): Promise<void> {
-  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
-  await invoke('write_document_file', { path, document: JSON.stringify(value, null, 2) });
-}
+// Kept as compatibility exports for focused path tests; runtime I/O is implemented by LocalFolderSyncTransport.
+export { syncManifestPath, syncRootPath, syncSnapshotPath, syncSnapshotsPath } from './sync/local-folder-transport.ts';
 
 export function snapshotFingerprint(snapshot: SyncSnapshot): string {
   return JSON.stringify(snapshot.categories);

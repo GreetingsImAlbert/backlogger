@@ -4,11 +4,13 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
+    "dev": "vite",
     "check": "tsc --noEmit",
     "test": "node --test tests/*.test.mjs",
     "build": "npm run check && vite build",
     "preview": "vite preview --host 127.0.0.1",
+    "android:dev": "set BACKLOGGER_DEV_HOST=0.0.0.0&& tauri android dev",
+    "android:build": "tauri android build --debug --apk --target x86_64 --ci",
     "tauri": "tauri"
   },
   "devDependencies": {

@@ -20,8 +20,11 @@ import {
   syncRootPath,
   syncSnapshotPath,
   SYNC_CHECKPOINT_VERSION,
+  SYNC_SCHEMA_VERSION,
   SYNC_SNAPSHOT_RETENTION_LIMIT,
+  LEGACY_SYNC_SCHEMA_VERSION,
 } from '../src/sync.ts';
+import { LocalFolderSyncTransport, syncSnapshotsPath } from '../src/sync/local-folder-transport.ts';
 
 const notebook = {
   categories: [{
@@ -68,6 +71,35 @@ test('sync manifests and Windows folder paths are stable', () => {
   assert.equal(syncRootPath('C:\\Users\\Albert\\OneDrive\\Backlogger'), 'C:\\Users\\Albert\\OneDrive\\Backlogger\\backlogger-sync');
   assert.equal(syncManifestPath('C:\\Users\\Albert\\OneDrive\\Backlogger'), 'C:\\Users\\Albert\\OneDrive\\Backlogger\\backlogger-sync\\notebook.json');
   assert.equal(syncSnapshotPath('C:\\Users\\Albert\\OneDrive\\Backlogger', 'snapshot-1'), 'C:\\Users\\Albert\\OneDrive\\Backlogger\\backlogger-sync\\snapshots\\snapshot-1.json');
+});
+
+test('legacy sync state migrates folderPath without dropping pending work', () => {
+  const state = makeSyncState('device-1');
+  state.notebookId = 'notebook-1';
+  const snapshot = makeSyncSnapshot(makeStoredDocument(notebook, 3, 'all'), state, ['parent-1']);
+  state.pendingSnapshots = [snapshot];
+  const { location: _location, ...legacyFields } = state;
+  const legacy = {
+    ...legacyFields,
+    schemaVersion: LEGACY_SYNC_SCHEMA_VERSION,
+    folderPath: 'C:\\Users\\Albert\\OneDrive',
+  };
+  const migrated = parseSyncState(legacy);
+  assert.equal(migrated.schemaVersion, SYNC_SCHEMA_VERSION);
+  assert.deepEqual(migrated.location, { kind: 'local-folder', parentPath: 'C:\\Users\\Albert\\OneDrive' });
+  assert.deepEqual(migrated.pendingSnapshots, [snapshot]);
+  assert.equal(migrated.deviceId, state.deviceId);
+});
+
+test('debug local transport resolves the explicit exchange root and reports best-effort writes', async () => {
+  const transport = new LocalFolderSyncTransport(
+    { kind: 'local-folder', parentPath: 'C:\\Users\\Albert\\OneDrive' },
+    { profile: 'debug', exchangeRootOverride: 'C:\\Temp\\backlogger-sync-test' },
+  );
+  const resolved = await transport.resolveLocation();
+  assert.equal(resolved.displayPath, 'C:\\Temp\\backlogger-sync-test');
+  assert.equal(transport.capabilities.conditionalManifestWrite, 'best-effort');
+  assert.equal(syncSnapshotsPath('C:\\Users\\Albert\\OneDrive', 'C:\\Temp\\backlogger-sync-test'), 'C:\\Temp\\backlogger-sync-test\\snapshots');
 });
 
 test('sync state rejects duplicate pending snapshot ids and unsupported manifests', () => {

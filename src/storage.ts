@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { normalizeDates, parseDate } from './dates.ts';
 import type { Category, Notebook, Task } from './model.ts';
+import { isTauriRuntime } from './platform/capabilities.ts';
 
 export const SCHEMA_VERSION = 1 as const;
 const BROWSER_STORAGE_KEY = 'backlogger.document.v1';
@@ -16,16 +17,10 @@ export interface StoredDocument {
   preferences: { viewMode: ViewMode; theme: Theme };
 }
 
-interface TauriWindow extends Window {
-  __TAURI_INTERNALS__?: unknown;
-}
-
-function isTauriRuntime(): boolean {
-  return Boolean((window as TauriWindow).__TAURI_INTERNALS__);
-}
-
-export function storageKind(): 'desktop' | 'browser' {
-  return isTauriRuntime() ? 'desktop' : 'browser';
+export function storageKind(): 'desktop' | 'android' | 'browser' {
+  if (!isTauriRuntime()) return 'browser';
+  const userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent.toLowerCase();
+  return userAgent.includes('android') ? 'android' : 'desktop';
 }
 
 export async function setNativeTheme(theme: Theme): Promise<void> {

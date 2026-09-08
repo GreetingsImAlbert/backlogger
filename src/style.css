@@ -38,7 +38,7 @@ button, summary { -webkit-tap-highlight-color: transparent; }
 button { cursor: pointer; }
 button:disabled { opacity: .3; cursor: default; }
 :focus-visible { outline: 2px solid var(--muted); outline-offset: 3px; }
-.notebook { max-width: 720px; padding: 24px 28px 40px; margin: 0 auto; }
+.notebook { max-width: 720px; padding: calc(24px + env(safe-area-inset-top, 0px)) 28px calc(40px + env(safe-area-inset-bottom, 0px)); margin: 0 auto; }
 .app-header { padding-bottom: 14px; }
 .title-bar { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
 h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
@@ -135,7 +135,13 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
   .task > .action-menu[open] > summary { opacity: 1; }
 }
 @media (max-width: 400px) {
-  .notebook { padding: 18px 18px 32px; }
+  .notebook { padding: calc(18px + env(safe-area-inset-top, 0px)) 18px calc(32px + env(safe-area-inset-bottom, 0px)); }
   .editor { padding: 18px; }
   .task { padding-left: 4px; }
+}
+@media (pointer: coarse) {
+  button, .action-menu > summary { min-height: 44px; }
+  .icon-button { width: 44px; height: 44px; padding: 11px; }
+  .drag-handle { width: 44px; height: 44px; padding: 14px; }
+  .day-button { min-height: 44px; }
 }

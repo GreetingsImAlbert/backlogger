@@ -3,12 +3,17 @@ import { open as openNativeFile, save as saveNativeFile } from '@tauri-apps/plug
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { compactDate, compactDateList, dateLabel, localToday, normalizeDates, parseDate, shiftDate, weekStart } from './dates';
 import type { Category, Notebook, Task } from './model';
+import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
 import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
-import { applySyncConflict, ensureSyncDirectory, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, hasValidSnapshotParentRevisions, isSnapshotAncestor, listSyncFiles, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncManifest, parseSyncSnapshot, readOptionalSyncFile, removeSyncFile, saveSyncState, snapshotFingerprint, storedDocumentFromSyncSnapshot, syncManifestPath, syncRootPath, syncSnapshotPath, syncSnapshotsPath, SYNC_SNAPSHOT_RETENTION_LIMIT, writeSyncJson, type SyncConflict, type SyncManifest, type SyncSnapshot, type SyncState } from './sync';
+import { applySyncConflict, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, localFolderLocation, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncConflict, type SyncSnapshot, type SyncState, type SyncLocation } from './sync';
+import { SyncCoordinator } from './sync/coordinator';
+import { LocalFolderSyncTransport, type LocalFolderTransportOptions } from './sync/local-folder-transport';
+import type { SyncTransport } from './sync/transport';
 
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('App container is missing.');
+const capabilities = platformCapabilities();
 let notebook: Notebook = { categories: [] };
 let hasUnsavedChanges = false;
 let viewMode: ViewMode = 'all';
@@ -406,10 +411,14 @@ function taskCount(categories: Notebook['categories']): number {
 }
 
 async function exportCurrentDocument() {
+  if (!capabilities.documentImportExport) {
+    setStatusMessage('Import and export will be available on Android in a later milestone.');
+    return;
+  }
   const stored = makeStoredDocument(notebook, revision, viewMode, theme);
   const raw = JSON.stringify(stored, null, 2);
   try {
-    if (storageKind() === 'desktop') {
+    if (capabilities.nativeDocuments) {
       const path = await saveNativeFile({
         title: 'Export Backlogger',
         defaultPath: `backlogger-${localToday()}.json`,
@@ -500,6 +509,10 @@ async function inspectImport(file: File) {
 }
 
 async function startImport() {
+  if (!capabilities.documentImportExport) {
+    setStatusMessage('Import and export will be available on Android in a later milestone.');
+    return;
+  }
   if (storageKind() !== 'desktop') {
     importInput.click();
     return;
@@ -570,10 +583,32 @@ function withSyncTimeout<T>(operation: Promise<T>): Promise<T> {
   return withTimeout(operation, SYNC_CHECK_TIMEOUT_MS, 'The shared-folder check timed out.');
 }
 
+function localFolderTransportOptions(): LocalFolderTransportOptions {
+  const debugProfile = import.meta.env.DEV && import.meta.env.VITE_BACKLOGGER_SYNC_PROFILE === 'test';
+  return {
+    profile: debugProfile ? 'debug' : 'production',
+    exchangeRootOverride: debugProfile ? import.meta.env.VITE_BACKLOGGER_SYNC_TEST_ROOT : undefined,
+  };
+}
+
+function syncTransportFor(location: SyncLocation | null = syncState.location): SyncTransport | null {
+  if (!location || location.kind !== 'local-folder') return null;
+  return new LocalFolderSyncTransport(location, localFolderTransportOptions());
+}
+
+function syncCoordinatorFor(location: SyncLocation | null = syncState.location): SyncCoordinator | null {
+  const transport = syncTransportFor(location);
+  return transport ? new SyncCoordinator(transport, syncState.notebookId) : null;
+}
+
+function localSyncParentPath(): string | null {
+  return localFolderLocation(syncState.location)?.parentPath ?? null;
+}
+
 function syncStatusLabel(): string {
-  if (storageKind() !== 'desktop') return 'Desktop app only';
+  if (!capabilities.localFolderSync) return 'Unavailable on Android';
   if (!syncReady) return syncLoadError ? 'Unavailable' : 'Loading…';
-  if (!syncState.folderPath || syncState.status === 'disconnected') return 'Not connected';
+  if (!syncState.location || syncState.status === 'disconnected') return 'Not connected';
   if (syncState.status === 'paused') return 'Paused';
   if (syncState.conflicts.length) return 'Conflicts';
   if (syncState.lastError) return 'Folder unavailable';
@@ -581,9 +616,9 @@ function syncStatusLabel(): string {
 }
 
 function syncStatusDetail(): string {
-  if (storageKind() !== 'desktop') return 'Folder sync is available in the installed desktop app.';
+  if (!capabilities.localFolderSync) return 'OneDrive sync will be enabled in a later Android milestone.';
   if (syncLoadError) return `Sync settings could not be loaded: ${syncLoadError}`;
-  if (!syncState.folderPath || syncState.status === 'disconnected') return 'Choose a folder managed by OneDrive or Google Drive for desktop.';
+  if (!syncState.location || syncState.status === 'disconnected') return 'Choose a folder managed by OneDrive or Google Drive for desktop.';
   const pending = syncState.pendingSnapshots.length;
   if (syncState.conflicts.length) return `${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`;
   if (syncState.lastError) return `Folder check failed: ${syncState.lastError}`;
@@ -596,43 +631,15 @@ function syncStatusDetail(): string {
     : `Local changes publish when you close the app.${checkedDetail}${retentionDetail} Provider upload/download is handled by its desktop app.`;
 }
 
-async function readSyncManifest(folderPath: string): Promise<SyncManifest | null> {
-  const raw = await readOptionalSyncFile(syncManifestPath(folderPath));
-  if (!raw) return null;
-  try {
-    return parseSyncManifest(JSON.parse(raw) as unknown);
-  } catch (error) {
-    throw new Error(`The selected folder has an invalid notebook manifest: ${errorText(error)}`);
-  }
-}
-
-async function writeSnapshotIfNeeded(folderPath: string, snapshot: SyncSnapshot): Promise<void> {
-  const path = syncSnapshotPath(folderPath, snapshot.snapshotId);
-  const serialized = JSON.stringify(snapshot, null, 2);
-  const existing = await readOptionalSyncFile(path);
-  if (existing !== null) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(existing) as unknown;
-    } catch {
-      throw new Error(`Snapshot ${snapshot.snapshotId} is not valid JSON.`);
-    }
-    if (JSON.stringify(parsed) !== JSON.stringify(snapshot)) {
-      throw new Error(`Snapshot ${snapshot.snapshotId} already exists with different content.`);
-    }
-    return;
-  }
-  await writeSyncJson(path, JSON.parse(serialized) as unknown);
-}
-
-async function compactSyncHistory(folderPath: string): Promise<boolean> {
+async function compactSyncHistory(coordinator: SyncCoordinator): Promise<boolean> {
   if (!syncState.notebookId || syncState.pendingSnapshots.length || syncState.conflicts.length) return false;
   let createdSnapshots: SyncSnapshot[] = [];
   let manifestPublished = false;
   try {
-    const snapshots = await readSnapshotIndex(folderPath);
+    const snapshots = await coordinator.readSnapshotIndex();
     if (snapshots.size <= SYNC_SNAPSHOT_RETENTION_LIMIT) return false;
-    const originalManifest = await readSyncManifest(folderPath);
+    const originalResource = await coordinator.readManifestResource();
+    const originalManifest = originalResource?.manifest ?? null;
     if (!originalManifest || originalManifest.notebookId !== syncState.notebookId) return false;
     const currentId = syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
     const leaves = snapshotLeaves(snapshots);
@@ -677,10 +684,11 @@ async function compactSyncHistory(folderPath: string): Promise<boolean> {
       createdSnapshots.push(rebased);
       parentId = rebased.snapshotId;
     }
-    for (const snapshot of createdSnapshots) await writeSnapshotIfNeeded(folderPath, snapshot);
+    for (const snapshot of createdSnapshots) await coordinator.createSnapshotIfNeeded(snapshot);
 
-    const latestSnapshots = await readSnapshotIndex(folderPath);
-    const latestManifest = await readSyncManifest(folderPath);
+    const latestSnapshots = await coordinator.readSnapshotIndex();
+    const latestResource = await coordinator.readManifestResource();
+    const latestManifest = latestResource?.manifest ?? null;
     const manifestsMatch = latestManifest
       && JSON.stringify([...latestManifest.headSnapshotIds].sort()) === JSON.stringify([...originalManifest.headSnapshotIds].sort())
       && JSON.stringify([...latestManifest.prunedSnapshotIds].sort()) === JSON.stringify([...originalManifest.prunedSnapshotIds].sort());
@@ -690,20 +698,20 @@ async function compactSyncHistory(folderPath: string): Promise<boolean> {
       && latestSnapshots.size === snapshots.size + createdSnapshots.length
       && [...snapshots.keys()].every(snapshotId => latestSnapshots.has(snapshotId));
     if (!unchangedHistory) {
-      for (const snapshot of createdSnapshots) await removeSyncFile(syncSnapshotPath(folderPath, snapshot.snapshotId));
+      for (const snapshot of createdSnapshots) await coordinator.deleteSnapshot(snapshot.snapshotId);
       return false;
     }
 
     const newHead = createdSnapshots.at(-1)!;
-    await writeSyncJson(syncManifestPath(folderPath), {
+    await coordinator.writeManifest({
       ...latestManifest,
       headSnapshotIds: [newHead.snapshotId],
       prunedSnapshotIds: [...new Set([...latestManifest.prunedSnapshotIds, ...snapshots.keys()])],
-    });
+    }, latestResource?.remote.version);
     manifestPublished = true;
     for (const snapshotId of snapshots.keys()) {
       try {
-        await removeSyncFile(syncSnapshotPath(folderPath, snapshotId));
+        await coordinator.deleteSnapshot(snapshotId);
       } catch (error) {
         console.warn(`Could not remove old sync snapshot ${snapshotId}:`, error);
       }
@@ -722,7 +730,7 @@ async function compactSyncHistory(folderPath: string): Promise<boolean> {
   } catch (error) {
     if (!manifestPublished) {
       for (const snapshot of createdSnapshots) {
-        try { await removeSyncFile(syncSnapshotPath(folderPath, snapshot.snapshotId)); } catch { /* best-effort cleanup */ }
+        try { await coordinator.deleteSnapshot(snapshot.snapshotId); } catch { /* best-effort cleanup */ }
       }
     }
     console.warn('Could not compact sync history:', error);
@@ -731,32 +739,33 @@ async function compactSyncHistory(folderPath: string): Promise<boolean> {
 }
 
 async function publishPendingSnapshots(): Promise<number> {
-  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId || syncState.conflicts.length) return 0;
+  const coordinator = syncCoordinatorFor();
+  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId || syncState.conflicts.length || !coordinator) return 0;
   const checkedAt = startSyncCheck();
-  const folderPath = syncState.folderPath;
-  await ensureSyncDirectory(syncRootPath(folderPath));
-  await ensureSyncDirectory(syncSnapshotsPath(folderPath));
-  let manifest = await readSyncManifest(folderPath);
-  if (!manifest) throw new Error('The connected folder is missing its notebook manifest.');
+  await coordinator.connect();
+  let manifestResource = await coordinator.readManifestResource();
+  let manifest = manifestResource?.manifest ?? null;
+  if (!manifest || !manifestResource) throw new Error('The connected folder is missing its notebook manifest.');
   if (manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder belongs to a different notebook.');
   let published = 0;
   for (const snapshot of [...syncState.pendingSnapshots]) {
     if (snapshot.notebookId !== syncState.notebookId) throw new Error('A pending snapshot belongs to a different notebook.');
-    const availableSnapshots = await readSnapshotIndex(folderPath, new Set(manifest.prunedSnapshotIds));
+    const availableSnapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds));
     const missingParent = snapshot.parentSnapshotIds.find(parentId => !availableSnapshots.has(parentId));
     if (missingParent) {
       throw new Error(`The pending snapshot is based on history that is no longer available (${missingParent}). Fetch the shared checkpoint before publishing local work.`);
     }
-    await writeSnapshotIfNeeded(folderPath, snapshot);
-    const latestManifest = await readSyncManifest(folderPath);
-    if (!latestManifest || latestManifest.notebookId !== syncState.notebookId) {
+    await coordinator.createSnapshotIfNeeded(snapshot);
+    const latestResource = await coordinator.readManifestResource();
+    const latestManifest = latestResource?.manifest ?? null;
+    if (!latestManifest || !latestResource || latestManifest.notebookId !== syncState.notebookId) {
       throw new Error('The notebook manifest changed while publishing.');
     }
     manifest = {
       ...latestManifest,
       headSnapshotIds: [...new Set([...latestManifest.headSnapshotIds, ...snapshot.parentSnapshotIds, snapshot.snapshotId])],
     };
-    await writeSyncJson(syncManifestPath(folderPath), manifest);
+    manifestResource = await coordinator.writeManifest(manifest, latestResource.remote.version);
     syncState.pendingSnapshots = syncState.pendingSnapshots.filter(item => item.snapshotId !== snapshot.snapshotId);
     syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds])];
     syncState.lastPublishedSnapshotId = snapshot.snapshotId;
@@ -774,41 +783,8 @@ async function publishPendingSnapshots(): Promise<number> {
     finishSyncCheck(checkedAt);
     await saveSyncState(syncState);
   }
-  await compactSyncHistory(folderPath);
+  await compactSyncHistory(coordinator);
   return published;
-}
-
-async function readSnapshotIndex(folderPath: string, excludedSnapshotIds = new Set<string>()): Promise<Map<string, SyncSnapshot>> {
-  const files = await listSyncFiles(syncSnapshotsPath(folderPath));
-  const snapshots = new Map<string, SyncSnapshot>();
-  for (const fileName of files.filter(name => name.toLowerCase().endsWith('.json'))) {
-    const path = syncSnapshotsPath(folderPath).replace(/[\\/]$/, '') + (syncSnapshotsPath(folderPath).includes('\\') ? '\\' : '/') + fileName;
-    const raw = await readOptionalSyncFile(path);
-    if (raw === null) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw) as unknown;
-    } catch {
-      continue;
-    }
-    let snapshot: SyncSnapshot;
-    try {
-      snapshot = parseSyncSnapshot(parsed, `Snapshot ${fileName}`);
-    } catch {
-      continue;
-    }
-    if (snapshot.notebookId !== syncState.notebookId) throw new Error(`Snapshot ${fileName} belongs to a different notebook.`);
-    const existing = snapshots.get(snapshot.snapshotId);
-    if (existing && JSON.stringify(existing) !== JSON.stringify(snapshot)) {
-      throw new Error(`Snapshot ${snapshot.snapshotId} has conflicting copies.`);
-    }
-    snapshots.set(snapshot.snapshotId, snapshot);
-  }
-  for (const [snapshotId, snapshot] of snapshots) {
-    if (!hasValidSnapshotParentRevisions(snapshot, snapshots)) snapshots.delete(snapshotId);
-  }
-  excludedSnapshotIds.forEach(snapshotId => snapshots.delete(snapshotId));
-  return snapshots;
 }
 
 function snapshotAncestry(snapshotId: string, snapshots: Map<string, SyncSnapshot>): string[] {
@@ -844,11 +820,11 @@ function acceptedSnapshotId(): string | null {
 }
 
 async function scanSharedUpdate(includeIgnored = false): Promise<AvailableUpdate | null> {
-  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return null;
-  const folderPath = syncState.folderPath;
-  const manifest = await readSyncManifest(folderPath);
+  const coordinator = syncCoordinatorFor();
+  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId || !coordinator) return null;
+  const manifest = await coordinator.readManifest();
   if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder has no matching notebook manifest.');
-  const snapshots = await readSnapshotIndex(folderPath, new Set(manifest.prunedSnapshotIds));
+  const snapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds));
   updateRetentionStatus(snapshots);
   const leaves = snapshotLeaves(snapshots);
   syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds, ...leaves.map(snapshot => snapshot.snapshotId)])];
@@ -1049,16 +1025,16 @@ function ignoreAvailableUpdate() {
 }
 
 async function reconcileSync(): Promise<{ applied: number; conflicts: number }> {
-  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return { applied: 0, conflicts: 0 };
+  const coordinator = syncCoordinatorFor();
+  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId || !coordinator) return { applied: 0, conflicts: 0 };
   if (taskEditorIsOpen()) {
     syncDeferred = true;
     return { applied: 0, conflicts: syncState.conflicts.length };
   }
   if (syncState.conflicts.length) return { applied: 0, conflicts: syncState.conflicts.length };
-  const folderPath = syncState.folderPath;
-  const manifest = await readSyncManifest(folderPath);
+  const manifest = await coordinator.readManifest();
   if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder has no matching notebook manifest.');
-  const snapshots = await readSnapshotIndex(folderPath, new Set(manifest.prunedSnapshotIds));
+  const snapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds));
   syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds, ...snapshotLeaves(snapshots).map(snapshot => snapshot.snapshotId)])];
   const currentId = syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
   const completeLeaves = snapshotLeaves(snapshots);
@@ -1180,10 +1156,10 @@ async function reconcileSync(): Promise<{ applied: number; conflicts: number }> 
 }
 
 async function queueSyncSnapshot(document: StoredDocument): Promise<void> {
-  if (!syncReady || storageKind() !== 'desktop' || !syncState.notebookId || !syncState.folderPath || syncState.status === 'disconnected' || syncState.conflicts.length) return;
+  if (!syncReady || storageKind() !== 'desktop' || !syncState.notebookId || !localSyncParentPath() || syncState.status === 'disconnected' || syncState.conflicts.length) return;
   try {
     await enqueueSyncMutation(async () => {
-      if (!syncState.notebookId || !syncState.folderPath || syncState.status === 'disconnected') return;
+      if (!syncState.notebookId || !localSyncParentPath() || syncState.status === 'disconnected') return;
       const previousPending = syncState.pendingSnapshots.at(-1)?.snapshotId;
       const parents = syncState.mergeParentSnapshotIds.length
         ? syncState.mergeParentSnapshotIds
@@ -1210,9 +1186,11 @@ async function connectSyncFolder(folderPath: string): Promise<boolean> {
   if (!trimmedPath) throw new Error('Choose a folder first.');
   return enqueueSyncMutation(async () => {
     const checkedAt = startSyncCheck();
-    await ensureSyncDirectory(syncRootPath(trimmedPath));
-    await ensureSyncDirectory(syncSnapshotsPath(trimmedPath));
-    const existingManifest = await readSyncManifest(trimmedPath);
+    const location: SyncLocation = { kind: 'local-folder', parentPath: trimmedPath };
+    const coordinator = syncCoordinatorFor(location);
+    if (!coordinator) throw new Error('The selected sync location is not supported by this desktop build.');
+    await coordinator.connect();
+    const existingManifest = await coordinator.readManifest();
     if (existingManifest && syncState.notebookId && existingManifest.notebookId !== syncState.notebookId) {
       throw new Error('This folder belongs to a different Backlogger notebook.');
     }
@@ -1222,15 +1200,15 @@ async function connectSyncFolder(folderPath: string): Promise<boolean> {
     let sharedHead: SyncSnapshot | null = null;
     let sharedSnapshots: Map<string, SyncSnapshot> | null = null;
     if (existingManifest && !syncState.currentSnapshotId && notebook.categories.length === 0) {
-      sharedSnapshots = await readSnapshotIndex(trimmedPath, new Set(manifest.prunedSnapshotIds));
+      sharedSnapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds), manifest.notebookId);
       sharedHead = snapshotLeaves(sharedSnapshots).at(-1) ?? null;
     }
-    syncState.folderPath = trimmedPath;
+    syncState.location = location;
     syncState.status = 'connected';
     syncState.knownHeadSnapshotIds = [...new Set(manifest.headSnapshotIds)];
     syncState.lastError = null;
     await saveSyncState(syncState);
-    if (!existingManifest) await writeSyncJson(syncManifestPath(trimmedPath), manifest);
+    if (!existingManifest) await coordinator.writeManifest(manifest, null);
     if (sharedHead) {
       notebook = { categories: sharedHead.categories.map(category => ({ ...category, tasks: category.tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })) })) };
       revision = Math.max(revision, sharedHead.revision);
@@ -1275,7 +1253,7 @@ async function connectSyncFolder(folderPath: string): Promise<boolean> {
 async function disconnectSync(): Promise<void> {
   await enqueueSyncMutation(async () => {
     syncState.status = 'disconnected';
-    syncState.folderPath = null;
+    syncState.location = null;
     syncState.lastError = null;
     await saveSyncState(syncState);
   });
@@ -1283,7 +1261,7 @@ async function disconnectSync(): Promise<void> {
 
 async function toggleSyncPause(): Promise<void> {
   await enqueueSyncMutation(async () => {
-    if (!syncState.folderPath || syncState.status === 'disconnected') throw new Error('Connect a folder first.');
+    if (!syncState.location || syncState.status === 'disconnected') throw new Error('Connect a folder first.');
     syncState.status = syncState.status === 'paused' ? 'connected' : 'paused';
     syncState.lastError = null;
     await saveSyncState(syncState);
@@ -1304,7 +1282,7 @@ function openSyncDialog() {
   editor.dialog.addEventListener('close', () => {
     if (syncDialogElement === editor.dialog) syncDialogElement = null;
   }, { once: true });
-  let selectedFolder = syncState.folderPath;
+  let selectedFolder = localSyncParentPath();
   let createNotebookConfirmed = false;
   const intro = element('p', '', 'Use a local folder already synchronized by OneDrive or Google Drive for desktop.');
   const statusLine = element('p', 'import-summary');
@@ -1317,19 +1295,19 @@ function openSyncDialog() {
   const resolveButton = button('Resolve conflicts', () => void resolveConflicts());
   controls.append(choose, syncNowButton, pauseButton, disconnectButton, resolveButton);
   editor.body.append(intro, statusLine, folderLine, controls);
-  editor.save.textContent = syncState.folderPath && syncState.status !== 'disconnected' ? 'Done' : 'Connect';
+  editor.save.textContent = syncState.location && syncState.status !== 'disconnected' ? 'Done' : 'Connect';
 
   function refresh() {
     statusLine.textContent = `${syncStatusLabel()} · ${syncStatusDetail()}`;
     folderLine.textContent = selectedFolder ? `Folder: ${selectedFolder}` : 'No folder selected.';
-    const connected = syncState.status !== 'disconnected' && Boolean(syncState.folderPath);
+    const connected = syncState.status !== 'disconnected' && Boolean(syncState.location);
     choose.disabled = storageKind() !== 'desktop' || !syncReady;
     syncNowButton.disabled = !connected || syncState.status === 'paused';
     pauseButton.disabled = !connected;
     disconnectButton.disabled = !connected;
     resolveButton.disabled = !syncState.conflicts.length;
     pauseButton.textContent = syncState.status === 'paused' ? 'Resume' : 'Pause';
-    editor.save.textContent = connected && selectedFolder === syncState.folderPath ? 'Done' : 'Connect';
+    editor.save.textContent = connected && selectedFolder === localSyncParentPath() ? 'Done' : 'Connect';
     editor.save.disabled = storageKind() !== 'desktop' || !syncReady;
   }
 
@@ -1351,7 +1329,10 @@ function openSyncDialog() {
     editor.error.textContent = '';
     editor.save.disabled = true;
     try {
-      const existingManifest = await readSyncManifest(selectedFolder);
+      const selectedLocation: SyncLocation = { kind: 'local-folder', parentPath: selectedFolder };
+      const selectedCoordinator = syncCoordinatorFor(selectedLocation);
+      if (!selectedCoordinator) throw new Error('The selected sync location is not supported by this desktop build.');
+      const existingManifest = await selectedCoordinator.readManifest();
       if (!existingManifest && !createNotebookConfirmed) {
         createNotebookConfirmed = true;
         editor.error.textContent = 'No shared notebook was found. Press Connect again to create a new notebook here, or cancel and wait for the provider to finish downloading.';
@@ -1420,7 +1401,7 @@ function openSyncDialog() {
 
   editor.form.addEventListener('submit', event => {
     event.preventDefault();
-    if (syncState.status !== 'disconnected' && selectedFolder === syncState.folderPath) {
+    if (syncState.status !== 'disconnected' && selectedFolder === localSyncParentPath()) {
       editor.dialog.close();
       return;
     }
@@ -1542,7 +1523,7 @@ function queueSave(publishSync = false) {
   }
   const documentToSave = makeStoredDocument(notebook, ++revision, viewMode, theme);
   const sequence = ++saveSequence;
-  setStorageNotice('Saving locally…', storageKind() === 'desktop' ? 'Writing a versioned file in the app-data folder.' : 'Writing to browser local storage for this preview.');
+  setStorageNotice('Saving locally…', capabilities.nativeLocalStorage ? 'Writing a versioned file in the app-data folder.' : 'Writing to browser local storage for this preview.');
   saveQueue = saveQueue
     .catch(() => undefined)
     .then(() => writeStoredDocument(documentToSave))
@@ -1551,7 +1532,7 @@ function queueSave(publishSync = false) {
       if (sequence === saveSequence) {
         hasUnsavedChanges = false;
         retrySaveButton.hidden = true;
-        setStorageNotice('Saved locally', storageKind() === 'desktop' ? 'Your backlog is stored on this device.' : 'Preview data is stored in this browser.');
+        setStorageNotice('Saved locally', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data is stored in this browser.');
       }
     })
     .catch(error => {
@@ -1820,8 +1801,12 @@ function render() {
   addCategory.disabled = !editingReady;
   themeButton.disabled = !editingReady;
   allView.disabled = todayView.disabled = tomorrowView.disabled = !editingReady;
-  importButton.disabled = exportButton.disabled = !editingReady;
-  syncButton.disabled = !storageReady || closeInProgress || (storageKind() === 'desktop' && !syncReady);
+  importButton.disabled = exportButton.disabled = !editingReady || !capabilities.documentImportExport;
+  if (!capabilities.documentImportExport) {
+    importButton.title = 'Import and export will be available in a later Android milestone.';
+    exportButton.title = 'Import and export will be available in a later Android milestone.';
+  }
+  syncButton.disabled = !storageReady || closeInProgress || !capabilities.localFolderSync || !syncReady;
   undoButton.disabled = !editingReady;
   renderStatusBar();
   if (notebook.categories.length === 0) {
@@ -1952,7 +1937,8 @@ function askCloseAfterSaveTimeout(): Promise<boolean> {
 }
 
 async function writeCloseSnapshot(): Promise<void> {
-  if (!syncState.folderPath || !syncState.notebookId || syncState.conflicts.length) return;
+  const coordinator = syncCoordinatorFor();
+  if (!localSyncParentPath() || !syncState.notebookId || syncState.conflicts.length || !coordinator) return;
   const pendingBaseParents = syncState.pendingSnapshots[0]?.parentSnapshotIds ?? [];
   const parents = syncState.mergeParentSnapshotIds.length
     ? syncState.mergeParentSnapshotIds
@@ -1970,7 +1956,7 @@ async function writeCloseSnapshot(): Promise<void> {
   // Closing performs one shared-folder operation: write the immutable snapshot.
   // If this does not finish, the unchanged content fingerprint makes the next
   // session recognize that the local notebook still needs publication.
-  await writeSyncJson(syncSnapshotPath(syncState.folderPath, snapshot.snapshotId), snapshot);
+  await coordinator.createSnapshotIfNeeded(snapshot);
 
   syncState.pendingSnapshots = [];
   syncState.currentSnapshotId = snapshot.snapshotId;
@@ -2006,7 +1992,7 @@ async function closeSession(): Promise<boolean> {
     render();
     return false;
   }
-  if (syncState.status !== 'connected' || !syncState.folderPath || !syncState.notebookId) return true;
+  if (syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId) return true;
 
   const localNeedsPublish = sessionContentDirty || syncState.pendingSnapshots.length > 0;
   if (localNeedsPublish) {
@@ -2027,7 +2013,7 @@ async function closeSession(): Promise<boolean> {
 }
 
 async function installNativeCloseHandler() {
-  if (storageKind() !== 'desktop') return;
+  if (!capabilities.desktopClose) return;
   await getCurrentWindow().onCloseRequested(async event => {
     if (closeInProgress) {
       event.preventDefault();
@@ -2109,7 +2095,7 @@ async function loadInitialData() {
       : syncState.lastPublishedRevision !== null && revision > syncState.lastPublishedRevision;
     sessionContentDirty = syncState.pendingSnapshots.length > 0 || (syncState.status === 'connected' && fingerprintChanged);
     recoverButton.hidden = true;
-    setStorageNotice(stored ? 'Saved locally' : 'Local data ready', storageKind() === 'desktop' ? 'Your backlog is stored on this device.' : 'Preview data will be stored in this browser.');
+    setStorageNotice(stored ? 'Saved locally' : 'Local data ready', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data will be stored in this browser.');
     sessionPhase = syncReady && syncState.status === 'connected' ? 'fetching' : syncLoadError ? 'offline' : 'ready';
     render();
     if (syncReady && syncState.status === 'connected') void startSessionFetch();
