@@ -1,11 +1,14 @@
 import type { SyncLocation } from '../sync.ts';
 
-export type SyncTransportKind = 'local-folder' | 'onedrive';
+export type SyncTransportKind = 'local-folder' | 'onedrive' | 'supabase';
 
 export type SyncTransportErrorCode =
   | 'location-unavailable'
   | 'not-found'
   | 'permission'
+  | 'auth-required'
+  | 'rate-limited'
+  | 'server'
   | 'conflict'
   | 'offline'
   | 'invalid'
@@ -14,12 +17,14 @@ export type SyncTransportErrorCode =
 export class SyncTransportError extends Error {
   readonly code: SyncTransportErrorCode;
   readonly retriable: boolean;
+  readonly cause?: unknown;
 
-  constructor(code: SyncTransportErrorCode, message: string, retriable = false) {
+  constructor(code: SyncTransportErrorCode, message: string, retriable = false, cause?: unknown) {
     super(message);
     this.name = 'SyncTransportError';
     this.code = code;
     this.retriable = retriable;
+    this.cause = cause;
   }
 }
 
@@ -41,7 +46,7 @@ export interface VersionedRemoteFile {
 }
 
 export interface SyncTransportCapabilities {
-  /** Local filesystem checks are not atomic; Graph will provide a strong version later. */
+  /** Whether manifest writes can be guarded by a provider-native version token. */
   conditionalManifestWrite: 'best-effort' | 'strong' | 'unsupported';
   /** Snapshot creation must never replace a different payload under the same ID. */
   immutableSnapshotCreate: 'best-effort' | 'strong';
@@ -57,7 +62,7 @@ export interface ResolvedSyncLocation {
 }
 
 /**
- * Exchange operations shared by local-folder and future OneDrive transports.
+ * Exchange operations shared by every sync provider.
  * Protocol parsing and ancestry decisions stay in SyncCoordinator above this boundary.
  */
 export interface SyncTransport {
@@ -73,4 +78,6 @@ export interface SyncTransport {
   readSnapshot(entry: SyncRemoteEntry): Promise<VersionedRemoteFile>;
   createSnapshot(snapshotId: string, content: string): Promise<VersionedRemoteFile>;
   deleteSnapshot(snapshotId: string): Promise<void>;
+  /** Provider-specific atomic first-notebook initialization, when supported. */
+  initializeNotebook?(notebookId: string, snapshotId: string, snapshotContent: string, manifestContent: string): Promise<VersionedRemoteFile>;
 }

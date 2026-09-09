@@ -25,7 +25,15 @@ export interface OneDriveLocation {
   displayPath: string;
 }
 
-export type SyncLocation = LocalFolderLocation | OneDriveLocation;
+export interface SupabaseLocation {
+  kind: 'supabase';
+  /** Supabase Auth user id; never use the user's email as the identity key. */
+  accountId: string;
+  /** Non-secret project reference used to prevent cross-project reconnects. */
+  projectRef: string;
+}
+
+export type SyncLocation = LocalFolderLocation | OneDriveLocation | SupabaseLocation;
 
 export interface SyncSnapshot {
   protocolVersion: typeof SYNC_PROTOCOL_VERSION;
@@ -110,11 +118,14 @@ function stringArray(value: unknown, field: string): string[] {
 }
 
 function parseSyncLocation(value: unknown, field = 'sync location'): SyncLocation {
-  if (!isRecord(value) || (value.kind !== 'local-folder' && value.kind !== 'onedrive')) {
+  if (!isRecord(value) || (value.kind !== 'local-folder' && value.kind !== 'onedrive' && value.kind !== 'supabase')) {
     throw new Error(`Sync data has an invalid ${field}.`);
   }
   if (value.kind === 'local-folder') {
     return { kind: 'local-folder', parentPath: requiredString(value.parentPath, `${field} parent path`) };
+  }
+  if (value.kind === 'supabase') {
+    throw new Error(`Sync data has a Supabase location before the schema-3 migration.`);
   }
   return {
     kind: 'onedrive',

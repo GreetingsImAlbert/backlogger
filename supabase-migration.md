@@ -323,6 +323,16 @@ Record the Supabase CLI version, local test count, migration filename, and wheth
 - No provider code appears in ancestry/merge functions.
 - No live user data is required for the automated suite.
 
+### Milestone 3 handoff
+
+- **Status:** Implementation complete; no live Supabase project or user data was accessed.
+- **Transport:** Added `SupabaseSyncTransport` with `SupabaseLocation` bound to the Supabase Auth account ID and project ref. It validates the active account on every operation, discovers the account's single notebook manifest, and keeps the notebook ID as transport-local binding until the schema-3 state migration.
+- **Safety:** Manifest writes use only the database `manifest_version` CAS token; snapshot creation is immutable and idempotent; deletion calls the guarded pruned-snapshot RPC; account/project mismatches, auth loss, permission denial, rate limits, offline failures, invalid responses, and transient server errors map to sanitized `SyncTransportError` values.
+- **Coordinator boundary:** Added provider-neutral atomic notebook initialization support without putting provider logic into ancestry or merge code. Schema-2 sync-state parsing still rejects persisted Supabase locations until Milestone 4 performs the explicit schema-3 migration.
+- **Tests:** Added deterministic fake-client coverage for initialization, CAS conflicts, snapshot pagination, duplicate/collision handling, deletion guards, malformed responses, auth loss, RLS-style denial, network errors, account/project mismatch, and concurrent heads.
+- **Checks:** `npm.cmd run check` passed; `npm.cmd test` passed with 41 tests; `npm.cmd run build` passed; `git diff --check` passed.
+- **Next milestone interface:** Milestone 4 may use `SupabaseSyncTransport`, `SyncCoordinator.initializeNotebook()`, the generated `Database` types, and `SupabaseLocation`. It must migrate live sync state to schema 3, wire the login UI, and bind the transport only after explicit account/notebook validation.
+
 ## Milestone 4 — Migrate local sync state and replace the connection UI
 
 **Prerequisites:** Milestones 1–3 and the schema-3 migration rules above. Gate A is required for end-to-end login.
