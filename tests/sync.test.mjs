@@ -15,6 +15,8 @@ import {
   parseSyncManifest,
   parseSyncSnapshot,
   parseSyncState,
+  reconcileManifestHeadIds,
+  snapshotLeaves,
   storedDocumentFromSyncSnapshot,
   syncManifestPath,
   syncRootPath,
@@ -129,6 +131,23 @@ test('snapshot ancestry supports fast-forward and common-base lookup', () => {
   assert.equal(hasCompleteSnapshotAncestry(child, snapshots), true);
   assert.equal(isSnapshotAncestor('base', 'child', snapshots), true);
   assert.equal(findCommonSnapshotAncestor('base', 'child', snapshots), 'base');
+});
+
+test('snapshot leaves exclude ancestors while preserving concurrent branches', () => {
+  const state = makeSyncState('device-1');
+  state.notebookId = 'notebook-1';
+  const base = { ...makeSyncSnapshot(makeStoredDocument(notebook, 1, 'all'), state, []), snapshotId: 'base', createdAt: '2026-09-06T00:00:00.000Z' };
+  const firstBranch = { ...makeSyncSnapshot(makeStoredDocument(notebook, 2, 'all'), state, ['base']), snapshotId: 'first', createdAt: '2026-09-06T00:01:00.000Z' };
+  const secondBranch = { ...makeSyncSnapshot(makeStoredDocument(notebook, 3, 'all'), state, ['base']), snapshotId: 'second', createdAt: '2026-09-06T00:02:00.000Z' };
+  const firstDescendant = { ...makeSyncSnapshot(makeStoredDocument(notebook, 4, 'all'), state, ['first']), snapshotId: 'first-child', createdAt: '2026-09-06T00:03:00.000Z' };
+  const snapshots = new Map([
+    [base.snapshotId, base],
+    [firstBranch.snapshotId, firstBranch],
+    [secondBranch.snapshotId, secondBranch],
+    [firstDescendant.snapshotId, firstDescendant],
+  ]);
+  assert.deepEqual(snapshotLeaves(snapshots).map(snapshot => snapshot.snapshotId), ['second', 'first-child']);
+  assert.deepEqual(reconcileManifestHeadIds(snapshots, ['base', 'unknown-head']), ['second', 'first-child', 'unknown-head']);
 });
 
 test('sync snapshots can be recovered as normal local documents and reject stale descendants', () => {

@@ -405,6 +405,20 @@ export function hasCompleteSnapshotAncestry(snapshot: SyncSnapshot, snapshots: M
   return true;
 }
 
+export function snapshotLeaves(snapshots: Map<string, SyncSnapshot>): SyncSnapshot[] {
+  const parentIds = new Set<string>();
+  snapshots.forEach(snapshot => snapshot.parentSnapshotIds.forEach(parentId => parentIds.add(parentId)));
+  return [...snapshots.values()]
+    .filter(snapshot => !parentIds.has(snapshot.snapshotId) && hasCompleteSnapshotAncestry(snapshot, snapshots))
+    .sort((first, second) => first.createdAt.localeCompare(second.createdAt));
+}
+
+export function reconcileManifestHeadIds(snapshots: Map<string, SyncSnapshot>, previousHeadIds: string[] = []): string[] {
+  const observedSnapshotIds = new Set(snapshots.keys());
+  const unobservedHeadIds = previousHeadIds.filter(snapshotId => !observedSnapshotIds.has(snapshotId));
+  return [...new Set([...snapshotLeaves(snapshots).map(snapshot => snapshot.snapshotId), ...unobservedHeadIds])];
+}
+
 export function findCommonSnapshotAncestor(firstId: string, secondId: string, snapshots: Map<string, SyncSnapshot>): string | null {
   const firstAncestors = new Set<string>();
   const firstPending = [firstId];

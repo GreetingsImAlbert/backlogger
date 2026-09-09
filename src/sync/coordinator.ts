@@ -1,4 +1,4 @@
-import { hasValidSnapshotParentRevisions, parseSyncManifest, parseSyncSnapshot, type SyncManifest, type SyncSnapshot } from '../sync.ts';
+import { hasValidSnapshotParentRevisions, parseSyncManifest, parseSyncSnapshot, reconcileManifestHeadIds, type SyncManifest, type SyncSnapshot } from '../sync.ts';
 import { SyncTransportError, type SyncTransport, type VersionedRemoteFile } from './transport.ts';
 
 export interface SyncManifestResource {
@@ -88,6 +88,36 @@ export class SyncCoordinator {
   async createSnapshotIfNeeded(snapshot: SyncSnapshot): Promise<SyncSnapshotResource> {
     const remote = await this.transport.createSnapshot(snapshot.snapshotId, JSON.stringify(snapshot, null, 2));
     return { snapshot, remote };
+  }
+
+  async publishSnapshot(snapshot: SyncSnapshot): Promise<SyncManifestResource> {
+    const originalResource = await this.readManifestResource();
+    const originalManifest = originalResource?.manifest ?? null;
+    if (!originalManifest || !originalResource) throw new Error('The connected folder is missing its notebook manifest.');
+    if (originalManifest.notebookId !== snapshot.notebookId || (this.notebookId && this.notebookId !== snapshot.notebookId)) {
+      throw new Error('The connected folder belongs to a different notebook.');
+    }
+
+    let availableSnapshots = await this.readSnapshotIndex(new Set(originalManifest.prunedSnapshotIds), snapshot.notebookId);
+    const missingParent = snapshot.parentSnapshotIds.find(parentId => !availableSnapshots.has(parentId));
+    if (missingParent) {
+      throw new Error(`The pending snapshot is based on history that is no longer available (${missingParent}). Fetch the shared checkpoint before publishing local work.`);
+    }
+
+    await this.createSnapshotIfNeeded(snapshot);
+    const latestResource = await this.readManifestResource();
+    const latestManifest = latestResource?.manifest ?? null;
+    if (!latestManifest || !latestResource || latestManifest.notebookId !== snapshot.notebookId) {
+      throw new Error('The notebook manifest changed while publishing.');
+    }
+    if (JSON.stringify(latestManifest.prunedSnapshotIds) !== JSON.stringify(originalManifest.prunedSnapshotIds)) {
+      availableSnapshots = await this.readSnapshotIndex(new Set(latestManifest.prunedSnapshotIds), snapshot.notebookId);
+    }
+    availableSnapshots.set(snapshot.snapshotId, snapshot);
+    return this.writeManifest({
+      ...latestManifest,
+      headSnapshotIds: reconcileManifestHeadIds(availableSnapshots, latestManifest.headSnapshotIds),
+    }, latestResource.remote.version);
   }
 
   deleteSnapshot(snapshotId: string): Promise<void> {

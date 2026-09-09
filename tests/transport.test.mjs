@@ -96,3 +96,23 @@ test('coordinator keeps transport metadata separate from validated sync records'
     error => error instanceof SyncTransportError && error.code === 'conflict',
   );
 });
+
+test('coordinator publication replaces ancestor manifest entries with actual branch heads', async () => {
+  const sharedFiles = new Map();
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const coordinator = new SyncCoordinator(new MemoryTransport(sharedFiles, 'profile-a'), state.notebookId);
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), snapshotId: 'base', createdAt: '2026-09-06T00:00:00.000Z' };
+  const first = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'first', createdAt: '2026-09-06T00:01:00.000Z' };
+  const concurrent = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'concurrent', createdAt: '2026-09-06T00:02:00.000Z' };
+  const descendant = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 3, 'all'), state, ['first']), snapshotId: 'descendant', createdAt: '2026-09-06T00:03:00.000Z' };
+  await coordinator.writeManifest(makeSyncManifest(state.notebookId, state.deviceId, ['base', 'first', 'concurrent']), null);
+  await coordinator.createSnapshotIfNeeded(base);
+  await coordinator.createSnapshotIfNeeded(first);
+  await coordinator.createSnapshotIfNeeded(concurrent);
+
+  const published = await coordinator.publishSnapshot(descendant);
+
+  assert.deepEqual(published.manifest.headSnapshotIds, ['concurrent', 'descendant']);
+  assert.ok(sharedFiles.has('snapshots/descendant.json'));
+});

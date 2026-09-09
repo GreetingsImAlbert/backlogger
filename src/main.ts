@@ -6,7 +6,7 @@ import type { Category, Notebook, Task } from './model';
 import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
 import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
-import { applySyncConflict, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, localFolderLocation, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncConflict, type SyncSnapshot, type SyncState, type SyncLocation } from './sync';
+import { applySyncConflict, findCommonSnapshotAncestor, isSnapshotAncestor, loadSyncState, localFolderLocation, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncConflict, type SyncSnapshot, type SyncState, type SyncLocation } from './sync';
 import { SyncCoordinator } from './sync/coordinator';
 import { LocalFolderSyncTransport, type LocalFolderTransportOptions } from './sync/local-folder-transport';
 import type { SyncTransport } from './sync/transport';
@@ -750,24 +750,10 @@ async function publishPendingSnapshots(): Promise<number> {
   let published = 0;
   for (const snapshot of [...syncState.pendingSnapshots]) {
     if (snapshot.notebookId !== syncState.notebookId) throw new Error('A pending snapshot belongs to a different notebook.');
-    const availableSnapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds));
-    const missingParent = snapshot.parentSnapshotIds.find(parentId => !availableSnapshots.has(parentId));
-    if (missingParent) {
-      throw new Error(`The pending snapshot is based on history that is no longer available (${missingParent}). Fetch the shared checkpoint before publishing local work.`);
-    }
-    await coordinator.createSnapshotIfNeeded(snapshot);
-    const latestResource = await coordinator.readManifestResource();
-    const latestManifest = latestResource?.manifest ?? null;
-    if (!latestManifest || !latestResource || latestManifest.notebookId !== syncState.notebookId) {
-      throw new Error('The notebook manifest changed while publishing.');
-    }
-    manifest = {
-      ...latestManifest,
-      headSnapshotIds: [...new Set([...latestManifest.headSnapshotIds, ...snapshot.parentSnapshotIds, snapshot.snapshotId])],
-    };
-    manifestResource = await coordinator.writeManifest(manifest, latestResource.remote.version);
+    manifestResource = await coordinator.publishSnapshot(snapshot);
+    manifest = manifestResource.manifest;
     syncState.pendingSnapshots = syncState.pendingSnapshots.filter(item => item.snapshotId !== snapshot.snapshotId);
-    syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds])];
+    syncState.knownHeadSnapshotIds = [...manifest.headSnapshotIds];
     syncState.lastPublishedSnapshotId = snapshot.snapshotId;
     syncState.lastPublishedRevision = snapshot.revision;
     syncState.lastPublishedContentFingerprint = snapshotFingerprint(snapshot);
@@ -801,14 +787,6 @@ function snapshotAncestry(snapshotId: string, snapshots: Map<string, SyncSnapsho
     pending.push(...snapshot.parentSnapshotIds);
   }
   return result;
-}
-
-function snapshotLeaves(snapshots: Map<string, SyncSnapshot>): SyncSnapshot[] {
-  const parents = new Set<string>();
-  snapshots.forEach(snapshot => snapshot.parentSnapshotIds.forEach(parentId => parents.add(parentId)));
-  return [...snapshots.values()]
-    .filter(snapshot => !parents.has(snapshot.snapshotId) && hasCompleteSnapshotAncestry(snapshot, snapshots))
-    .sort((first, second) => first.createdAt.localeCompare(second.createdAt));
 }
 
 function taskEditorIsOpen(): boolean {
@@ -909,6 +887,21 @@ async function runSessionFetch() {
   sessionPhase = 'fetching';
   setStatusMessage('Fetching shared updates…');
   render();
+  if (syncState.pendingSnapshots.length) {
+    try {
+      await withSyncTimeout(enqueueSyncMutation(() => publishPendingSnapshots()));
+      if (!syncState.pendingSnapshots.length && syncState.lastPublishedContentFingerprint === notebookFingerprint(notebook)) {
+        sessionContentDirty = false;
+      }
+    } catch (error) {
+      syncState.lastError = errorText(error);
+      sessionPhase = 'offline';
+      try { await saveSyncState(syncState); } catch { /* local data remains available */ }
+      setStatusMessage(`Could not publish pending local changes: ${syncState.lastError}`);
+      render();
+      return;
+    }
+  }
   const update = await checkForSharedUpdate(true);
   if (!update) {
     sessionPhase = syncState.lastError ? 'offline' : 'ready';
@@ -1947,28 +1940,21 @@ async function writeCloseSnapshot(): Promise<void> {
       : pendingBaseParents.length
         ? pendingBaseParents
         : syncState.knownHeadSnapshotIds;
-  const snapshot = makeSyncSnapshot(
-    makeStoredDocument(notebook, revision, viewMode, theme),
-    syncState,
-    parents,
-  );
+  const document = makeStoredDocument(notebook, revision, viewMode, theme);
+  const existingPending = syncState.pendingSnapshots.at(-1);
+  const snapshot = existingPending
+    && existingPending.revision === document.revision
+    && snapshotFingerprint(existingPending) === notebookFingerprint(notebook)
+    ? existingPending
+    : makeSyncSnapshot(document, syncState, parents);
 
-  // Closing performs one shared-folder operation: write the immutable snapshot.
-  // If this does not finish, the unchanged content fingerprint makes the next
-  // session recognize that the local notebook still needs publication.
-  await coordinator.createSnapshotIfNeeded(snapshot);
-
-  syncState.pendingSnapshots = [];
-  syncState.currentSnapshotId = snapshot.snapshotId;
-  syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, snapshot.snapshotId])];
-  syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, snapshot.snapshotId])];
-  syncState.lastPublishedSnapshotId = snapshot.snapshotId;
-  syncState.lastPublishedRevision = snapshot.revision;
-  syncState.lastPublishedContentFingerprint = snapshotFingerprint(snapshot);
-  syncState.lastPublishedAt = new Date().toISOString();
-  syncState.mergeParentSnapshotIds = [];
+  // Save the final state as pending before touching the shared folder. Full
+  // publication writes both the immutable snapshot and the manifest. Startup
+  // and periodic checks retry this same snapshot if either operation fails.
+  syncState.pendingSnapshots = [snapshot];
   syncState.lastError = null;
   await saveSyncState(syncState);
+  await enqueueSyncMutation(() => publishPendingSnapshots());
 }
 
 async function closeSession(): Promise<boolean> {
@@ -2000,12 +1986,13 @@ async function closeSession(): Promise<boolean> {
       await withTimeout(
         writeCloseSnapshot(),
         CLOSE_SNAPSHOT_TIMEOUT_MS,
-        'The snapshot write did not finish before closing.',
+        'The sync publication did not finish before closing.',
       );
       sessionContentDirty = false;
       return true;
     } catch (error) {
       syncState.lastError = errorText(error);
+      try { await saveSyncState(syncState); } catch { /* pending publication is already persisted when possible */ }
       return true;
     }
   }
@@ -2063,6 +2050,10 @@ setInterval(refreshDateState, 30_000);
 async function attemptPendingSync() {
   if (taskEditorIsOpen()) {
     syncDeferred = true;
+    return;
+  }
+  if (syncState.pendingSnapshots.length) {
+    await startSessionFetch();
     return;
   }
   await checkForSharedUpdate();
