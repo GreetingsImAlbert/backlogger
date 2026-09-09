@@ -9,8 +9,10 @@ export interface PlatformCapabilities {
   nativeLocalStorage: boolean;
   nativeDocuments: boolean;
   documentImportExport: boolean;
-  localFolderSync: boolean;
-  oneDriveSync: boolean;
+  /** Provider-neutral cloud-sync entry point. */
+  cloudSync: boolean;
+  /** Supabase transport is Windows-only until Android callback/lifecycle work is verified. */
+  supabaseSync: boolean;
   desktopClose: boolean;
   mobileLifecycle: boolean;
 }
@@ -35,8 +37,8 @@ export function platformCapabilities(): PlatformCapabilities {
       nativeLocalStorage: true,
       nativeDocuments: true,
       documentImportExport: true,
-      localFolderSync: true,
-      oneDriveSync: false,
+      cloudSync: true,
+      supabaseSync: true,
       desktopClose: true,
       mobileLifecycle: false,
     };
@@ -47,8 +49,8 @@ export function platformCapabilities(): PlatformCapabilities {
       nativeLocalStorage: true,
       nativeDocuments: false,
       documentImportExport: false,
-      localFolderSync: false,
-      oneDriveSync: false,
+      cloudSync: false,
+      supabaseSync: false,
       desktopClose: false,
       mobileLifecycle: true,
     };
@@ -58,8 +60,8 @@ export function platformCapabilities(): PlatformCapabilities {
     nativeLocalStorage: false,
     nativeDocuments: false,
     documentImportExport: true,
-    localFolderSync: false,
-    oneDriveSync: false,
+    cloudSync: false,
+    supabaseSync: false,
     desktopClose: false,
     mobileLifecycle: false,
   };

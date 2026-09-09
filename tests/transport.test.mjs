@@ -75,6 +75,25 @@ class MemoryTransport {
   }
 }
 
+class StaleOnceTransport extends MemoryTransport {
+  injected = false;
+  writeAttempts = 0;
+
+  async writeManifest(content, expectedVersion) {
+    this.writeAttempts += 1;
+    if (!this.injected && expectedVersion !== null && expectedVersion !== undefined) {
+      this.injected = true;
+      const current = JSON.parse(this.sharedFiles.get('notebook.json'));
+      this.sharedFiles.set('notebook.json', JSON.stringify({
+        ...current,
+        headSnapshotIds: [...new Set([...current.headSnapshotIds, 'concurrent'])],
+      }));
+      throw new SyncTransportError('conflict', 'manifest changed', true);
+    }
+    return super.writeManifest(content, expectedVersion);
+  }
+}
+
 test('coordinator keeps transport metadata separate from validated sync records', async () => {
   const sharedFiles = new Map();
   const state = makeSyncState('device-a');
@@ -115,4 +134,58 @@ test('coordinator publication replaces ancestor manifest entries with actual bra
 
   assert.deepEqual(published.manifest.headSnapshotIds, ['concurrent', 'descendant']);
   assert.ok(sharedFiles.has('snapshots/descendant.json'));
+});
+
+test('coordinator retries a stale CAS and preserves a concurrent head', async () => {
+  const sharedFiles = new Map();
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const transport = new StaleOnceTransport(sharedFiles, 'profile-a');
+  const coordinator = new SyncCoordinator(transport, state.notebookId, {
+    retryDelayMs: 0,
+    wait: async () => {},
+  });
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), snapshotId: 'base' };
+  const concurrent = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'concurrent' };
+  const pending = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'pending' };
+  await coordinator.writeManifest(makeSyncManifest(state.notebookId, state.deviceId, ['base']), null);
+  await coordinator.createSnapshotIfNeeded(base);
+  await coordinator.createSnapshotIfNeeded(concurrent);
+
+  const published = await coordinator.publishSnapshot(pending);
+
+  assert.equal(transport.writeAttempts, 3);
+  assert.deepEqual(new Set(published.manifest.headSnapshotIds), new Set(['concurrent', 'pending']));
+  assert.ok(sharedFiles.has('snapshots/pending.json'));
+});
+
+test('coordinator stops after three stale CAS attempts without losing the immutable snapshot', async () => {
+  const sharedFiles = new Map();
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const transport = new MemoryTransport(sharedFiles, 'profile-a');
+  const originalWrite = transport.writeManifest.bind(transport);
+  let attempts = 0;
+  transport.writeManifest = async (content, expectedVersion) => {
+    if (expectedVersion !== null && expectedVersion !== undefined) {
+      attempts += 1;
+      throw new SyncTransportError('conflict', 'manifest changed', true);
+    }
+    return originalWrite(content, expectedVersion);
+  };
+  const coordinator = new SyncCoordinator(transport, state.notebookId, {
+    retryDelayMs: 0,
+    wait: async () => {},
+  });
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), snapshotId: 'base' };
+  const pending = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'pending' };
+  await coordinator.writeManifest(makeSyncManifest(state.notebookId, state.deviceId, ['base']), null);
+  await coordinator.createSnapshotIfNeeded(base);
+
+  await assert.rejects(
+    () => coordinator.publishSnapshot(pending),
+    error => error instanceof SyncTransportError && error.code === 'conflict' && error.retriable,
+  );
+  assert.equal(attempts, 3);
+  assert.ok(sharedFiles.has('snapshots/pending.json'));
 });

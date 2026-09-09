@@ -11,14 +11,40 @@ export interface SyncSnapshotResource {
   remote: VersionedRemoteFile;
 }
 
+export interface SyncCoordinatorOptions {
+  /** Maximum number of manifest CAS attempts for one immutable snapshot. */
+  maxPublishAttempts?: number;
+  /** Base delay before a retry. A small random jitter avoids synchronized retries. */
+  retryDelayMs?: number;
+  /** Injectable wait function for deterministic tests. */
+  wait?: (milliseconds: number) => Promise<void>;
+}
+
+const DEFAULT_MAX_PUBLISH_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 25;
+
+function defaultWait(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
 /** Shared protocol adapter: transport bytes enter here, validated records leave here. */
 export class SyncCoordinator {
   readonly transport: SyncTransport;
   readonly notebookId: string | null;
+  private readonly maxPublishAttempts: number;
+  private readonly retryDelayMs: number;
+  private readonly wait: (milliseconds: number) => Promise<void>;
 
-  constructor(transport: SyncTransport, notebookId: string | null = null) {
+  constructor(transport: SyncTransport, notebookId: string | null = null, options: SyncCoordinatorOptions = {}) {
     this.transport = transport;
     this.notebookId = notebookId;
+    this.maxPublishAttempts = Number.isInteger(options.maxPublishAttempts) && (options.maxPublishAttempts ?? 0) > 0
+      ? options.maxPublishAttempts as number
+      : DEFAULT_MAX_PUBLISH_ATTEMPTS;
+    this.retryDelayMs = Number.isFinite(options.retryDelayMs) && (options.retryDelayMs ?? 0) >= 0
+      ? options.retryDelayMs as number
+      : DEFAULT_RETRY_DELAY_MS;
+    this.wait = options.wait ?? defaultWait;
   }
 
   resolveLocation() {
@@ -104,11 +130,27 @@ export class SyncCoordinator {
   }
 
   async publishSnapshot(snapshot: SyncSnapshot): Promise<SyncManifestResource> {
+    for (let attempt = 1; attempt <= this.maxPublishAttempts; attempt += 1) {
+      try {
+        return await this.publishSnapshotAttempt(snapshot);
+      } catch (error) {
+        const retryableConflict = error instanceof SyncTransportError
+          && error.code === 'conflict'
+          && error.retriable;
+        if (!retryableConflict || attempt >= this.maxPublishAttempts) throw error;
+        const jitter = this.retryDelayMs === 0 ? 0 : this.retryDelayMs * (0.5 + Math.random());
+        await this.wait(jitter);
+      }
+    }
+    throw new Error('Cloud publication stopped before a safe manifest update.');
+  }
+
+  private async publishSnapshotAttempt(snapshot: SyncSnapshot): Promise<SyncManifestResource> {
     const originalResource = await this.readManifestResource();
     const originalManifest = originalResource?.manifest ?? null;
-    if (!originalManifest || !originalResource) throw new Error('The connected folder is missing its notebook manifest.');
+    if (!originalManifest || !originalResource) throw new Error('The connected sync location is missing its notebook manifest.');
     if (originalManifest.notebookId !== snapshot.notebookId || (this.notebookId && this.notebookId !== snapshot.notebookId)) {
-      throw new Error('The connected folder belongs to a different notebook.');
+      throw new Error('The connected sync location belongs to a different notebook.');
     }
 
     let availableSnapshots = await this.readSnapshotIndex(new Set(originalManifest.prunedSnapshotIds), snapshot.notebookId);
@@ -123,9 +165,10 @@ export class SyncCoordinator {
     if (!latestManifest || !latestResource || latestManifest.notebookId !== snapshot.notebookId) {
       throw new Error('The notebook manifest changed while publishing.');
     }
-    if (JSON.stringify(latestManifest.prunedSnapshotIds) !== JSON.stringify(originalManifest.prunedSnapshotIds)) {
-      availableSnapshots = await this.readSnapshotIndex(new Set(latestManifest.prunedSnapshotIds), snapshot.notebookId);
-    }
+    // Always re-read the complete visible history after the immutable insert.
+    // A concurrent publisher may have added a head without changing the
+    // manifest's pruned list; ancestry must be computed from that fresh set.
+    availableSnapshots = await this.readSnapshotIndex(new Set(latestManifest.prunedSnapshotIds), snapshot.notebookId);
     availableSnapshots.set(snapshot.snapshotId, snapshot);
     return this.writeManifest({
       ...latestManifest,

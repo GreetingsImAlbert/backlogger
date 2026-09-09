@@ -3,7 +3,8 @@ import type { Category, Notebook, Task } from './model.ts';
 import { parseStoredDocument, SCHEMA_VERSION, storageKind, type StoredDocument, type Theme, type ViewMode } from './storage.ts';
 
 export const LEGACY_SYNC_SCHEMA_VERSION = 1 as const;
-export const SYNC_SCHEMA_VERSION = 2 as const;
+export const PREVIOUS_SYNC_SCHEMA_VERSION = 2 as const;
+export const SYNC_SCHEMA_VERSION = 3 as const;
 export const SYNC_PROTOCOL_VERSION = 1 as const;
 export const SYNC_SNAPSHOT_RETENTION_LIMIT = 30 as const;
 export const SYNC_CHECKPOINT_VERSION = 1 as const;
@@ -117,7 +118,7 @@ function stringArray(value: unknown, field: string): string[] {
   return [...new Set(value)];
 }
 
-function parseSyncLocation(value: unknown, field = 'sync location'): SyncLocation {
+function parseSyncLocation(value: unknown, allowSupabase: boolean, field = 'sync location'): SyncLocation {
   if (!isRecord(value) || (value.kind !== 'local-folder' && value.kind !== 'onedrive' && value.kind !== 'supabase')) {
     throw new Error(`Sync data has an invalid ${field}.`);
   }
@@ -125,7 +126,12 @@ function parseSyncLocation(value: unknown, field = 'sync location'): SyncLocatio
     return { kind: 'local-folder', parentPath: requiredString(value.parentPath, `${field} parent path`) };
   }
   if (value.kind === 'supabase') {
-    throw new Error(`Sync data has a Supabase location before the schema-3 migration.`);
+    if (!allowSupabase) throw new Error(`Sync data has a Supabase location before the schema-3 migration.`);
+    return {
+      kind: 'supabase',
+      accountId: requiredString(value.accountId, `${field} account id`),
+      projectRef: requiredString(value.projectRef, `${field} project reference`),
+    };
   }
   return {
     kind: 'onedrive',
@@ -232,9 +238,12 @@ export function makeSyncState(deviceId: string = crypto.randomUUID()): SyncState
 
 export function parseSyncState(value: unknown): SyncState {
   if (!isRecord(value)) throw new Error('Sync data is not an object.');
-  if (value.schemaVersion !== SYNC_SCHEMA_VERSION && value.schemaVersion !== LEGACY_SYNC_SCHEMA_VERSION) {
+  if (value.schemaVersion !== SYNC_SCHEMA_VERSION
+    && value.schemaVersion !== PREVIOUS_SYNC_SCHEMA_VERSION
+    && value.schemaVersion !== LEGACY_SYNC_SCHEMA_VERSION) {
     throw new Error('This sync data uses an unsupported version.');
   }
+  const isCurrentSchema = value.schemaVersion === SYNC_SCHEMA_VERSION;
   const status = value.status;
   if (status !== 'disconnected' && status !== 'connected' && status !== 'paused') {
     throw new Error('Sync data has an invalid connection status.');
@@ -252,7 +261,10 @@ export function parseSyncState(value: unknown): SyncState {
   const legacyFolderPath = value.folderPath === undefined ? null : optionalString(value.folderPath, 'folder path');
   const parsedLocation = value.location === undefined || value.location === null
     ? null
-    : parseSyncLocation(value.location);
+    : parseSyncLocation(value.location, isCurrentSchema);
+  if (isCurrentSchema && (legacyFolderPath || (parsedLocation && parsedLocation.kind !== 'supabase'))) {
+    throw new Error('Schema-3 sync data cannot contain a retired folder location.');
+  }
   if (parsedLocation && legacyFolderPath && parsedLocation.kind === 'local-folder' && parsedLocation.parentPath !== legacyFolderPath) {
     throw new Error('Sync data has conflicting location and folder path values.');
   }
@@ -272,8 +284,8 @@ export function parseSyncState(value: unknown): SyncState {
         : (() => { throw new Error('Sync data has an invalid last published revision.'); })()),
     lastPublishedContentFingerprint: optionalString(value.lastPublishedContentFingerprint, 'last published content fingerprint'),
     lastPublishedAt: optionalString(value.lastPublishedAt, 'last published time'),
-    lastCheckedAt: optionalString(value.lastCheckedAt, 'last folder check time'),
-    lastSuccessfulCheckAt: optionalString(value.lastSuccessfulCheckAt, 'last successful folder check time'),
+    lastCheckedAt: optionalString(value.lastCheckedAt, 'last sync check time'),
+    lastSuccessfulCheckAt: optionalString(value.lastSuccessfulCheckAt, 'last successful sync check time'),
     currentSnapshotId: optionalString(value.currentSnapshotId ?? value.lastPublishedSnapshotId, 'current snapshot id'),
     processedSnapshotIds: stringArray(value.processedSnapshotIds ?? [], 'processed snapshots'),
     mergeParentSnapshotIds: stringArray(value.mergeParentSnapshotIds ?? [], 'merge parents'),
@@ -308,7 +320,7 @@ export function makeCheckpointSnapshot(document: StoredDocument, state: SyncStat
 export function parseSyncManifest(value: unknown): SyncManifest {
   if (!isRecord(value)) throw new Error('The sync manifest is not an object.');
   if (value.protocolVersion !== SYNC_PROTOCOL_VERSION || value.type !== 'manifest') {
-    throw new Error('The sync folder uses an unsupported manifest version.');
+    throw new Error('The sync manifest uses an unsupported manifest protocol version.');
   }
   return {
     protocolVersion: SYNC_PROTOCOL_VERSION,
@@ -338,14 +350,48 @@ export async function loadSyncState(): Promise<SyncState> {
   const raw = await invoke<string | null>('load_sync_state');
   if (!raw) return makeSyncState();
   const parsed = JSON.parse(raw) as unknown;
-  const state = parseSyncState(parsed);
-  const legacy = isRecord(parsed) && (parsed.schemaVersion === LEGACY_SYNC_SCHEMA_VERSION || ('folderPath' in parsed && !('location' in parsed)));
-  if (legacy) {
-    // Preserve the old state before writing the versioned location shape.
+  const { state, migrated } = migrateSyncState(parsed);
+  if (migrated) {
+    // Preserve the complete old state before writing a disconnected schema-3
+    // state. The retired folder/account is never treated as a Supabase binding.
     await invoke('backup_sync_state');
     await invoke('save_sync_state', { state: JSON.stringify(state, null, 2) });
   }
   return state;
+}
+
+/**
+ * Convert schema-1/2 state to a safe, disconnected schema-3 state. The old
+ * location, pending publication, and remote history remain in the native
+ * `.bak`; the live state must not publish that history to a newly logged-in
+ * account.
+ */
+export function migrateSyncState(value: unknown): { state: SyncState; migrated: boolean } {
+  const state = parseSyncState(value);
+  const rawSchema = isRecord(value) && typeof value.schemaVersion === 'number' ? value.schemaVersion : null;
+  if (rawSchema === SYNC_SCHEMA_VERSION) return { state, migrated: false };
+  return {
+    state: {
+      ...state,
+      schemaVersion: SYNC_SCHEMA_VERSION,
+      location: null,
+      status: 'disconnected',
+      pendingSnapshots: [],
+      knownHeadSnapshotIds: [],
+      lastPublishedSnapshotId: null,
+      lastPublishedRevision: null,
+      lastPublishedContentFingerprint: null,
+      lastPublishedAt: null,
+      lastCheckedAt: null,
+      lastSuccessfulCheckAt: null,
+      currentSnapshotId: null,
+      processedSnapshotIds: [],
+      mergeParentSnapshotIds: [],
+      conflicts: [],
+      lastError: null,
+    },
+    migrated: true,
+  };
 }
 
 export async function saveSyncState(state: SyncState): Promise<void> {

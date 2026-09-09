@@ -366,6 +366,18 @@ Record the Supabase CLI version, local test count, migration filename, and wheth
 - Logout, cancelled login, wrong account, and restart preserve local tasks.
 - UI contains no `Choose folder`, OneDrive, Google Drive, or local-folder status language.
 
+### Milestone 4 handoff
+
+- **Status:** Implementation complete; the Windows UI now uses Google login for Supabase sync and no longer exposes folder/provider-desktop wording. Android and browser preview remain local-only.
+- **State migration:** `SYNC_SCHEMA_VERSION` is now 3. Schema-1/2 state is parsed for compatibility, backed up through the existing native `backup_sync_state` command, and saved as disconnected schema-3 state with no retired location or publishable old history. Explicit schema-3 Supabase locations are accepted; folder and OneDrive locations are rejected in schema 3.
+- **Cloud flow:** Login authenticates only. After sign-in, the app reads the account's one-notebook manifest. A missing notebook requires `Start sync with this device` before atomic checkpoint initialization. An existing notebook requires explicit fetch confirmation after manifest/ancestry validation; incomplete or branched history never replaces local data automatically.
+- **Runtime safety:** Logout and account changes clear the active cloud binding while retaining local notebook data and recoverable sync state. Authenticated restart validates the saved account/project binding before resuming checks. Local saves remain available when Supabase is unavailable or the session expires.
+- **Capabilities/UI:** Added provider-neutral `cloudSync`/`supabaseSync` capabilities (Windows true; Android/browser false), provider-neutral status text, sanitized account email display, `Continue with Google`, `Check for updates`, Pause/Resume, conflict resolution, and Log out controls.
+- **Bundle configuration fix:** `src/supabase/config.ts` now uses a direct `import.meta.env` access so Vite embeds the client-safe Supabase URL/key in packaged Tauri builds; the previous indirect access left production builds appearing unconfigured.
+- **Tests/checks:** Added migration and schema-3 location tests. `npm.cmd run check` passed; `npm.cmd test` passed with 43 tests; `npm.cmd run build` passed; `git diff --check` passed; Windows packaging produced `src-tauri/target/release/bundle/nsis/Backlogger_0.1.2_x64-setup.exe`; Android debug packaging produced `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
+- **Manual evidence pending:** Gate A credentials/configuration and a packaged Windows first-login, account-restore, explicit initialization/fetch, logout, and wrong-account acceptance run remain user-owned. No Supabase remote operation was performed by Codex.
+- **Next milestone interface:** Milestone 5 may restore full provider-neutral publication/reconciliation orchestration over `SupabaseSyncTransport`; it must preserve schema-3 migration safety and never reintroduce folder-sync UI.
+
 ## Milestone 5 — Restore all sync orchestration over Supabase
 
 **Prerequisites:** Milestones 1–4. Work against local Supabase or a disposable development project only.
@@ -401,6 +413,17 @@ Automate these cases against fake/local Supabase:
 - more than 30 sequential publications compact safely;
 - concurrent heads, pending work, missing ancestry, and conflicts prevent cleanup;
 - Windows close-time publication still leaves either a confirmed remote snapshot or a durable local pending snapshot.
+
+### Milestone 5 handoff
+
+- **Status:** Implementation complete for provider-neutral Supabase orchestration. No live Supabase project, Google account, or user notebook was accessed.
+- **Changed files:** `src/main.ts`, `src/sync/coordinator.ts`, `tests/transport.test.mjs`, and this handoff.
+- **Publication safety:** `SyncCoordinator.publishSnapshot()` now retries stale, retriable manifest CAS failures at most three times with small jitter, re-reading the manifest and complete visible snapshot history on every attempt. The immutable snapshot remains idempotent and is never rewritten; exhausted CAS conflicts propagate so the caller keeps the pending snapshot locally.
+- **Concurrency:** Shared update checks, fetch-and-replace, reconciliation, startup/foreground retry, auth inspection/account changes, pause/resume, and close-time publication now use the serialized sync mutation queue. Local pending state is written before any remote publication attempt.
+- **History validation/retention:** Connected publication, update scans, reconciliation, and compaction reject empty/incomplete manifest heads before changing local data. Compaction additionally requires one complete manifest head matching the current local head and still performs replacement-manifest CAS before guarded snapshot deletion.
+- **Tests/checks:** `npm.cmd run check` passed; `npm.cmd test` passed with 45 tests, including stale-CAS retry, concurrent-head preservation, and exhausted-retry recovery; `npm.cmd run build` passed; `git diff --check` passed.
+- **Manual evidence pending:** Gate A credentials plus the Milestone 6 two-profile, offline, auth-expiry, interruption, retention, and packaged Windows acceptance runs remain user-owned. No Supabase CLI migration or remote operation is required for this milestone.
+- **Next milestone interface:** Milestone 6 may use the existing schema/RPCs, `SupabaseSyncTransport`, `SyncCoordinator`, and schema-3 state. It should focus on disposable-project security and two-client acceptance; do not add Realtime or change the sync protocol.
 
 ## Milestone 6 — Provider, security, and two-client acceptance
 

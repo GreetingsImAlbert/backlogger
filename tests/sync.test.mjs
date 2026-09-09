@@ -15,6 +15,7 @@ import {
   parseSyncManifest,
   parseSyncSnapshot,
   parseSyncState,
+  migrateSyncState,
   reconcileManifestHeadIds,
   snapshotLeaves,
   storedDocumentFromSyncSnapshot,
@@ -91,6 +92,38 @@ test('legacy sync state migrates folderPath without dropping pending work', () =
   assert.deepEqual(migrated.location, { kind: 'local-folder', parentPath: 'C:\\Users\\Albert\\OneDrive' });
   assert.deepEqual(migrated.pendingSnapshots, [snapshot]);
   assert.equal(migrated.deviceId, state.deviceId);
+});
+
+test('schema-2 state migrates to a disconnected schema-3 state without binding the old folder', () => {
+  const state = makeSyncState('device-1');
+  state.schemaVersion = 2;
+  state.notebookId = 'notebook-1';
+  state.location = { kind: 'local-folder', parentPath: 'C:\\Users\\Albert\\OneDrive' };
+  state.status = 'connected';
+  state.pendingSnapshots = [{
+    ...makeSyncSnapshot(makeStoredDocument(notebook, 3, 'all'), state, []),
+    snapshotId: 'pending-1',
+  }];
+  state.knownHeadSnapshotIds = ['old-head'];
+  state.lastError = 'old folder error';
+  const migrated = migrateSyncState(state);
+  assert.equal(migrated.migrated, true);
+  assert.equal(migrated.state.schemaVersion, SYNC_SCHEMA_VERSION);
+  assert.equal(migrated.state.location, null);
+  assert.equal(migrated.state.status, 'disconnected');
+  assert.deepEqual(migrated.state.pendingSnapshots, []);
+  assert.deepEqual(migrated.state.knownHeadSnapshotIds, []);
+  assert.equal(migrated.state.notebookId, 'notebook-1');
+});
+
+test('schema-3 accepts only explicit Supabase locations', () => {
+  const state = makeSyncState('device-1');
+  const location = { kind: 'supabase', accountId: 'user-1', projectRef: 'project-1' };
+  assert.deepEqual(parseSyncState({ ...state, location, status: 'connected' }).location, location);
+  assert.throws(
+    () => parseSyncState({ ...state, location: { kind: 'local-folder', parentPath: 'C:\\Users\\Albert' } }),
+    /retired folder location/,
+  );
 });
 
 test('debug local transport resolves the explicit exchange root and reports best-effort writes', async () => {

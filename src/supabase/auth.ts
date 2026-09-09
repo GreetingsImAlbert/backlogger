@@ -1,4 +1,6 @@
 import type { Session, SupabaseClient } from '@supabase/supabase-js';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import type { Database } from '../../supabase/database.types.ts';
@@ -43,9 +45,11 @@ let initialization: Promise<void> | null = null;
 let authClient: SupabaseClient<Database> | null = null;
 let authUnsubscribe: (() => void) | null = null;
 let deepLinkUnsubscribe: (() => void) | null = null;
+let callbackFallbackUnsubscribe: (() => void) | null = null;
 let pendingFlowInMemory = false;
 let flowStartedFrom: AuthStatus = 'signed-out';
 const consumedCodes = new Set<string>();
+const receivedCallbackUrls = new Set<string>();
 const listeners = new Set<AuthStateListener>();
 
 function notify() {
@@ -224,10 +228,13 @@ export async function startGoogleSignIn(): Promise<void> {
   setPendingFlow(configState.config.projectRef);
   updateState({ status: 'signing-in', configured: true, error: null });
   try {
+    const redirectTo = isTauriRuntime()
+      ? await invoke<string>('start_oauth_callback_listener')
+      : SUPABASE_CALLBACK_URL;
     const { data, error } = await client.auth.signInWithOAuth({
       provider: SUPABASE_PROVIDER,
       options: {
-        redirectTo: SUPABASE_CALLBACK_URL,
+        redirectTo,
         skipBrowserRedirect: true,
         scopes: 'openid email profile',
       },
@@ -297,6 +304,8 @@ export async function handleAuthCallback(rawUrl: string): Promise<boolean> {
 
 async function handleIncomingUrls(urls: string[]) {
   for (const rawUrl of urls) {
+    if (receivedCallbackUrls.has(rawUrl)) continue;
+    receivedCallbackUrls.add(rawUrl);
     try {
       await handleAuthCallback(rawUrl);
     } catch (error) {
@@ -309,6 +318,9 @@ async function handleIncomingUrls(urls: string[]) {
 async function installDeepLinkHandlers() {
   if (!isTauriRuntime() || deepLinkUnsubscribe) return;
   deepLinkUnsubscribe = await onOpenUrl(urls => { void handleIncomingUrls(urls); });
+  callbackFallbackUnsubscribe = await listen<string[]>('backlogger-auth-callback', event => {
+    if (Array.isArray(event.payload)) void handleIncomingUrls(event.payload);
+  });
   const currentUrls = await getCurrent();
   if (currentUrls?.length) void handleIncomingUrls(currentUrls);
 }
@@ -373,5 +385,7 @@ export function disposeAuthListeners(): void {
   authUnsubscribe = null;
   deepLinkUnsubscribe?.();
   deepLinkUnsubscribe = null;
+  callbackFallbackUnsubscribe?.();
+  callbackFallbackUnsubscribe = null;
   initialization = null;
 }

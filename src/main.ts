@@ -6,11 +6,12 @@ import type { Category, Notebook, Task } from './model';
 import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
 import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
-import { applySyncConflict, findCommonSnapshotAncestor, isSnapshotAncestor, loadSyncState, localFolderLocation, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncConflict, type SyncSnapshot, type SyncState, type SyncLocation } from './sync';
+import { applySyncConflict, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncConflict, type SyncManifest, type SyncSnapshot, type SyncState, type SupabaseLocation } from './sync';
 import { SyncCoordinator } from './sync/coordinator';
-import { LocalFolderSyncTransport, type LocalFolderTransportOptions } from './sync/local-folder-transport';
+import { SupabaseSyncTransport } from './sync/supabase-transport';
 import type { SyncTransport } from './sync/transport';
-import { initializeAuth } from './supabase/auth';
+import { getAuthState, initializeAuth, signOut as signOutAuth, startGoogleSignIn, subscribeAuthState, type AuthState } from './supabase/auth';
+import { getConfiguredSupabaseProject } from './supabase/client';
 
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('App container is missing.');
@@ -31,7 +32,11 @@ let syncReady = false;
 let syncLoadError: string | null = null;
 let syncQueue: Promise<void> = Promise.resolve();
 let syncDialogElement: HTMLDialogElement | null = null;
+let syncDialogRefresh: (() => void) | null = null;
 let syncDeferred = false;
+let authState: AuthState = getAuthState();
+let cloudInspection: { accountId: string; manifest: SyncManifest | null; error: string | null } | null = null;
+let cloudInspectionInFlight: Promise<void> | null = null;
 type SessionPhase = 'loading' | 'fetching' | 'ready' | 'offline' | 'closing';
 interface AvailableUpdate {
   snapshot: SyncSnapshot;
@@ -484,7 +489,7 @@ function showImportDialog(fileName: string, imported: StoredDocument, syncSnapsh
       notebook = { categories: imported.categories };
       viewMode = imported.preferences.viewMode;
       revision = Math.max(revision, imported.revision);
-      if (syncSnapshot && storageKind() === 'desktop' && syncState.status !== 'disconnected') {
+      if (syncSnapshot && capabilities.supabaseSync && hasCloudBinding() && syncState.status !== 'disconnected') {
         syncState.currentSnapshotId = syncSnapshot.snapshotId;
         syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, syncSnapshot.snapshotId])];
         syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, syncSnapshot.snapshotId])];
@@ -581,55 +586,62 @@ async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, message:
 }
 
 function withSyncTimeout<T>(operation: Promise<T>): Promise<T> {
-  return withTimeout(operation, SYNC_CHECK_TIMEOUT_MS, 'The shared-folder check timed out.');
+  return withTimeout(operation, SYNC_CHECK_TIMEOUT_MS, 'The cloud sync check timed out.');
 }
 
-function localFolderTransportOptions(): LocalFolderTransportOptions {
-  const debugProfile = import.meta.env.DEV && import.meta.env.VITE_BACKLOGGER_SYNC_PROFILE === 'test';
-  return {
-    profile: debugProfile ? 'debug' : 'production',
-    exchangeRootOverride: debugProfile ? import.meta.env.VITE_BACKLOGGER_SYNC_TEST_ROOT : undefined,
-  };
+function cloudLocation(location: SyncState['location'] = syncState.location): SupabaseLocation | null {
+  return location?.kind === 'supabase' ? location : null;
 }
 
-function syncTransportFor(location: SyncLocation | null = syncState.location): SyncTransport | null {
-  if (!location || location.kind !== 'local-folder') return null;
-  return new LocalFolderSyncTransport(location, localFolderTransportOptions());
+function hasCloudBinding(): boolean {
+  return capabilities.supabaseSync && Boolean(cloudLocation()) && syncState.status !== 'disconnected';
 }
 
-function syncCoordinatorFor(location: SyncLocation | null = syncState.location): SyncCoordinator | null {
+function currentSupabaseLocation(): SupabaseLocation {
+  if (!capabilities.supabaseSync) throw new Error('Cloud sync is unavailable on this device.');
+  if (authState.status !== 'signed-in' || !authState.userId) throw new Error('Log in to sync.');
+  const project = getConfiguredSupabaseProject();
+  if (!project) throw new Error('Sync is not configured.');
+  return { kind: 'supabase', accountId: authState.userId, projectRef: project.projectRef };
+}
+
+function syncTransportFor(location: SyncState['location'] = syncState.location): SyncTransport | null {
+  if (!location || location.kind !== 'supabase' || !capabilities.supabaseSync) return null;
+  return new SupabaseSyncTransport(location);
+}
+
+function syncCoordinatorFor(location: SyncState['location'] = syncState.location): SyncCoordinator | null {
   const transport = syncTransportFor(location);
   return transport ? new SyncCoordinator(transport, syncState.notebookId) : null;
 }
 
-function localSyncParentPath(): string | null {
-  return localFolderLocation(syncState.location)?.parentPath ?? null;
-}
-
 function syncStatusLabel(): string {
-  if (!capabilities.localFolderSync) return 'Unavailable on Android';
+  if (!capabilities.cloudSync) return 'Not logged in';
   if (!syncReady) return syncLoadError ? 'Unavailable' : 'Loading…';
-  if (!syncState.location || syncState.status === 'disconnected') return 'Not connected';
+  if (authState.status === 'signing-in') return 'Signing in';
+  if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Not logged in';
   if (syncState.status === 'paused') return 'Paused';
   if (syncState.conflicts.length) return 'Conflicts';
-  if (syncState.lastError) return 'Folder unavailable';
+  if (syncState.lastError) return 'Offline';
   return 'Connected';
 }
 
 function syncStatusDetail(): string {
-  if (!capabilities.localFolderSync) return 'OneDrive sync will be enabled in a later Android milestone.';
+  if (!capabilities.cloudSync) return 'Cloud sync is unavailable on this device.';
   if (syncLoadError) return `Sync settings could not be loaded: ${syncLoadError}`;
-  if (!syncState.location || syncState.status === 'disconnected') return 'Choose a folder managed by OneDrive or Google Drive for desktop.';
+  if (!authState.configured) return 'Sync is not configured for this build.';
+  if (authState.status === 'signing-in') return 'Complete Google sign-in in your browser.';
+  if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Log in with Google to sync this notebook.';
   const pending = syncState.pendingSnapshots.length;
   if (syncState.conflicts.length) return `${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`;
-  if (syncState.lastError) return `Folder check failed: ${syncState.lastError}`;
+  if (syncState.lastError) return `Cloud sync is offline: ${syncState.lastError}`;
   if (syncState.status === 'paused') return `${pending} pending snapshot${pending === 1 ? '' : 's'} saved locally.`;
   const checked = formatSyncCheckTime(syncState.lastSuccessfulCheckAt);
-  const checkedDetail = checked ? ` Folder checked locally ${checked}.` : '';
+  const checkedDetail = checked ? ` Last cloud check ${checked}.` : '';
   const retentionDetail = syncRetentionMessage ? ` ${syncRetentionMessage}` : '';
   return pending
-    ? `${pending} snapshot${pending === 1 ? '' : 's'} waiting for the folder.${checkedDetail}${retentionDetail}`
-    : `Local changes publish when you close the app.${checkedDetail}${retentionDetail} Provider upload/download is handled by its desktop app.`;
+    ? `${pending} snapshot${pending === 1 ? '' : 's'} waiting to sync.${checkedDetail}${retentionDetail}`
+    : `Local changes publish to Supabase when sync runs.${checkedDetail}${retentionDetail}`;
 }
 
 async function compactSyncHistory(coordinator: SyncCoordinator): Promise<boolean> {
@@ -642,6 +654,8 @@ async function compactSyncHistory(coordinator: SyncCoordinator): Promise<boolean
     const originalResource = await coordinator.readManifestResource();
     const originalManifest = originalResource?.manifest ?? null;
     if (!originalManifest || originalManifest.notebookId !== syncState.notebookId) return false;
+    if (originalManifest.headSnapshotIds.length !== 1 || originalManifest.headSnapshotIds[0] !== (syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId)) return false;
+    assertCompleteRemoteHistory(originalManifest, snapshots);
     const currentId = syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
     const leaves = snapshotLeaves(snapshots);
     if (!currentId || leaves.length !== 1 || leaves[0].snapshotId !== currentId) return false;
@@ -739,15 +753,17 @@ async function compactSyncHistory(coordinator: SyncCoordinator): Promise<boolean
   }
 }
 
-async function publishPendingSnapshots(): Promise<number> {
+async function publishPendingSnapshotsUnsafe(): Promise<number> {
   const coordinator = syncCoordinatorFor();
-  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId || syncState.conflicts.length || !coordinator) return 0;
+  if (!capabilities.supabaseSync || !syncReady || syncState.status !== 'connected' || !hasCloudBinding() || !syncState.notebookId || syncState.conflicts.length || !coordinator) return 0;
   const checkedAt = startSyncCheck();
   await coordinator.connect();
   let manifestResource = await coordinator.readManifestResource();
   let manifest = manifestResource?.manifest ?? null;
-  if (!manifest || !manifestResource) throw new Error('The connected folder is missing its notebook manifest.');
-  if (manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder belongs to a different notebook.');
+  if (!manifest || !manifestResource) throw new Error('The connected cloud notebook is unavailable.');
+  if (manifest.notebookId !== syncState.notebookId) throw new Error('The connected cloud notebook belongs to a different notebook.');
+  const initialSnapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds), syncState.notebookId);
+  assertCompleteRemoteHistory(manifest, initialSnapshots);
   let published = 0;
   for (const snapshot of [...syncState.pendingSnapshots]) {
     if (snapshot.notebookId !== syncState.notebookId) throw new Error('A pending snapshot belongs to a different notebook.');
@@ -790,6 +806,16 @@ function snapshotAncestry(snapshotId: string, snapshots: Map<string, SyncSnapsho
   return result;
 }
 
+function assertCompleteRemoteHistory(manifest: SyncManifest, snapshots: Map<string, SyncSnapshot>) {
+  if (!manifest.headSnapshotIds.length) throw new Error('The connected cloud notebook has no complete snapshot head.');
+  for (const headId of manifest.headSnapshotIds) {
+    const head = snapshots.get(headId);
+    if (!head || !hasCompleteSnapshotAncestry(head, snapshots)) {
+      throw new Error('The connected cloud notebook has incomplete or unavailable history.');
+    }
+  }
+}
+
 function taskEditorIsOpen(): boolean {
   return [...document.querySelectorAll<HTMLDialogElement>('dialog[open]')].some(dialog => dialog !== syncDialogElement);
 }
@@ -800,10 +826,11 @@ function acceptedSnapshotId(): string | null {
 
 async function scanSharedUpdate(includeIgnored = false): Promise<AvailableUpdate | null> {
   const coordinator = syncCoordinatorFor();
-  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId || !coordinator) return null;
+  if (!capabilities.supabaseSync || !syncReady || syncState.status !== 'connected' || !hasCloudBinding() || !syncState.notebookId || !coordinator) return null;
   const manifest = await coordinator.readManifest();
-  if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder has no matching notebook manifest.');
+  if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected cloud notebook has no matching manifest.');
   const snapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds));
+  assertCompleteRemoteHistory(manifest, snapshots);
   updateRetentionStatus(snapshots);
   const leaves = snapshotLeaves(snapshots);
   syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds, ...leaves.map(snapshot => snapshot.snapshotId)])];
@@ -835,7 +862,7 @@ function updateRetentionStatus(snapshots: Map<string, SyncSnapshot>) {
   }
 }
 
-async function checkForSharedUpdate(allowFetching = false) {
+async function checkForSharedUpdateUnsafe(allowFetching = false) {
   if (!syncReady || syncState.status !== 'connected' || sessionPhase === 'closing' || (sessionPhase === 'fetching' && !allowFetching)) return null;
   const checkedAt = startSyncCheck();
   try {
@@ -859,12 +886,19 @@ async function checkForSharedUpdate(allowFetching = false) {
   }
 }
 
+function checkForSharedUpdate(allowFetching = false): Promise<AvailableUpdate | null> {
+  return enqueueSyncMutation(() => checkForSharedUpdateUnsafe(allowFetching));
+}
+
 async function applyFetchedSnapshot(snapshot: SyncSnapshot): Promise<void> {
   const localDocument = makeStoredDocument(notebook, revision, viewMode, theme);
   await writeStoredDocument(localDocument);
   notebook = notebookFromSnapshot(snapshot);
   revision = Math.max(revision, snapshot.revision);
   syncState.currentSnapshotId = snapshot.snapshotId;
+  syncState.lastPublishedSnapshotId = snapshot.snapshotId;
+  syncState.lastPublishedRevision = snapshot.revision;
+  syncState.lastPublishedAt = snapshot.createdAt;
   syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, snapshot.snapshotId])];
   syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, snapshot.snapshotId])];
   syncState.pendingSnapshots = [];
@@ -879,7 +913,7 @@ async function applyFetchedSnapshot(snapshot: SyncSnapshot): Promise<void> {
   await saveSyncState(syncState);
 }
 
-async function runSessionFetch() {
+async function runSessionFetchUnsafe() {
   if (!syncReady || syncState.status !== 'connected') {
     sessionPhase = 'ready';
     render();
@@ -890,7 +924,7 @@ async function runSessionFetch() {
   render();
   if (syncState.pendingSnapshots.length) {
     try {
-      await withSyncTimeout(enqueueSyncMutation(() => publishPendingSnapshots()));
+      await withSyncTimeout(publishPendingSnapshotsUnsafe());
       if (!syncState.pendingSnapshots.length && syncState.lastPublishedContentFingerprint === notebookFingerprint(notebook)) {
         sessionContentDirty = false;
       }
@@ -903,7 +937,7 @@ async function runSessionFetch() {
       return;
     }
   }
-  const update = await checkForSharedUpdate(true);
+  const update = await checkForSharedUpdateUnsafe(true);
   if (!update) {
     sessionPhase = syncState.lastError ? 'offline' : 'ready';
     setStatusMessage(syncState.lastError ? 'Working offline. Shared updates will be checked again.' : '');
@@ -932,7 +966,7 @@ async function runSessionFetch() {
 
 function startSessionFetch(): Promise<void> {
   if (sessionFetchInFlight) return sessionFetchInFlight;
-  const operation = runSessionFetch();
+  const operation = enqueueSyncMutation(() => runSessionFetchUnsafe());
   let tracked: Promise<void>;
   tracked = operation.finally(() => {
     if (sessionFetchInFlight === tracked) sessionFetchInFlight = null;
@@ -951,7 +985,9 @@ function askFetchConfirmation(): Promise<boolean> {
     const editor = openDialog('Replace local backlog?');
     editor.body.append(
       element('p', '', 'Fetching this shared version will replace the visible list with the validated shared snapshot.'),
-      element('p', 'advisory', 'Your current local backlog will be backed up first. Continue only if you want to discard the local edits from this session.'),
+      element('p', 'advisory', hasLocalBacklog()
+        ? 'Your current local backlog will be backed up first. Continue only if you want to replace this device’s saved list.'
+        : 'This device has no saved backlog yet. The shared snapshot will become the local list after you confirm.'),
     );
     editor.save.textContent = 'Fetch and replace';
     let settled = false;
@@ -969,17 +1005,17 @@ function askFetchConfirmation(): Promise<boolean> {
   });
 }
 
-async function fetchAvailableUpdate() {
+async function fetchAvailableUpdateUnsafe() {
   if (!availableUpdate || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
   const requestedId = availableUpdate.snapshot.snapshotId;
   sessionPhase = 'fetching';
   setStatusMessage('Fetching shared update…');
   render();
-  const fresh = await checkForSharedUpdate(true);
+  const fresh = await checkForSharedUpdateUnsafe(true);
   if (!fresh || fresh.snapshot.snapshotId !== requestedId) {
     if (!fresh) availableUpdate = null;
     sessionPhase = syncState.lastError ? 'offline' : 'ready';
-    setStatusMessage(syncState.lastError ? 'Could not recheck the shared update. Retry when the folder is available.' : fresh ? 'A newer shared update is available.' : 'That shared update is no longer available.');
+    setStatusMessage(syncState.lastError ? 'Could not recheck the cloud update. Retry when you are back online.' : fresh ? 'A newer cloud update is available.' : 'That cloud update is no longer available.');
     render();
     return;
   }
@@ -1010,6 +1046,10 @@ async function fetchAvailableUpdate() {
   }
 }
 
+function fetchAvailableUpdate(): Promise<void> {
+  return enqueueSyncMutation(() => fetchAvailableUpdateUnsafe());
+}
+
 function ignoreAvailableUpdate() {
   if (!availableUpdate) return;
   ignoredUpdateIds.add(availableUpdate.snapshot.snapshotId);
@@ -1018,17 +1058,18 @@ function ignoreAvailableUpdate() {
   render();
 }
 
-async function reconcileSync(): Promise<{ applied: number; conflicts: number }> {
+async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: number }> {
   const coordinator = syncCoordinatorFor();
-  if (storageKind() !== 'desktop' || !syncReady || syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId || !coordinator) return { applied: 0, conflicts: 0 };
+  if (!capabilities.supabaseSync || !syncReady || syncState.status !== 'connected' || !hasCloudBinding() || !syncState.notebookId || !coordinator) return { applied: 0, conflicts: 0 };
   if (taskEditorIsOpen()) {
     syncDeferred = true;
     return { applied: 0, conflicts: syncState.conflicts.length };
   }
   if (syncState.conflicts.length) return { applied: 0, conflicts: syncState.conflicts.length };
   const manifest = await coordinator.readManifest();
-  if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected folder has no matching notebook manifest.');
+  if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected cloud notebook has no matching manifest.');
   const snapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds));
+  assertCompleteRemoteHistory(manifest, snapshots);
   syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, ...manifest.headSnapshotIds, ...snapshotLeaves(snapshots).map(snapshot => snapshot.snapshotId)])];
   const currentId = syncState.currentSnapshotId ?? syncState.lastPublishedSnapshotId;
   const completeLeaves = snapshotLeaves(snapshots);
@@ -1149,11 +1190,15 @@ async function reconcileSync(): Promise<{ applied: number; conflicts: number }> 
   return { applied, conflicts: syncState.conflicts.length };
 }
 
+function reconcileSync(): Promise<{ applied: number; conflicts: number }> {
+  return enqueueSyncMutation(() => reconcileSyncUnsafe());
+}
+
 async function queueSyncSnapshot(document: StoredDocument): Promise<void> {
-  if (!syncReady || storageKind() !== 'desktop' || !syncState.notebookId || !localSyncParentPath() || syncState.status === 'disconnected' || syncState.conflicts.length) return;
+  if (!syncReady || !capabilities.supabaseSync || !syncState.notebookId || !hasCloudBinding() || syncState.status === 'disconnected' || syncState.conflicts.length) return;
   try {
     await enqueueSyncMutation(async () => {
-      if (!syncState.notebookId || !localSyncParentPath() || syncState.status === 'disconnected') return;
+      if (!syncState.notebookId || !hasCloudBinding() || syncState.status === 'disconnected') return;
       const previousPending = syncState.pendingSnapshots.at(-1)?.snapshotId;
       const parents = syncState.mergeParentSnapshotIds.length
         ? syncState.mergeParentSnapshotIds
@@ -1174,100 +1219,214 @@ async function queueSyncSnapshot(document: StoredDocument): Promise<void> {
   }
 }
 
-async function connectSyncFolder(folderPath: string): Promise<boolean> {
-  if (storageKind() !== 'desktop') throw new Error('Folder sync is available in the desktop app.');
-  const trimmedPath = folderPath.trim();
-  if (!trimmedPath) throw new Error('Choose a folder first.');
-  return enqueueSyncMutation(async () => {
-    const checkedAt = startSyncCheck();
-    const location: SyncLocation = { kind: 'local-folder', parentPath: trimmedPath };
-    const coordinator = syncCoordinatorFor(location);
-    if (!coordinator) throw new Error('The selected sync location is not supported by this desktop build.');
-    await coordinator.connect();
-    const existingManifest = await coordinator.readManifest();
-    if (existingManifest && syncState.notebookId && existingManifest.notebookId !== syncState.notebookId) {
-      throw new Error('This folder belongs to a different Backlogger notebook.');
-    }
-    const existing = Boolean(existingManifest);
-    if (!syncState.notebookId) syncState.notebookId = existingManifest?.notebookId ?? crypto.randomUUID();
-    const manifest = existingManifest ?? makeSyncManifest(syncState.notebookId, syncState.deviceId);
-    let sharedHead: SyncSnapshot | null = null;
-    let sharedSnapshots: Map<string, SyncSnapshot> | null = null;
-    if (existingManifest && !syncState.currentSnapshotId && notebook.categories.length === 0) {
-      sharedSnapshots = await coordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds), manifest.notebookId);
-      sharedHead = snapshotLeaves(sharedSnapshots).at(-1) ?? null;
-    }
-    syncState.location = location;
-    syncState.status = 'connected';
-    syncState.knownHeadSnapshotIds = [...new Set(manifest.headSnapshotIds)];
-    syncState.lastError = null;
-    await saveSyncState(syncState);
-    if (!existingManifest) await coordinator.writeManifest(manifest, null);
-    if (sharedHead) {
-      notebook = { categories: sharedHead.categories.map(category => ({ ...category, tasks: category.tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })) })) };
-      revision = Math.max(revision, sharedHead.revision);
-      syncState.currentSnapshotId = sharedHead.snapshotId;
-      syncState.lastPublishedRevision = revision + 1;
-      syncState.lastPublishedContentFingerprint = snapshotFingerprint(sharedHead);
-      syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(sharedHead.snapshotId, sharedSnapshots!)])];
-      syncState.pendingSnapshots = [];
-      finishSyncCheck(checkedAt);
-      await saveSyncState(syncState);
-      render();
-      queueSave(false);
-      return existing;
-    }
-    if (existingManifest && (syncState.currentSnapshotId || syncState.lastPublishedSnapshotId)) {
-      const result = await reconcileSync();
-      if (result.conflicts) return existing;
-    }
-    const currentDocument = makeStoredDocument(notebook, revision, viewMode, theme);
-    if (!syncState.pendingSnapshots.length && (!existingManifest || syncState.lastPublishedRevision !== currentDocument.revision)) {
-      const parents = syncState.mergeParentSnapshotIds.length
-        ? syncState.mergeParentSnapshotIds
-        : syncState.currentSnapshotId
-          ? [syncState.currentSnapshotId]
-          : syncState.lastPublishedSnapshotId
-            ? [syncState.lastPublishedSnapshotId]
-            : manifest.headSnapshotIds;
-      syncState.pendingSnapshots.push(makeSyncSnapshot(currentDocument, syncState, parents));
-      await saveSyncState(syncState);
-    }
-    try {
-      await publishPendingSnapshots();
-    } catch (error) {
-      syncState.lastError = errorText(error);
-      await saveSyncState(syncState);
-      throw error;
-    }
-    return existing;
+function hasLocalBacklog(): boolean {
+  return notebook.categories.length > 0 || revision > 0;
+}
+
+async function askStartSyncConfirmation(): Promise<boolean> {
+  return new Promise(resolve => {
+    const editor = openDialog('Start cloud sync?');
+    editor.body.append(
+      element('p', '', 'No Backlogger notebook exists for this Google account yet.'),
+      element('p', 'advisory', 'Start sync with this device to create the first cloud checkpoint from the current local notebook. Nothing is uploaded before you confirm.'),
+    );
+    editor.save.textContent = 'Start sync with this device';
+    let settled = false;
+    const finish = (choice: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(choice);
+    };
+    editor.dialog.addEventListener('close', () => finish(false), { once: true });
+    editor.form.addEventListener('submit', event => {
+      event.preventDefault();
+      finish(true);
+      editor.dialog.close();
+    });
   });
 }
 
-async function disconnectSync(): Promise<void> {
+async function bindSupabaseAccount(): Promise<void> {
+  const location = currentSupabaseLocation();
   await enqueueSyncMutation(async () => {
-    syncState.status = 'disconnected';
-    syncState.location = null;
-    syncState.lastError = null;
-    await saveSyncState(syncState);
+    const checkedAt = startSyncCheck();
+    const transport = new SupabaseSyncTransport(location);
+    const coordinator = new SyncCoordinator(transport);
+    const remoteResource = await withSyncTimeout(coordinator.readManifestResource());
+    cloudInspection = { accountId: location.accountId, manifest: remoteResource?.manifest ?? null, error: null };
+
+    if (!remoteResource) {
+      if (!(await askStartSyncConfirmation())) return;
+      const notebookId = syncState.notebookId ?? crypto.randomUUID();
+      const nextState = { ...syncState, notebookId };
+      const checkpoint = makeCheckpointSnapshot(makeStoredDocument(notebook, revision, viewMode, theme), nextState);
+      const initialManifest = makeSyncManifest(notebookId, syncState.deviceId, [checkpoint.snapshotId]);
+      await coordinator.initializeNotebook(checkpoint, initialManifest);
+      syncState = {
+        ...syncState,
+        notebookId,
+        location,
+        status: 'connected',
+        pendingSnapshots: [],
+        knownHeadSnapshotIds: [checkpoint.snapshotId],
+        lastPublishedSnapshotId: checkpoint.snapshotId,
+        lastPublishedRevision: checkpoint.revision,
+        lastPublishedContentFingerprint: snapshotFingerprint(checkpoint),
+        lastPublishedAt: checkpoint.createdAt,
+        lastCheckedAt: checkedAt,
+        lastSuccessfulCheckAt: checkedAt,
+        currentSnapshotId: checkpoint.snapshotId,
+        processedSnapshotIds: [checkpoint.snapshotId],
+        mergeParentSnapshotIds: [],
+        conflicts: [],
+        lastError: null,
+      };
+      sessionContentDirty = false;
+      availableUpdate = null;
+      sessionPhase = 'ready';
+      await saveSyncState(syncState);
+      setStatusMessage('Cloud sync started with this device.');
+      render();
+      return;
+    }
+
+    const manifest = remoteResource.manifest;
+    const remoteCoordinator = new SyncCoordinator(transport, manifest.notebookId);
+    const snapshots = await remoteCoordinator.readSnapshotIndex(new Set(manifest.prunedSnapshotIds), manifest.notebookId);
+    if (manifest.headSnapshotIds.some(snapshotId => !snapshots.has(snapshotId))) {
+      throw new Error('The cloud notebook is incomplete; no local data was replaced.');
+    }
+    const leaves = snapshotLeaves(snapshots);
+    if (leaves.length !== 1 || !hasCompleteSnapshotAncestry(leaves[0], snapshots)) {
+      throw new Error('The cloud notebook has multiple or incomplete branches; resolve it before connecting this device.');
+    }
+    if (!(await askFetchConfirmation())) return;
+
+    const previousState = structuredClone(syncState);
+    try {
+      syncState = {
+        ...syncState,
+        location,
+        status: 'connected',
+        notebookId: manifest.notebookId,
+        pendingSnapshots: [],
+        knownHeadSnapshotIds: [...manifest.headSnapshotIds],
+        lastPublishedSnapshotId: null,
+        lastPublishedRevision: null,
+        lastPublishedContentFingerprint: null,
+        lastPublishedAt: null,
+        currentSnapshotId: null,
+        processedSnapshotIds: [],
+        mergeParentSnapshotIds: [],
+        conflicts: [],
+        lastError: null,
+      };
+      await applyFetchedSnapshot(leaves[0]);
+      finishSyncCheck(checkedAt);
+      await saveSyncState(syncState);
+      sessionContentDirty = false;
+      sessionPhase = 'ready';
+      setStatusMessage('Cloud notebook fetched safely.');
+      render();
+    } catch (error) {
+      syncState = previousState;
+      try { await saveSyncState(syncState); } catch { /* retain the original operation error */ }
+      throw error;
+    }
   });
+}
+
+async function disconnectSyncUnsafe(): Promise<void> {
+  syncState.status = 'disconnected';
+  syncState.location = null;
+  syncState.lastError = null;
+  cloudInspection = null;
+  availableUpdate = null;
+  if (sessionPhase === 'fetching') sessionPhase = 'ready';
+  await saveSyncState(syncState);
+  render();
+}
+
+async function disconnectSync(): Promise<void> {
+  await enqueueSyncMutation(() => disconnectSyncUnsafe());
+}
+
+async function inspectAuthenticatedAccount(): Promise<void> {
+  if (!capabilities.supabaseSync || !syncReady || !storageReady || authState.status !== 'signed-in' || !authState.userId) return;
+  if (cloudInspectionInFlight) return cloudInspectionInFlight;
+  const accountId = authState.userId;
+  const operation = enqueueSyncMutation(async () => {
+    try {
+      const location = currentSupabaseLocation();
+      const transport = new SupabaseSyncTransport(location);
+      const resource = await withSyncTimeout(new SyncCoordinator(transport).readManifestResource());
+      cloudInspection = { accountId, manifest: resource?.manifest ?? null, error: null };
+      const active = cloudLocation();
+      if (active?.accountId === accountId && syncState.status !== 'disconnected') {
+        if (!resource || !syncState.notebookId || resource.manifest.notebookId !== syncState.notebookId) {
+          await disconnectSyncUnsafe();
+          setStatusMessage('The saved cloud binding is no longer available; local tasks were kept.');
+        } else if (sessionPhase !== 'fetching' && sessionPhase !== 'closing') {
+          void startSessionFetch().then(() => reconcileSync()).catch(error => {
+            syncState.lastError = errorText(error);
+            sessionPhase = 'offline';
+            void saveSyncState(syncState);
+            render();
+          });
+        }
+      }
+    } catch (error) {
+      const message = errorText(error);
+      cloudInspection = { accountId, manifest: null, error: message };
+      if (cloudLocation()?.accountId === accountId && hasCloudBinding()) {
+        syncState.lastError = message;
+        sessionPhase = 'offline';
+        try { await saveSyncState(syncState); } catch { /* local notebook remains usable */ }
+      }
+    }
+    syncDialogRefresh?.();
+    render();
+  });
+  let tracked: Promise<void>;
+  tracked = operation.finally(() => {
+    if (cloudInspectionInFlight === tracked) cloudInspectionInFlight = null;
+  });
+  cloudInspectionInFlight = tracked;
+  await tracked;
+}
+
+async function handleAuthStateChange(next: AuthState): Promise<void> {
+  await enqueueSyncMutation(async () => {
+    authState = next;
+    syncDialogRefresh?.();
+    render();
+    if (next.status === 'signed-out') {
+      if (cloudLocation()) await disconnectSyncUnsafe();
+      return;
+    }
+    if (next.status !== 'signed-in' || !next.userId) return;
+    if (cloudLocation() && cloudLocation()?.accountId !== next.userId) await disconnectSyncUnsafe();
+  });
+  if (next.status === 'signed-in' && next.userId) await inspectAuthenticatedAccount();
 }
 
 async function toggleSyncPause(): Promise<void> {
   await enqueueSyncMutation(async () => {
-    if (!syncState.location || syncState.status === 'disconnected') throw new Error('Connect a folder first.');
+    if (!hasCloudBinding() || syncState.status === 'disconnected') throw new Error('Log in to sync first.');
     syncState.status = syncState.status === 'paused' ? 'connected' : 'paused';
     syncState.lastError = null;
     await saveSyncState(syncState);
-    if (syncState.status === 'connected') await checkForSharedUpdate();
+    if (syncState.status === 'connected') await checkForSharedUpdateUnsafe();
   });
 }
 
 async function syncNow(): Promise<number> {
-  if (syncState.status === 'paused') throw new Error('Resume folder checks before searching for updates.');
-  if (syncState.status === 'disconnected') throw new Error('Connect a folder first.');
-  const update = await checkForSharedUpdate();
-  return update ? 1 : 0;
+  return enqueueSyncMutation(async () => {
+    if (syncState.status === 'paused') throw new Error('Resume cloud sync before checking for updates.');
+    if (!hasCloudBinding() || syncState.status === 'disconnected') throw new Error('Log in to sync first.');
+    const update = await checkForSharedUpdateUnsafe();
+    return update ? 1 : 0;
+  });
 }
 
 function openSyncDialog() {
@@ -1275,76 +1434,73 @@ function openSyncDialog() {
   syncDialogElement = editor.dialog;
   editor.dialog.addEventListener('close', () => {
     if (syncDialogElement === editor.dialog) syncDialogElement = null;
+    syncDialogRefresh = null;
   }, { once: true });
-  let selectedFolder = localSyncParentPath();
-  let createNotebookConfirmed = false;
-  const intro = element('p', '', 'Use a local folder already synchronized by OneDrive or Google Drive for desktop.');
+  const intro = element('p', '', 'Sync Backlogger across your Windows devices with one Google account.');
   const statusLine = element('p', 'import-summary');
-  const folderLine = element('p', 'import-summary');
+  const accountLine = element('p', 'import-summary');
   const controls = element('div', 'sync-controls');
-  const choose = button('Choose folder', () => void chooseFolder());
+  const loginButton = button('Continue with Google', () => void login());
+  const startButton = button('Start sync', () => void connect());
   const syncNowButton = button('Check for updates', () => void runSyncNow());
   const pauseButton = button(syncState.status === 'paused' ? 'Resume' : 'Pause', () => void togglePause());
-  const disconnectButton = button('Disconnect', () => void disconnect());
   const resolveButton = button('Resolve conflicts', () => void resolveConflicts());
-  controls.append(choose, syncNowButton, pauseButton, disconnectButton, resolveButton);
-  editor.body.append(intro, statusLine, folderLine, controls);
-  editor.save.textContent = syncState.location && syncState.status !== 'disconnected' ? 'Done' : 'Connect';
+  const logoutButton = button('Log out', () => void logout());
+  controls.append(loginButton, startButton, syncNowButton, pauseButton, resolveButton, logoutButton);
+  editor.body.append(intro, statusLine, accountLine, controls);
+  editor.save.textContent = 'Close';
 
   function refresh() {
     statusLine.textContent = `${syncStatusLabel()} · ${syncStatusDetail()}`;
-    folderLine.textContent = selectedFolder ? `Folder: ${selectedFolder}` : 'No folder selected.';
-    const connected = syncState.status !== 'disconnected' && Boolean(syncState.location);
-    choose.disabled = storageKind() !== 'desktop' || !syncReady;
+    const signedIn = authState.status === 'signed-in' && Boolean(authState.userId);
+    const connected = hasCloudBinding();
+    loginButton.hidden = signedIn;
+    loginButton.disabled = !capabilities.supabaseSync || !authState.configured || authState.status === 'signing-in' || !syncReady;
+    startButton.hidden = !signedIn || connected;
+    startButton.disabled = !syncReady || Boolean(cloudInspectionInFlight);
+    syncNowButton.hidden = !connected;
     syncNowButton.disabled = !connected || syncState.status === 'paused';
+    pauseButton.hidden = !connected;
     pauseButton.disabled = !connected;
-    disconnectButton.disabled = !connected;
+    resolveButton.hidden = !connected;
     resolveButton.disabled = !syncState.conflicts.length;
+    logoutButton.hidden = !signedIn;
+    logoutButton.disabled = authState.status === 'signing-in';
     pauseButton.textContent = syncState.status === 'paused' ? 'Resume' : 'Pause';
-    editor.save.textContent = connected && selectedFolder === localSyncParentPath() ? 'Done' : 'Connect';
-    editor.save.disabled = storageKind() !== 'desktop' || !syncReady;
+    editor.save.disabled = false;
+    if (!authState.configured) accountLine.textContent = 'Sync is not configured for this build.';
+    else if (signedIn) {
+      const email = authState.email ?? 'Google account';
+      const inspection = cloudInspection?.accountId === authState.userId ? cloudInspection : null;
+      accountLine.textContent = inspection?.error
+        ? `Signed in as ${email}. ${inspection.error}`
+        : inspection && !inspection.manifest
+          ? `Signed in as ${email}. No cloud notebook exists yet.`
+          : `Signed in as ${email}.`;
+    } else if (authState.status === 'loading') accountLine.textContent = 'Checking your Google sign-in…';
+    else if (authState.status === 'signing-in') accountLine.textContent = 'Complete Google sign-in in your browser.';
+    else accountLine.textContent = authState.error ?? 'Not logged in.';
   }
 
-  async function chooseFolder() {
+  async function login() {
+    editor.error.textContent = '';
     try {
-      const path = await openNativeFile({ title: 'Choose Backlogger sync folder', directory: true, multiple: false });
-      if (typeof path === 'string') {
-        selectedFolder = path;
-        createNotebookConfirmed = false;
-        refresh();
-      }
+      await startGoogleSignIn();
     } catch (error) {
-      editor.error.textContent = `Folder picker failed: ${errorText(error)}`;
+      editor.error.textContent = errorText(error);
+      refresh();
     }
   }
 
   async function connect() {
-    if (!selectedFolder) { editor.error.textContent = 'Choose a folder first.'; return; }
     editor.error.textContent = '';
-    editor.save.disabled = true;
     try {
-      const selectedLocation: SyncLocation = { kind: 'local-folder', parentPath: selectedFolder };
-      const selectedCoordinator = syncCoordinatorFor(selectedLocation);
-      if (!selectedCoordinator) throw new Error('The selected sync location is not supported by this desktop build.');
-      const existingManifest = await selectedCoordinator.readManifest();
-      if (!existingManifest && !createNotebookConfirmed) {
-        createNotebookConfirmed = true;
-        editor.error.textContent = 'No shared notebook was found. Press Connect again to create a new notebook here, or cancel and wait for the provider to finish downloading.';
-        refresh();
-        return;
-      }
-      const joinedExisting = await connectSyncFolder(selectedFolder);
-      setStatusMessage(joinedExisting
-        ? 'Connected. Local snapshots are publishing; checking the shared notebook for remote changes.'
-        : 'Connected. The initial snapshot was published.');
+      await bindSupabaseAccount();
       refresh();
-      editor.dialog.close();
+      if (hasCloudBinding()) editor.dialog.close();
       void attemptPendingSync();
     } catch (error) {
-      syncState.lastCheckedAt = syncState.lastCheckedAt ?? syncCheckTime();
-      syncState.lastError = errorText(error);
-      try { await saveSyncState(syncState); } catch { /* keep the connection error visible in the dialog */ }
-      editor.error.textContent = `Could not connect: ${errorText(error)}`;
+      editor.error.textContent = `Could not start cloud sync: ${errorText(error)}`;
       refresh();
     }
   }
@@ -1355,7 +1511,7 @@ function openSyncDialog() {
       const count = await syncNow();
       setStatusMessage(syncState.conflicts.length
         ? `${syncState.conflicts.length} sync conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`
-        : count ? 'Shared update available.' : 'No shared update found.');
+        : count ? 'Cloud update available.' : 'No cloud update found.');
       refresh();
     } catch (error) {
       editor.error.textContent = `Sync failed: ${errorText(error)}`;
@@ -1372,7 +1528,7 @@ function openSyncDialog() {
     editor.error.textContent = '';
     try {
       await toggleSyncPause();
-      setStatusMessage(syncState.status === 'paused' ? 'Folder sync paused; local saves continue.' : 'Folder sync resumed.');
+      setStatusMessage(syncState.status === 'paused' ? 'Cloud sync paused; local saves continue.' : 'Cloud sync resumed.');
       refresh();
     } catch (error) {
       editor.error.textContent = `Could not change sync state: ${errorText(error)}`;
@@ -1380,12 +1536,12 @@ function openSyncDialog() {
     }
   }
 
-  async function disconnect() {
+  async function logout() {
     editor.error.textContent = '';
     try {
+      await signOutAuth();
       await disconnectSync();
-      selectedFolder = null;
-      setStatusMessage('Disconnected. Local tasks and pending snapshots were kept.');
+      setStatusMessage('Logged out. Local tasks and recoverable sync state were kept.');
       refresh();
     } catch (error) {
       editor.error.textContent = `Could not disconnect: ${errorText(error)}`;
@@ -1395,12 +1551,9 @@ function openSyncDialog() {
 
   editor.form.addEventListener('submit', event => {
     event.preventDefault();
-    if (syncState.status !== 'disconnected' && selectedFolder === localSyncParentPath()) {
-      editor.dialog.close();
-      return;
-    }
-    void connect();
+    editor.dialog.close();
   });
+  syncDialogRefresh = refresh;
   refresh();
 }
 
@@ -1800,7 +1953,8 @@ function render() {
     importButton.title = 'Import and export will be available in a later Android milestone.';
     exportButton.title = 'Import and export will be available in a later Android milestone.';
   }
-  syncButton.disabled = !storageReady || closeInProgress || !capabilities.localFolderSync || !syncReady;
+  syncButton.textContent = hasCloudBinding() ? 'Sync' : 'Log in to Sync';
+  syncButton.disabled = !storageReady || closeInProgress || !capabilities.cloudSync || !syncReady;
   undoButton.disabled = !editingReady;
   renderStatusBar();
   if (notebook.categories.length === 0) {
@@ -1932,7 +2086,7 @@ function askCloseAfterSaveTimeout(): Promise<boolean> {
 
 async function writeCloseSnapshot(): Promise<void> {
   const coordinator = syncCoordinatorFor();
-  if (!localSyncParentPath() || !syncState.notebookId || syncState.conflicts.length || !coordinator) return;
+  if (!hasCloudBinding() || !syncState.notebookId || syncState.conflicts.length || !coordinator) return;
   const pendingBaseParents = syncState.pendingSnapshots[0]?.parentSnapshotIds ?? [];
   const parents = syncState.mergeParentSnapshotIds.length
     ? syncState.mergeParentSnapshotIds
@@ -1949,13 +2103,13 @@ async function writeCloseSnapshot(): Promise<void> {
     ? existingPending
     : makeSyncSnapshot(document, syncState, parents);
 
-  // Save the final state as pending before touching the shared folder. Full
+  // Save the final state as pending before touching Supabase. Full
   // publication writes both the immutable snapshot and the manifest. Startup
   // and periodic checks retry this same snapshot if either operation fails.
   syncState.pendingSnapshots = [snapshot];
   syncState.lastError = null;
   await saveSyncState(syncState);
-  await enqueueSyncMutation(() => publishPendingSnapshots());
+  await enqueueSyncMutation(() => publishPendingSnapshotsUnsafe());
 }
 
 async function closeSession(): Promise<boolean> {
@@ -1979,7 +2133,7 @@ async function closeSession(): Promise<boolean> {
     render();
     return false;
   }
-  if (syncState.status !== 'connected' || !localSyncParentPath() || !syncState.notebookId) return true;
+  if (!hasCloudBinding() || syncState.status !== 'connected' || !syncState.notebookId) return true;
 
   const localNeedsPublish = sessionContentDirty || syncState.pendingSnapshots.length > 0;
   if (localNeedsPublish) {
@@ -2088,9 +2242,11 @@ async function loadInitialData() {
     sessionContentDirty = syncState.pendingSnapshots.length > 0 || (syncState.status === 'connected' && fingerprintChanged);
     recoverButton.hidden = true;
     setStorageNotice(stored ? 'Saved locally' : 'Local data ready', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data will be stored in this browser.');
-    sessionPhase = syncReady && syncState.status === 'connected' ? 'fetching' : syncLoadError ? 'offline' : 'ready';
+    sessionPhase = syncReady && syncState.status === 'connected' && authState.status === 'signed-in'
+      ? 'fetching'
+      : syncLoadError ? 'offline' : 'ready';
     render();
-    if (syncReady && syncState.status === 'connected') void startSessionFetch();
+    if (syncReady && syncState.status === 'connected' && authState.status === 'signed-in') void inspectAuthenticatedAccount();
     else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : '');
   } catch (error) {
     storageReady = true;
@@ -2106,6 +2262,7 @@ async function loadInitialData() {
 applyTheme();
 render();
 setStorageNotice('Loading local data…', 'Checking this device for a saved backlog.');
+subscribeAuthState(next => { void handleAuthStateChange(next); });
 void loadInitialData();
 void initializeAuth().catch(() => undefined);
 void installNativeCloseHandler();

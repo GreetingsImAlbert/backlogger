@@ -1,6 +1,7 @@
 export const SUPABASE_CALLBACK_URL = 'backlogger://auth/callback';
 export const SUPABASE_PROVIDER = 'google' as const;
 
+
 const PROJECT_HOST_PATTERN = /^([a-z0-9][a-z0-9-]{0,62})\.supabase\.co$/;
 const PUBLISHABLE_KEY_PREFIX = 'sb_publishable_';
 
@@ -17,8 +18,9 @@ export type SupabaseConfigState =
 type RuntimeEnv = Record<string, unknown>;
 
 function defaultRuntimeEnv(): RuntimeEnv {
-  const meta = import.meta as ImportMeta & { env?: RuntimeEnv };
-  return meta.env ?? {};
+  // Keep this as a direct `import.meta.env` expression so Vite embeds the
+  // client-safe values into production/Tauri bundles at build time.
+  return import.meta.env as unknown as RuntimeEnv;
 }
 
 function stringValue(value: unknown): string {

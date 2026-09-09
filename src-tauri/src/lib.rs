@@ -3,9 +3,74 @@
 use std::{
     fs,
     io::{ErrorKind, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+
+const OAUTH_CALLBACK_ADDRESS: &str = "127.0.0.1:17428";
+const OAUTH_CALLBACK_URL: &str = "http://127.0.0.1:17428/auth/callback";
+static OAUTH_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn oauth_response(stream: &mut TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn handle_oauth_request(app: &AppHandle, mut stream: TcpStream) {
+    use std::io::Read;
+
+    let mut request = [0_u8; 8192];
+    let Ok(length) = stream.read(&mut request) else {
+        return;
+    };
+    let first_line = String::from_utf8_lossy(&request[..length])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let target = first_line
+        .strip_prefix("GET ")
+        .and_then(|line| line.split_once(' ').map(|(target, _)| target));
+    let query = target.and_then(|target| target.strip_prefix("/auth/callback?"));
+    if let Some(query) = query {
+        let callback = format!("backlogger://auth/callback?{query}");
+        let _ = app.emit("backlogger-auth-callback", vec![callback]);
+        oauth_response(
+            &mut stream,
+            "200 OK",
+            "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Backlogger sign-in</title><style>:root{color-scheme:light dark;font-family:system-ui,sans-serif}body{min-height:100vh;margin:0;display:grid;place-items:center}main{width:min(28rem,calc(100% - 3rem));text-align:center}</style></head><body><main><h1>Sign-in complete</h1><p>You may close this tab and return to Backlogger.</p></main></body></html>",
+        );
+    } else {
+        oauth_response(
+            &mut stream,
+            "400 Bad Request",
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Backlogger sign-in</title></head><body><h1>Invalid sign-in callback</h1><p>Return to Backlogger and try again.</p></body></html>",
+        );
+    }
+}
+
+#[tauri::command]
+fn start_oauth_callback_listener(app: AppHandle) -> Result<String, String> {
+    if OAUTH_LISTENER_STARTED.load(Ordering::Acquire) {
+        return Ok(OAUTH_CALLBACK_URL.to_string());
+    }
+    let listener = TcpListener::bind(OAUTH_CALLBACK_ADDRESS)
+        .map_err(|_| "Backlogger could not start its local sign-in callback. Close other Backlogger instances and try again.".to_string())?;
+    OAUTH_LISTENER_STARTED.store(true, Ordering::Release);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            handle_oauth_request(&app, stream);
+        }
+        OAUTH_LISTENER_STARTED.store(false, Ordering::Release);
+    });
+    Ok(OAUTH_CALLBACK_URL.to_string())
+}
 
 fn notebook_path(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
@@ -221,7 +286,14 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let auth_urls: Vec<String> = args
+                .into_iter()
+                .filter(|arg| arg.starts_with("backlogger://auth/callback"))
+                .collect();
+            if !auth_urls.is_empty() {
+                let _ = app.emit("backlogger-auth-callback", auth_urls);
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -253,7 +325,8 @@ pub fn run() {
             remove_file,
             set_app_theme,
             read_document_file,
-            write_document_file
+            write_document_file,
+            start_oauth_callback_listener
         ])
         .run(tauri::generate_context!())
         .expect("error while running Backlogger");
