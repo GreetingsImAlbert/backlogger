@@ -282,6 +282,17 @@ Record the Supabase CLI version, local test count, migration filename, and wheth
 - App logs, `backlogger.sync.json`, exports, and Git contain no credentials or OAuth parameters.
 - Windows release packaging still produces version `0.1.2` unless the user separately changes the Windows version.
 
+### Milestone 2 handoff
+
+- **Status:** Implementation complete; the user must perform the real first-login browser acceptance after the login entry point is exposed by Milestone 4.
+- **Changed files:** `package.json`, `package-lock.json`, `src/supabase/config.ts`, `src/supabase/client.ts`, `src/supabase/auth.ts`, `src/vite-env.d.ts`, `src/main.ts`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/src/lib.rs`, `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json`, and `tests/supabase-auth.test.mjs`.
+- **Auth interface:** `initializeAuth()` restores the persisted Supabase session and installs cold-start/already-running deep-link listeners. `startGoogleSignIn()`, `cancelGoogleSignIn()`, `handleAuthCallback()`, `signOut()`, `getAuthState()`, and `subscribeAuthState()` expose sanitized auth state only. PKCE, session persistence, token refresh, exact `backlogger://auth/callback` validation, pending-flow markers, duplicate/unsolicited callback rejection, and sanitized errors are implemented.
+- **Configuration:** Only `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` are accepted. URLs must be HTTPS Supabase project URLs; missing configuration leaves local-only mode available. No service-role key, Google secret, OAuth code, token, or notebook payload is logged or persisted by the auth module.
+- **Tauri:** Added official deep-link/opener plugins, enabled the single-instance deep-link feature and registered that plugin first, configured the desktop-only `backlogger` scheme, restricted opener URLs to Supabase authorization endpoints, and registered links at Windows debug runtime. Android OAuth/deep-link release behavior remains disabled for the revised mobile plan.
+- **Checks:** `npm.cmd run check` passed; `npm.cmd test` passed with 35 tests; `npm.cmd run build` passed; `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` passed; `cargo check --manifest-path src-tauri/Cargo.toml` passed; Windows packaging passed and produced `src-tauri/target/release/bundle/nsis/Backlogger_0.1.2_x64-setup.exe`; Android debug packaging passed and produced `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
+- **Manual evidence pending:** The current UI still contains the retired folder-sync dialog; Milestone 4 must wire it to `Continue with Google` before the user can perform the required first-login, consent, session-restore, sign-out, and same-account checks. Linked type generation remains a user-run command after remote migration deployment.
+- **Next milestone interface:** Milestone 3 may use the generated `Database` type and the auth/client functions above. It must not put sessions into `SyncState`, use the service-role key, or enable Android OAuth. Deterministic transport tests should inject/fake the Supabase client and avoid Google login.
+
 ## Milestone 3 — Implement `SupabaseSyncTransport`
 
 **Prerequisites:** Milestones 1–2. Real database verification requires Gate A; deterministic tests must not require Google.

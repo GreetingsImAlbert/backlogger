@@ -21,6 +21,33 @@ cargo check --manifest-path src-tauri/Cargo.toml
 - Android development: `npm.cmd run android:dev`. Emulator debug APK: `npm.cmd run android:build`; the current script targets x86_64 and is not a signed production build.
 - Android builds on Windows require Android Studio/SDK/NDK, Rust Android targets, and Windows Developer Mode for symlinks.
 
+## Supabase workflow
+
+- The user runs all Supabase operations manually. Codex must not run migrations, resets, links, pushes, remote tests, or other destructive database commands.
+- After any change to `supabase/migrations/`, tables, RLS, grants, RPCs, seed data, or generated database types, remind the user to run this local sequence from the repository root:
+
+```powershell
+npm.cmd run supabase:start
+npm.cmd run supabase:reset:local
+npm.cmd run supabase:test:db
+npx.cmd supabase db lint --local
+npm.cmd run supabase:types:local
+npm.cmd run check
+npm.cmd test
+npm.cmd run build
+```
+
+- Create a new migration manually with `npx.cmd supabase migration new <name>`. Never edit an already-applied remote migration; add a new one.
+- For the development project only, the user manually runs `npx.cmd supabase link --project-ref <DEV_PROJECT_REF>`, then `npx.cmd supabase db push --linked --dry-run`, reviews the SQL, and runs `npx.cmd supabase db push --linked`. After a remote schema change, lint and regenerate linked types with:
+
+```powershell
+npx.cmd supabase db lint --linked
+cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types.ts"
+```
+
+- `npx.cmd supabase test db --linked` is allowed only against the disposable development project, never production. Never run `npx.cmd supabase db reset --linked`.
+- Do not mark a database-related milestone verified until the user reports the relevant manual commands and results. Remind the user of these commands whenever a change touches the database contract because Codex cannot apply or verify those migrations itself.
+
 ## Architecture and invariants
 
 - `src/main.ts` owns UI orchestration; keep domain logic testable in focused modules such as `dates.ts`, `storage.ts`, `reorder.ts`, and `sync.ts`.

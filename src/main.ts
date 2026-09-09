@@ -10,6 +10,7 @@ import { applySyncConflict, findCommonSnapshotAncestor, isSnapshotAncestor, load
 import { SyncCoordinator } from './sync/coordinator';
 import { LocalFolderSyncTransport, type LocalFolderTransportOptions } from './sync/local-folder-transport';
 import type { SyncTransport } from './sync/transport';
+import { initializeAuth } from './supabase/auth';
 
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('App container is missing.');
@@ -2106,4 +2107,5 @@ applyTheme();
 render();
 setStorageNotice('Loading local data…', 'Checking this device for a saved backlog.');
 void loadInitialData();
+void initializeAuth().catch(() => undefined);
 void installNativeCloseHandler();

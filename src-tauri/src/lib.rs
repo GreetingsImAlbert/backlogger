@@ -227,7 +227,17 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }));
+        builder = builder.plugin(tauri_plugin_deep_link::init());
+        builder = builder.plugin(tauri_plugin_opener::init());
         builder = builder.plugin(tauri_plugin_dialog::init());
+        builder = builder.setup(|_app| {
+            #[cfg(all(debug_assertions, windows))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                _app.deep_link().register_all()?;
+            }
+            Ok(())
+        });
     }
     builder
         .invoke_handler(tauri::generate_handler![

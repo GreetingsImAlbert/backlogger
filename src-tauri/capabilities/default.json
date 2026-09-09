@@ -4,5 +4,18 @@
   "description": "Default desktop capability",
   "windows": ["main"],
   "platforms": ["windows", "macOS", "linux"],
-  "permissions": ["core:default", "core:window:allow-destroy", "dialog:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-destroy",
+    "dialog:default",
+    "deep-link:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://*.supabase.co/auth/v1/authorize*"
+        }
+      ]
+    }
+  ]
 }
