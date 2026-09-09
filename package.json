@@ -11,6 +11,10 @@
     "preview": "vite preview --host 127.0.0.1",
     "android:dev": "set BACKLOGGER_DEV_HOST=0.0.0.0&& tauri android dev",
     "android:build": "tauri android build --debug --apk --target x86_64 --ci",
+    "supabase:start": "npx supabase start",
+    "supabase:reset:local": "npx supabase db reset --local",
+    "supabase:test:db": "npx supabase test db --local",
+    "supabase:types:local": "npx supabase gen types --lang typescript --local > supabase/database.types.ts",
     "tauri": "tauri"
   },
   "devDependencies": {

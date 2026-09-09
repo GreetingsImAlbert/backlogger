@@ -4,3 +4,4 @@ src-tauri/target/
 src-tauri/gen/
 *.local
 gate-c-inventory.local.json
+.env.local

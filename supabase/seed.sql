@@ -1,0 +1,1 @@
+-- Intentionally empty. Database tests create and roll back their own auth users.

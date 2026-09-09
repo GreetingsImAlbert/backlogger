@@ -41,5 +41,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 ## Working practice
 
 - Preserve unrelated changes in the working tree and keep secrets, tokens, signing keys, and machine-specific credentials out of Git.
+- The user runs Supabase migrations, resets, links, pushes, and database tests manually; prepare the files and commands, but do not run remote or destructive Supabase operations on their behalf.
+- The user creates Git commits manually; do not commit or amend history unless explicitly requested.
 - Run the checks relevant to every changed layer. Record each mobile milestone's concise handoff and evidence beneath that milestone in `mobile-implementation.md`.
 - Do not recreate the retired `PLAN.md`, `PROGRESS.md`, `feature.md`, `feature_drop.md`, or `FEATURES.md` files.
