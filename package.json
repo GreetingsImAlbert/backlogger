@@ -15,6 +15,7 @@
     "supabase:reset:local": "npx supabase db reset --local",
     "supabase:test:db": "npx supabase test db --local",
     "supabase:types:local": "npx supabase gen types --lang typescript --local > supabase/database.types.ts",
+    "security:secrets": "node scripts/verify-no-secrets.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

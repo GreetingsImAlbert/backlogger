@@ -116,6 +116,23 @@ test('coordinator keeps transport metadata separate from validated sync records'
   );
 });
 
+test('coordinator preserves the transport receiver during atomic notebook initialization', async () => {
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const snapshot = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), type: 'checkpoint', checkpointVersion: 1 };
+  const manifest = makeSyncManifest(state.notebookId, state.deviceId, [snapshot.snapshotId]);
+  const transport = new MemoryTransport(new Map(), 'profile-a');
+  transport.initializeNotebook = async function (notebookId, snapshotId, snapshotContent, manifestContent) {
+    assert.equal(this, transport);
+    assert.equal(notebookId, state.notebookId);
+    await this.createSnapshot(snapshotId, snapshotContent);
+    return this.writeManifest(manifestContent, null);
+  };
+
+  const initialized = await new SyncCoordinator(transport).initializeNotebook(snapshot, manifest);
+  assert.deepEqual(initialized.manifest.headSnapshotIds, [snapshot.snapshotId]);
+});
+
 test('coordinator publication replaces ancestor manifest entries with actual branch heads', async () => {
   const sharedFiles = new Map();
   const state = makeSyncState('device-a');
@@ -188,4 +205,83 @@ test('coordinator stops after three stale CAS attempts without losing the immuta
   );
   assert.equal(attempts, 3);
   assert.ok(sharedFiles.has('snapshots/pending.json'));
+});
+
+test('publication interrupted before snapshot creation leaves the remote manifest unchanged', async () => {
+  const sharedFiles = new Map();
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const transport = new MemoryTransport(sharedFiles, 'profile-a');
+  const coordinator = new SyncCoordinator(transport, state.notebookId);
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), snapshotId: 'base' };
+  const pending = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'pending' };
+  await coordinator.writeManifest(makeSyncManifest(state.notebookId, state.deviceId, ['base']), null);
+  await coordinator.createSnapshotIfNeeded(base);
+  const manifestBefore = sharedFiles.get('notebook.json');
+  transport.createSnapshot = async () => { throw new SyncTransportError('offline', 'interrupted', true); };
+
+  await assert.rejects(() => coordinator.publishSnapshot(pending), /interrupted/);
+  assert.equal(sharedFiles.has('snapshots/pending.json'), false);
+  assert.equal(sharedFiles.get('notebook.json'), manifestBefore);
+});
+
+test('publication resumes idempotently after snapshot creation but before manifest CAS', async () => {
+  const sharedFiles = new Map();
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const transport = new MemoryTransport(sharedFiles, 'profile-a');
+  const coordinator = new SyncCoordinator(transport, state.notebookId);
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), snapshotId: 'base' };
+  const pending = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'pending' };
+  await coordinator.writeManifest(makeSyncManifest(state.notebookId, state.deviceId, ['base']), null);
+  await coordinator.createSnapshotIfNeeded(base);
+  const writeManifest = transport.writeManifest.bind(transport);
+  transport.writeManifest = async () => { throw new SyncTransportError('offline', 'interrupted after snapshot', true); };
+
+  await assert.rejects(() => coordinator.publishSnapshot(pending), /interrupted after snapshot/);
+  assert.ok(sharedFiles.has('snapshots/pending.json'));
+  assert.deepEqual(JSON.parse(sharedFiles.get('notebook.json')).headSnapshotIds, ['base']);
+
+  transport.writeManifest = writeManifest;
+  const recovered = await coordinator.publishSnapshot(pending);
+  assert.deepEqual(recovered.manifest.headSnapshotIds, ['pending']);
+  assert.equal([...sharedFiles.keys()].filter(key => key === 'snapshots/pending.json').length, 1);
+});
+
+test('a stale local pending snapshot is safe to republish after manifest CAS', async () => {
+  const sharedFiles = new Map();
+  const state = makeSyncState('device-a');
+  state.notebookId = 'notebook-1';
+  const coordinator = new SyncCoordinator(new MemoryTransport(sharedFiles, 'profile-a'), state.notebookId);
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), state, []), snapshotId: 'base' };
+  const pending = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), state, ['base']), snapshotId: 'pending' };
+  await coordinator.writeManifest(makeSyncManifest(state.notebookId, state.deviceId, ['base']), null);
+  await coordinator.createSnapshotIfNeeded(base);
+  await coordinator.publishSnapshot(pending);
+
+  const recovered = await coordinator.publishSnapshot(pending);
+  assert.deepEqual(recovered.manifest.headSnapshotIds, ['pending']);
+  assert.equal([...sharedFiles.keys()].filter(key => key === 'snapshots/pending.json').length, 1);
+});
+
+test('two isolated coordinators converge through sequential publications', async () => {
+  const sharedFiles = new Map();
+  const firstState = makeSyncState('device-a');
+  const secondState = makeSyncState('device-b');
+  firstState.notebookId = secondState.notebookId = 'notebook-1';
+  const first = new SyncCoordinator(new MemoryTransport(sharedFiles, 'profile-a'), firstState.notebookId);
+  const second = new SyncCoordinator(new MemoryTransport(sharedFiles, 'profile-b'), secondState.notebookId);
+  const base = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 1, 'all'), firstState, []), snapshotId: 'base' };
+  const fromFirst = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 2, 'all'), firstState, ['base']), snapshotId: 'from-first' };
+  const fromSecond = { ...makeSyncSnapshot(makeStoredDocument({ categories: [] }, 3, 'all'), secondState, ['from-first']), snapshotId: 'from-second' };
+  await first.writeManifest(makeSyncManifest(firstState.notebookId, firstState.deviceId, ['base']), null);
+  await first.createSnapshotIfNeeded(base);
+  await first.publishSnapshot(fromFirst);
+  await second.publishSnapshot(fromSecond);
+
+  const firstView = await first.readManifest();
+  const secondView = await second.readManifest();
+  assert.deepEqual(firstView.headSnapshotIds, ['from-second']);
+  assert.deepEqual(secondView, firstView);
+  assert.equal((await first.readSnapshotIndex()).size, 3);
 });

@@ -11,6 +11,7 @@ import {
   makeSyncManifest,
   makeSyncSnapshot,
   makeSyncState,
+  mergeEverything,
   mergeNotebooks,
   parseSyncManifest,
   parseSyncSnapshot,
@@ -197,6 +198,34 @@ test('sync snapshots can be recovered as normal local documents and reject stale
   assert.equal(recovered.preferences.viewMode, 'today');
   assert.equal(recovered.preferences.theme, 'light');
   assert.deepEqual(recovered.categories, base.categories);
+});
+
+test('merge everything unions categories, tasks, dates, and missing values without conflicts', () => {
+  const local = {
+    categories: [{
+      id: 'shared-category',
+      name: 'Local name',
+      tasks: [{ id: 'shared-task', title: 'Local title', scheduledDates: ['2026-09-10'], deadlineDate: null }],
+    }, { id: 'local-category', name: 'Local only', tasks: [] }],
+  };
+  const remote = {
+    categories: [{
+      id: 'shared-category',
+      name: 'Remote name',
+      tasks: [
+        { id: 'shared-task', title: 'Remote title', scheduledDates: ['2026-09-11'], deadlineDate: '2026-09-12' },
+        { id: 'remote-task', title: 'Remote only', scheduledDates: [], deadlineDate: null },
+      ],
+    }, { id: 'remote-category', name: 'Remote only', tasks: [] }],
+  };
+
+  const merged = mergeEverything(local, remote);
+  assert.deepEqual(merged.categories.map(category => category.id), ['shared-category', 'local-category', 'remote-category']);
+  assert.deepEqual(merged.categories[0].tasks.map(task => task.id), ['shared-task', 'remote-task']);
+  assert.equal(merged.categories[0].name, 'Local name');
+  assert.equal(merged.categories[0].tasks[0].title, 'Local title');
+  assert.deepEqual(merged.categories[0].tasks[0].scheduledDates, ['2026-09-10', '2026-09-11']);
+  assert.equal(merged.categories[0].tasks[0].deadlineDate, '2026-09-12');
 });
 
 test('three-way merge keeps independent task fields and records same-field conflicts', () => {

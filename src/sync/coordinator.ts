@@ -77,10 +77,9 @@ export class SyncCoordinator {
   }
 
   async initializeNotebook(snapshot: SyncSnapshot, manifest: SyncManifest): Promise<SyncManifestResource> {
-    const initialize = this.transport.initializeNotebook;
-    if (!initialize) throw new SyncTransportError('unsupported', 'This sync provider cannot initialize a notebook atomically.', false);
+    if (!this.transport.initializeNotebook) throw new SyncTransportError('unsupported', 'This sync provider cannot initialize a notebook atomically.', false);
     if (snapshot.notebookId !== manifest.notebookId) throw new Error('The initial snapshot and manifest belong to different notebooks.');
-    const remote = await initialize(
+    const remote = await this.transport.initializeNotebook(
       snapshot.notebookId,
       snapshot.snapshotId,
       JSON.stringify(snapshot, null, 2),

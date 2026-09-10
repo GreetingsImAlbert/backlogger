@@ -146,10 +146,14 @@ export function localFolderLocation(location: SyncLocation | null): LocalFolderL
   return location?.kind === 'local-folder' ? location : null;
 }
 
+function cloneTasks(tasks: Task[]): Task[] {
+  return tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] }));
+}
+
 function cloneCategories(categories: Category[]): Category[] {
   return categories.map(category => ({
     ...category,
-    tasks: category.tasks.map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })),
+    tasks: cloneTasks(category.tasks),
   }));
 }
 
@@ -408,6 +412,38 @@ export function snapshotFingerprint(snapshot: SyncSnapshot): string {
 
 export function notebookFingerprint(notebook: Pick<Notebook, 'categories'>): string {
   return JSON.stringify(notebook.categories);
+}
+
+/**
+ * Deliberately simple union merge. Stable local ordering wins, remote-only
+ * records append, and matching records combine their non-destructive values.
+ */
+export function mergeEverything(local: Notebook, remote: Notebook): Notebook {
+  const remoteCategories = new Map(remote.categories.map(category => [category.id, category]));
+  const categories = local.categories.map(localCategory => {
+    const remoteCategory = remoteCategories.get(localCategory.id);
+    if (!remoteCategory) return { ...localCategory, tasks: cloneTasks(localCategory.tasks) };
+    remoteCategories.delete(localCategory.id);
+    const remoteTasks = new Map(remoteCategory.tasks.map(task => [task.id, task]));
+    const tasks = localCategory.tasks.map(localTask => {
+      const remoteTask = remoteTasks.get(localTask.id);
+      if (!remoteTask) return { ...localTask, scheduledDates: [...localTask.scheduledDates] };
+      remoteTasks.delete(localTask.id);
+      return {
+        id: localTask.id,
+        title: localTask.title || remoteTask.title,
+        scheduledDates: [...new Set([...localTask.scheduledDates, ...remoteTask.scheduledDates])].sort(),
+        deadlineDate: localTask.deadlineDate ?? remoteTask.deadlineDate,
+      };
+    });
+    tasks.push(...[...remoteTasks.values()].map(task => ({ ...task, scheduledDates: [...task.scheduledDates] })));
+    return { id: localCategory.id, name: localCategory.name || remoteCategory.name, tasks };
+  });
+  categories.push(...[...remoteCategories.values()].map(category => ({
+    ...category,
+    tasks: cloneTasks(category.tasks),
+  })));
+  return { categories };
 }
 
 export function notebookFromSnapshot(snapshot: SyncSnapshot): Notebook {

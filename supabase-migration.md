@@ -435,7 +435,7 @@ Automate these cases against fake/local Supabase:
 
 1. Re-run pgTAP security tests and database linting against a clean local reset.
 2. Use two isolated Backlogger profiles with the same Google account to simulate two devices. Each profile must have a distinct device ID and local app-data directory.
-3. Verify first-profile initialization, second-profile discovery, explicit first fetch, sequential edits in both directions, concurrent offline edits, automatic merge, and manual conflict resolution.
+3. Verify first-profile initialization, second-profile discovery, explicit first fetch, sequential edits in both directions, concurrent offline edits, and the explicit Merge everything union action.
 4. Interrupt the app after every publication boundary: before snapshot RPC, after snapshot RPC/before manifest CAS, after CAS/before local sync-state save, and during cleanup. Restart and confirm recoverability.
 5. Test revoked/expired session, logout during an idle state, login cancellation, wrong Google account, offline startup, throttled/transient responses, and return online.
 6. Inspect Supabase rows after each test. Confirm one owner cannot query or mutate another owner's data, snapshot rows never change in place, and manifest versions increase monotonically.
@@ -446,9 +446,18 @@ Automate these cases against fake/local Supabase:
 
 - All repository and database tests pass.
 - Real Google login, session restoration, and logout are verified in a packaged Windows build.
-- Two isolated clients converge without data loss through sequential, concurrent, offline, restart, and conflict cases.
+- Two isolated clients converge without data loss through sequential, concurrent, offline, restart, and Merge everything cases.
 - RLS and function permissions pass both allowed and denied tests.
 - The old OneDrive folder was not modified.
+
+### Milestone 6 handoff
+
+- **Status:** Automated acceptance coverage is implemented. Packaged two-profile and live-account acceptance remains user-owned and must pass before this milestone is marked complete.
+- **Recovery coverage:** Deterministic coordinator tests cover interruption before snapshot creation, after immutable snapshot creation/before manifest CAS, after manifest CAS/before local pending-state removal, CAS retry exhaustion, concurrent-head preservation, and sequential convergence between distinct device profiles.
+- **Existing coverage reused:** Supabase transport tests cover authentication loss, account/project mismatch, RLS-style permission denial, offline responses, immutable collisions, pagination, guarded deletion, and monotonically versioned manifest CAS. The active UI now uses only Fetch and replace or the deterministic Merge everything union; legacy three-way merge code remains compatibility-tested but is no longer exposed.
+- **Secret audit:** `npm.cmd run security:secrets` scans tracked files plus available production artifacts for service-role JWTs/assignments, Google client secrets, and private keys. The publishable key remains intentionally client-visible.
+- **Remote safety:** No OneDrive folder is accessed by this milestone. Codex does not run local resets, pgTAP, linked database tests, or migrations; those commands and their results remain a user gate.
+- **Manual acceptance pending:** Use two isolated packaged Backlogger profiles with distinct app-data directories and the same disposable Google account. Verify first initialization, explicit second fetch, bidirectional sequential edits, concurrent offline Merge everything, restart recovery, cancellation, logout/session restoration, wrong-account rejection, and return-online recovery. Inspect database ownership, immutable snapshots, and increasing manifest versions after each phase.
 
 ## Milestone 7 — Remove retired folder sync and document the cutover
 

@@ -6,11 +6,11 @@ import type { Category, Notebook, Task } from './model';
 import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
 import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
-import { applySyncConflict, findCommonSnapshotAncestor, hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeNotebooks, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncConflict, type SyncManifest, type SyncSnapshot, type SyncState, type SupabaseLocation } from './sync';
+import { hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeEverything, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncManifest, type SyncSnapshot, type SyncState, type SupabaseLocation } from './sync';
 import { SyncCoordinator } from './sync/coordinator';
 import { SupabaseSyncTransport } from './sync/supabase-transport';
 import type { SyncTransport } from './sync/transport';
-import { getAuthState, initializeAuth, signOut as signOutAuth, startGoogleSignIn, subscribeAuthState, type AuthState } from './supabase/auth';
+import { cancelGoogleSignIn, getAuthState, initializeAuth, signOut as signOutAuth, startGoogleSignIn, subscribeAuthState, type AuthState } from './supabase/auth';
 import { getConfiguredSupabaseProject } from './supabase/client';
 
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -35,6 +35,7 @@ let syncDialogElement: HTMLDialogElement | null = null;
 let syncDialogRefresh: (() => void) | null = null;
 let syncDeferred = false;
 let authState: AuthState = getAuthState();
+let signInStartedAt: number | null = null;
 let cloudInspection: { accountId: string; manifest: SyncManifest | null; error: string | null } | null = null;
 let cloudInspectionInFlight: Promise<void> | null = null;
 type SessionPhase = 'loading' | 'fetching' | 'ready' | 'offline' | 'closing';
@@ -45,6 +46,7 @@ interface AvailableUpdate {
 let sessionPhase: SessionPhase = 'loading';
 let sessionContentDirty = false;
 let statusMessage = '';
+let statusDetailMessage = '';
 let availableUpdate: AvailableUpdate | null = null;
 let ignoredUpdateIds = new Set<string>();
 let closeInProgress = false;
@@ -334,14 +336,21 @@ statusBar.setAttribute('aria-label', 'Activity status');
 const status = element('div', 'status');
 status.setAttribute('role', 'status');
 status.setAttribute('aria-live', 'polite');
+const statusText = element('span');
+const statusInfo = element('span', 'status-info');
+statusInfo.tabIndex = 0;
+statusInfo.setAttribute('role', 'img');
+statusInfo.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>';
+statusInfo.hidden = true;
+status.append(statusText, statusInfo);
 const statusActions = element('div', 'status-actions');
 const fetchUpdateButton = button('Fetch', () => void fetchAvailableUpdate(), 'quiet-button');
-const ignoreUpdateButton = button('Ignore', () => ignoreAvailableUpdate(), 'quiet-button');
+const mergeUpdateButton = button('Merge', () => void mergeAvailableUpdate(), 'quiet-button');
 const retryFetchButton = button('Retry fetch', () => void retrySessionFetch(), 'quiet-button');
 fetchUpdateButton.hidden = true;
-ignoreUpdateButton.hidden = true;
+mergeUpdateButton.hidden = true;
 retryFetchButton.hidden = true;
-statusActions.append(fetchUpdateButton, ignoreUpdateButton, retryFetchButton);
+statusActions.append(fetchUpdateButton, mergeUpdateButton, retryFetchButton);
 statusBar.append(status, statusActions);
 const list = element('div', 'categories');
 const addCategory = button('+ Add category', () => editCategory(), 'add-category');
@@ -376,22 +385,34 @@ root.append(main);
 
 function setStatusMessage(message: string) {
   statusMessage = message;
+  statusDetailMessage = '';
+  renderStatusBar();
+}
+
+function setSyncStatusMessage(detail: string) {
+  statusMessage = 'Syncing...';
+  statusDetailMessage = detail;
   renderStatusBar();
 }
 
 function renderStatusBar() {
   const update = availableUpdate;
-  status.textContent = update
+  const message = update
     ? update.branchCount > 1 ? `${update.branchCount} shared updates available.` : 'Shared update available.'
     : statusMessage;
+  statusText.textContent = message;
+  statusInfo.hidden = Boolean(update) || !statusDetailMessage || !message;
+  statusInfo.title = statusDetailMessage;
+  statusInfo.setAttribute('aria-label', `Sync details: ${statusDetailMessage}`);
+  status.hidden = !message;
   fetchUpdateButton.hidden = !update;
-  ignoreUpdateButton.hidden = !update;
+  mergeUpdateButton.hidden = !update;
   retryFetchButton.hidden = sessionPhase !== 'offline' || !syncState.lastError;
   const editingReady = sessionPhase === 'ready' || sessionPhase === 'offline';
   fetchUpdateButton.disabled = !editingReady;
-  ignoreUpdateButton.disabled = !editingReady;
+  mergeUpdateButton.disabled = !editingReady;
   retryFetchButton.disabled = sessionPhase === 'fetching' || sessionPhase === 'closing';
-  statusBar.hidden = !status.textContent && statusActions.querySelector('button:not([hidden])') === null;
+  statusBar.hidden = !message && statusActions.querySelector('button:not([hidden])') === null;
 }
 
 function setStorageNotice(title: string, detail: string) {
@@ -920,7 +941,7 @@ async function runSessionFetchUnsafe() {
     return;
   }
   sessionPhase = 'fetching';
-  setStatusMessage('Fetching shared updates…');
+  setSyncStatusMessage('Publishing pending local changes and checking Supabase for updates.');
   render();
   if (syncState.pendingSnapshots.length) {
     try {
@@ -980,36 +1001,68 @@ async function retrySessionFetch() {
   await startSessionFetch();
 }
 
-function askFetchConfirmation(): Promise<boolean> {
+type CloudDifferenceAction = 'replace' | 'merge';
+
+function askFetchConfirmation(): Promise<CloudDifferenceAction | null> {
   return new Promise(resolve => {
-    const editor = openDialog('Replace local backlog?');
+    const editor = openDialog('Cloud notebook found');
     editor.body.append(
       element('p', '', 'Fetching this shared version will replace the visible list with the validated shared snapshot.'),
       element('p', 'advisory', hasLocalBacklog()
         ? 'Your current local backlog will be backed up first. Continue only if you want to replace this device’s saved list.'
         : 'This device has no saved backlog yet. The shared snapshot will become the local list after you confirm.'),
     );
-    editor.save.textContent = 'Fetch and replace';
+    editor.save.textContent = 'Fetch';
+    const mergeButton = button('Merge', () => {
+      finish('merge');
+      editor.dialog.close();
+    });
+    editor.controls.insertBefore(mergeButton, editor.save);
     let settled = false;
-    const finish = (choice: boolean) => {
+    const finish = (choice: CloudDifferenceAction | null) => {
       if (settled) return;
       settled = true;
       resolve(choice);
     };
-    editor.dialog.addEventListener('close', () => finish(false), { once: true });
+    editor.dialog.addEventListener('close', () => finish(null), { once: true });
     editor.form.addEventListener('submit', event => {
       event.preventDefault();
-      finish(true);
+      finish('replace');
       editor.dialog.close();
     });
   });
+}
+
+async function applyEverythingMerge(snapshot: SyncSnapshot): Promise<void> {
+  await writeStoredDocument(makeStoredDocument(notebook, revision, viewMode, theme));
+  const merged = mergeEverything(notebook, notebookFromSnapshot(snapshot));
+  if (notebookFingerprint(merged) === snapshotFingerprint(snapshot)) {
+    await applyFetchedSnapshot(snapshot);
+    setStatusMessage('Everything was already included in the cloud backlog; no merge snapshot was needed.');
+    return;
+  }
+  notebook = merged;
+  revision = Math.max(revision, snapshot.revision);
+  const currentId = acceptedSnapshotId();
+  syncState.pendingSnapshots = [];
+  syncState.mergeParentSnapshotIds = [...new Set([currentId, snapshot.snapshotId].filter((id): id is string => Boolean(id)))];
+  syncState.currentSnapshotId = null;
+  syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, snapshot.snapshotId])];
+  syncState.conflicts = [];
+  syncState.lastError = null;
+  availableUpdate = null;
+  sessionContentDirty = true;
+  await saveSyncState(syncState);
+  queueSave(true);
+  setSyncStatusMessage('Saving and publishing the combined local and cloud backlog.');
+  render();
 }
 
 async function fetchAvailableUpdateUnsafe() {
   if (!availableUpdate || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
   const requestedId = availableUpdate.snapshot.snapshotId;
   sessionPhase = 'fetching';
-  setStatusMessage('Fetching shared update…');
+  setSyncStatusMessage('Rechecking and fetching the selected cloud update.');
   render();
   const fresh = await checkForSharedUpdateUnsafe(true);
   if (!fresh || fresh.snapshot.snapshotId !== requestedId) {
@@ -1025,12 +1078,20 @@ async function fetchAvailableUpdateUnsafe() {
     render();
     return;
   }
-  if (sessionContentDirty && !(await askFetchConfirmation())) {
-    sessionPhase = 'ready';
-    availableUpdate = fresh;
-    setStatusMessage('Fetch canceled; local edits were kept.');
-    render();
-    return;
+  if (sessionContentDirty) {
+    const action = await askFetchConfirmation();
+    if (!action) {
+      sessionPhase = 'ready';
+      availableUpdate = fresh;
+      setStatusMessage('Fetch canceled; local edits were kept.');
+      render();
+      return;
+    }
+    if (action === 'merge') {
+      await applyEverythingMerge(fresh.snapshot);
+      sessionPhase = 'ready';
+      return;
+    }
   }
   try {
     await applyFetchedSnapshot(fresh.snapshot);
@@ -1050,12 +1111,24 @@ function fetchAvailableUpdate(): Promise<void> {
   return enqueueSyncMutation(() => fetchAvailableUpdateUnsafe());
 }
 
-function ignoreAvailableUpdate() {
-  if (!availableUpdate) return;
-  ignoredUpdateIds.add(availableUpdate.snapshot.snapshotId);
-  availableUpdate = null;
-  setStatusMessage('Shared update ignored for this session.');
+async function mergeAvailableUpdateUnsafe() {
+  if (!availableUpdate || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
+  const requestedId = availableUpdate.snapshot.snapshotId;
+  sessionPhase = 'fetching';
   render();
+  const fresh = await checkForSharedUpdateUnsafe(true);
+  if (!fresh || fresh.snapshot.snapshotId !== requestedId) {
+    sessionPhase = syncState.lastError ? 'offline' : 'ready';
+    setStatusMessage(fresh ? 'A newer cloud update is available.' : 'That cloud update is no longer available.');
+    render();
+    return;
+  }
+  await applyEverythingMerge(fresh.snapshot);
+  sessionPhase = 'ready';
+}
+
+function mergeAvailableUpdate(): Promise<void> {
+  return enqueueSyncMutation(() => mergeAvailableUpdateUnsafe());
 }
 
 async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: number }> {
@@ -1105,30 +1178,10 @@ async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: numb
     }
     if (isSnapshotAncestor(workingId, candidate.snapshotId, snapshots)) {
       if (syncState.pendingSnapshots.length) {
-        const baseSnapshot = snapshots.get(workingId);
-        const merge = mergeNotebooks(
-          baseSnapshot ? { categories: baseSnapshot.categories } : null,
-          workingNotebook,
-          { categories: candidate.categories },
-          workingId,
-          candidate.snapshotId,
-        );
-        workingNotebook = merge.notebook;
+        workingNotebook = mergeEverything(workingNotebook, { categories: candidate.categories });
         syncState.pendingSnapshots = [];
         syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(candidate.snapshotId, snapshots)])];
         syncState.mergeParentSnapshotIds = [...new Set([...syncState.mergeParentSnapshotIds, workingId, candidate.snapshotId])];
-        if (merge.conflicts.length) {
-          syncState.conflicts = merge.conflicts;
-          syncState.lastError = null;
-          syncState.currentSnapshotId = null;
-          notebook = workingNotebook;
-          revision = Math.max(revision, candidate.revision);
-          await saveSyncState(syncState);
-          queueSave(false);
-          render();
-          setStatusMessage(`${merge.conflicts.length} sync conflict${merge.conflicts.length === 1 ? '' : 's'} need attention.`);
-          return { applied, conflicts: merge.conflicts.length };
-        }
         syncState.currentSnapshotId = null;
         applied += 1;
         break;
@@ -1141,30 +1194,10 @@ async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: numb
       applied += 1;
       continue;
     }
-    const baseId = findCommonSnapshotAncestor(workingId, candidate.snapshotId, snapshots);
-    const base = baseId ? snapshots.get(baseId) : null;
-    const merge = mergeNotebooks(
-      base ? { categories: base.categories } : null,
-      workingNotebook,
-      { categories: candidate.categories },
-      workingId,
-      candidate.snapshotId,
-    );
-    workingNotebook = merge.notebook;
+    workingNotebook = mergeEverything(workingNotebook, { categories: candidate.categories });
     if (syncState.pendingSnapshots.length) syncState.pendingSnapshots = [];
     syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(candidate.snapshotId, snapshots)])];
     syncState.mergeParentSnapshotIds = [...new Set([...syncState.mergeParentSnapshotIds, workingId, candidate.snapshotId])];
-    if (merge.conflicts.length) {
-      syncState.conflicts = merge.conflicts;
-      syncState.lastError = null;
-      notebook = workingNotebook;
-      revision = Math.max(revision, candidate.revision);
-      await saveSyncState(syncState);
-      queueSave(false);
-      render();
-      setStatusMessage(`${merge.conflicts.length} sync conflict${merge.conflicts.length === 1 ? '' : 's'} need attention.`);
-      return { applied, conflicts: merge.conflicts.length };
-    }
     syncState.currentSnapshotId = null;
     applied += 1;
     break;
@@ -1182,7 +1215,7 @@ async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: numb
       await saveSyncState(syncState);
       queueSave(true);
       render();
-      setStatusMessage('Merged a remote snapshot; publishing the merged backlog.');
+      setSyncStatusMessage('Saving and publishing the combined local and cloud backlog.');
     }
   } else {
     await saveSyncState(syncState);
@@ -1199,6 +1232,18 @@ async function queueSyncSnapshot(document: StoredDocument): Promise<void> {
   try {
     await enqueueSyncMutation(async () => {
       if (!syncState.notebookId || !hasCloudBinding() || syncState.status === 'disconnected') return;
+      const contentFingerprint = notebookFingerprint(document);
+      const latestPending = syncState.pendingSnapshots.at(-1);
+      if (!syncState.mergeParentSnapshotIds.length) {
+        if (latestPending && snapshotFingerprint(latestPending) === contentFingerprint) return;
+        if (syncState.lastPublishedContentFingerprint === contentFingerprint) {
+          syncState.pendingSnapshots = [];
+          sessionContentDirty = false;
+          syncState.lastError = null;
+          await saveSyncState(syncState);
+          return;
+        }
+      }
       const previousPending = syncState.pendingSnapshots.at(-1)?.snapshotId;
       const parents = syncState.mergeParentSnapshotIds.length
         ? syncState.mergeParentSnapshotIds
@@ -1261,7 +1306,8 @@ async function bindSupabaseAccount(): Promise<void> {
       const nextState = { ...syncState, notebookId };
       const checkpoint = makeCheckpointSnapshot(makeStoredDocument(notebook, revision, viewMode, theme), nextState);
       const initialManifest = makeSyncManifest(notebookId, syncState.deviceId, [checkpoint.snapshotId]);
-      await coordinator.initializeNotebook(checkpoint, initialManifest);
+      const initialized = await coordinator.initializeNotebook(checkpoint, initialManifest);
+      cloudInspection = { accountId: location.accountId, manifest: initialized.manifest, error: null };
       syncState = {
         ...syncState,
         notebookId,
@@ -1300,7 +1346,8 @@ async function bindSupabaseAccount(): Promise<void> {
     if (leaves.length !== 1 || !hasCompleteSnapshotAncestry(leaves[0], snapshots)) {
       throw new Error('The cloud notebook has multiple or incomplete branches; resolve it before connecting this device.');
     }
-    if (!(await askFetchConfirmation())) return;
+    const action = await askFetchConfirmation();
+    if (!action) return;
 
     const previousState = structuredClone(syncState);
     try {
@@ -1321,12 +1368,21 @@ async function bindSupabaseAccount(): Promise<void> {
         conflicts: [],
         lastError: null,
       };
-      await applyFetchedSnapshot(leaves[0]);
+      if (action === 'replace') {
+        await applyFetchedSnapshot(leaves[0]);
+      } else {
+        syncState.currentSnapshotId = leaves[0].snapshotId;
+        syncState.lastPublishedSnapshotId = leaves[0].snapshotId;
+        syncState.lastPublishedRevision = leaves[0].revision;
+        syncState.lastPublishedContentFingerprint = snapshotFingerprint(leaves[0]);
+        syncState.processedSnapshotIds = snapshotAncestry(leaves[0].snapshotId, snapshots);
+        await applyEverythingMerge(leaves[0]);
+      }
       finishSyncCheck(checkedAt);
       await saveSyncState(syncState);
-      sessionContentDirty = false;
+      sessionContentDirty = action === 'merge';
       sessionPhase = 'ready';
-      setStatusMessage('Cloud notebook fetched safely.');
+      setStatusMessage(action === 'replace' ? 'Cloud notebook fetched safely.' : 'Merged everything; the combined backlog is queued for sync.');
       render();
     } catch (error) {
       syncState = previousState;
@@ -1389,7 +1445,11 @@ async function inspectAuthenticatedAccount(): Promise<void> {
   });
   let tracked: Promise<void>;
   tracked = operation.finally(() => {
-    if (cloudInspectionInFlight === tracked) cloudInspectionInFlight = null;
+    if (cloudInspectionInFlight === tracked) {
+      cloudInspectionInFlight = null;
+      syncDialogRefresh?.();
+      render();
+    }
   });
   cloudInspectionInFlight = tracked;
   await tracked;
@@ -1398,6 +1458,8 @@ async function inspectAuthenticatedAccount(): Promise<void> {
 async function handleAuthStateChange(next: AuthState): Promise<void> {
   await enqueueSyncMutation(async () => {
     authState = next;
+    if (next.status === 'signing-in') signInStartedAt ??= Date.now();
+    else signInStartedAt = null;
     syncDialogRefresh?.();
     render();
     if (next.status === 'signed-out') {
@@ -1441,12 +1503,13 @@ function openSyncDialog() {
   const accountLine = element('p', 'import-summary');
   const controls = element('div', 'sync-controls');
   const loginButton = button('Continue with Google', () => void login());
+  const cancelLoginButton = button('Cancel sign-in', () => cancelPendingLogin());
   const startButton = button('Start sync', () => void connect());
   const syncNowButton = button('Check for updates', () => void runSyncNow());
   const pauseButton = button(syncState.status === 'paused' ? 'Resume' : 'Pause', () => void togglePause());
-  const resolveButton = button('Resolve conflicts', () => void resolveConflicts());
+  const resolveButton = button('Merge', () => void mergeStoredConflicts());
   const logoutButton = button('Log out', () => void logout());
-  controls.append(loginButton, startButton, syncNowButton, pauseButton, resolveButton, logoutButton);
+  controls.append(loginButton, cancelLoginButton, startButton, syncNowButton, pauseButton, resolveButton, logoutButton);
   editor.body.append(intro, statusLine, accountLine, controls);
   editor.save.textContent = 'Close';
 
@@ -1456,6 +1519,7 @@ function openSyncDialog() {
     const connected = hasCloudBinding();
     loginButton.hidden = signedIn;
     loginButton.disabled = !capabilities.supabaseSync || !authState.configured || authState.status === 'signing-in' || !syncReady;
+    cancelLoginButton.hidden = authState.status !== 'signing-in';
     startButton.hidden = !signedIn || connected;
     startButton.disabled = !syncReady || Boolean(cloudInspectionInFlight);
     syncNowButton.hidden = !connected;
@@ -1492,6 +1556,12 @@ function openSyncDialog() {
     }
   }
 
+  function cancelPendingLogin() {
+    cancelGoogleSignIn();
+    setStatusMessage('Google sign-in canceled. You can try again.');
+    refresh();
+  }
+
   async function connect() {
     editor.error.textContent = '';
     try {
@@ -1519,9 +1589,14 @@ function openSyncDialog() {
     }
   }
 
-  async function resolveConflicts() {
-    editor.dialog.close();
-    openConflictDialog();
+  async function mergeStoredConflicts() {
+    syncState.conflicts = [];
+    syncState.lastError = null;
+    sessionContentDirty = true;
+    await saveSyncState(syncState);
+    queueSave(true);
+    setSyncStatusMessage('Saving and publishing the combined local and cloud backlog.');
+    refresh();
   }
 
   async function togglePause() {
@@ -1555,76 +1630,6 @@ function openSyncDialog() {
   });
   syncDialogRefresh = refresh;
   refresh();
-}
-
-function conflictValueLabel(value: unknown): string {
-  if (value === null || value === undefined) return 'Deleted';
-  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
-  return serialized.length > 220 ? `${serialized.slice(0, 217)}…` : serialized;
-}
-
-function conflictLabel(conflict: SyncConflict): string {
-  if (conflict.target === 'category-order') return 'Category order changed on both devices.';
-  if (conflict.target === 'task-order') return 'Task order changed on both devices.';
-  const record = conflict.target === 'task' ? `Task ${conflict.recordId}` : `Category ${conflict.recordId}`;
-  return conflict.field === 'record' ? `${record} was deleted on one device and edited on the other.` : `${record} has two values for ${conflict.field}.`;
-}
-
-function openConflictDialog() {
-  if (!syncState.conflicts.length) return;
-  const editor = openDialog(`Resolve ${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'}`);
-  editor.save.textContent = 'Close';
-  const list = element('div', 'conflict-list');
-  editor.body.append(element('p', '', 'Choose which value should become the shared value. Each choice is saved locally; the final choice publishes a merge snapshot.'), list);
-
-  function draw() {
-    list.replaceChildren();
-    syncState.conflicts.forEach(conflict => {
-      const item = element('section', 'conflict-item');
-      item.append(element('strong', '', conflictLabel(conflict)));
-      const values = element('div', 'conflict-values');
-      values.append(
-        element('p', '', `Mine: ${conflictValueLabel(conflict.localValue)}`),
-        element('p', '', `Other: ${conflictValueLabel(conflict.remoteValue)}`),
-      );
-      const actions = element('div', 'sync-controls');
-      actions.append(
-        button('Keep mine', () => void resolve(conflict, conflict.localValue)),
-        button('Use other', () => void resolve(conflict, conflict.remoteValue)),
-      );
-      item.append(values, actions);
-      list.append(item);
-    });
-  }
-
-  async function resolve(conflict: SyncConflict, value: unknown) {
-    notebook = applySyncConflict(notebook, conflict, value);
-    syncState.conflicts = syncState.conflicts.filter(item => item.conflictId !== conflict.conflictId);
-    syncState.lastError = null;
-    render();
-    try {
-      await saveSyncState(syncState);
-      queueSave(syncState.conflicts.length === 0);
-      if (syncState.conflicts.length === 0) {
-        setStatusMessage('Conflicts resolved; publishing the merge.');
-        editor.dialog.close();
-      } else {
-        setStatusMessage(`${syncState.conflicts.length} sync conflict${syncState.conflicts.length === 1 ? '' : 's'} remain.`);
-        draw();
-      }
-    } catch (error) {
-      editor.error.textContent = `Could not save the conflict choice: ${errorText(error)}`;
-      syncState.conflicts.push(conflict);
-      render();
-      draw();
-    }
-  }
-
-  editor.form.addEventListener('submit', event => {
-    event.preventDefault();
-    editor.dialog.close();
-  });
-  draw();
 }
 
 async function recoverBackup() {
@@ -1751,7 +1756,7 @@ function openDialog(title: string) {
     }
   }, { once: true });
   dialog.showModal();
-  return { dialog, form, body, error, save };
+  return { dialog, form, body, error, controls, save };
 }
 
 function textField(labelText: string, value: string) {
@@ -2096,10 +2101,18 @@ async function writeCloseSnapshot(): Promise<void> {
         ? pendingBaseParents
         : syncState.knownHeadSnapshotIds;
   const document = makeStoredDocument(notebook, revision, viewMode, theme);
+  const contentFingerprint = notebookFingerprint(notebook);
+  if (!syncState.mergeParentSnapshotIds.length && syncState.lastPublishedContentFingerprint === contentFingerprint) {
+    syncState.pendingSnapshots = [];
+    syncState.lastError = null;
+    sessionContentDirty = false;
+    await saveSyncState(syncState);
+    return;
+  }
   const existingPending = syncState.pendingSnapshots.at(-1);
   const snapshot = existingPending
     && existingPending.revision === document.revision
-    && snapshotFingerprint(existingPending) === notebookFingerprint(notebook)
+    && snapshotFingerprint(existingPending) === contentFingerprint
     ? existingPending
     : makeSyncSnapshot(document, syncState, parents);
 
@@ -2242,9 +2255,7 @@ async function loadInitialData() {
     sessionContentDirty = syncState.pendingSnapshots.length > 0 || (syncState.status === 'connected' && fingerprintChanged);
     recoverButton.hidden = true;
     setStorageNotice(stored ? 'Saved locally' : 'Local data ready', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data will be stored in this browser.');
-    sessionPhase = syncReady && syncState.status === 'connected' && authState.status === 'signed-in'
-      ? 'fetching'
-      : syncLoadError ? 'offline' : 'ready';
+    sessionPhase = syncLoadError ? 'offline' : 'ready';
     render();
     if (syncReady && syncState.status === 'connected' && authState.status === 'signed-in') void inspectAuthenticatedAccount();
     else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : '');
@@ -2263,6 +2274,15 @@ applyTheme();
 render();
 setStorageNotice('Loading local data…', 'Checking this device for a saved backlog.');
 subscribeAuthState(next => { void handleAuthStateChange(next); });
+window.addEventListener('focus', () => {
+  const pendingSince = signInStartedAt;
+  if (authState.status !== 'signing-in' || pendingSince === null || Date.now() - pendingSince < 1500) return;
+  window.setTimeout(() => {
+    if (authState.status !== 'signing-in' || signInStartedAt !== pendingSince) return;
+    cancelGoogleSignIn();
+    setStatusMessage('Google sign-in canceled. You can try again.');
+  }, 500);
+});
 void loadInitialData();
 void initializeAuth().catch(() => undefined);
 void installNativeCloseHandler();
