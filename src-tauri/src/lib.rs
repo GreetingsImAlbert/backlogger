@@ -211,48 +211,6 @@ fn backup_sync_state(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn ensure_directory(path: String) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn read_optional_file(path: String) -> Result<Option<String>, String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-#[tauri::command]
-fn list_directory_files(path: String) -> Result<Vec<String>, String> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        if entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_file()
-        {
-            if let Some(name) = entry.file_name().to_str() {
-                files.push(name.to_string());
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-#[tauri::command]
-fn remove_file(path: String) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-#[tauri::command]
 fn read_document_file(path: String) -> Result<String, String> {
     fs::read_to_string(path).map_err(|error| error.to_string())
 }
@@ -319,10 +277,6 @@ pub fn run() {
             load_sync_state,
             save_sync_state,
             backup_sync_state,
-            ensure_directory,
-            read_optional_file,
-            list_directory_files,
-            remove_file,
             set_app_theme,
             read_document_file,
             write_document_file,

@@ -11,18 +11,16 @@ export const SYNC_CHECKPOINT_VERSION = 1 as const;
 
 export type SyncConnectionStatus = 'disconnected' | 'connected' | 'paused';
 
-export interface LocalFolderLocation {
+interface LegacyLocalFolderLocation {
   kind: 'local-folder';
-  /** Parent directory selected by the Windows folder picker. */
   parentPath: string;
 }
 
-export interface OneDriveLocation {
+interface LegacyOneDriveLocation {
   kind: 'onedrive';
   accountId: string;
   driveId: string;
   rootItemId: string;
-  /** `/backlogger-sync` or the explicit debug path used for isolated tests. */
   displayPath: string;
 }
 
@@ -34,7 +32,11 @@ export interface SupabaseLocation {
   projectRef: string;
 }
 
-export type SyncLocation = LocalFolderLocation | OneDriveLocation | SupabaseLocation;
+// Schema 1/2 compatibility only. These locations are parsed solely so migration
+// can disconnect retired bindings without attempting to access them.
+type LegacySyncLocation = LegacyLocalFolderLocation | LegacyOneDriveLocation;
+type ParsedSyncLocation = SyncLocation | LegacySyncLocation;
+export type SyncLocation = SupabaseLocation;
 
 export interface SyncSnapshot {
   protocolVersion: typeof SYNC_PROTOCOL_VERSION;
@@ -118,7 +120,7 @@ function stringArray(value: unknown, field: string): string[] {
   return [...new Set(value)];
 }
 
-function parseSyncLocation(value: unknown, allowSupabase: boolean, field = 'sync location'): SyncLocation {
+function parseSyncLocation(value: unknown, allowSupabase: boolean, field = 'sync location'): ParsedSyncLocation {
   if (!isRecord(value) || (value.kind !== 'local-folder' && value.kind !== 'onedrive' && value.kind !== 'supabase')) {
     throw new Error(`Sync data has an invalid ${field}.`);
   }
@@ -140,10 +142,6 @@ function parseSyncLocation(value: unknown, allowSupabase: boolean, field = 'sync
     rootItemId: requiredString(value.rootItemId, `${field} root item id`),
     displayPath: requiredString(value.displayPath, `${field} display path`),
   };
-}
-
-export function localFolderLocation(location: SyncLocation | null): LocalFolderLocation | null {
-  return location?.kind === 'local-folder' ? location : null;
 }
 
 function cloneTasks(tasks: Task[]): Task[] {
@@ -240,7 +238,9 @@ export function makeSyncState(deviceId: string = crypto.randomUUID()): SyncState
   };
 }
 
-export function parseSyncState(value: unknown): SyncState {
+type ParsedSyncState = Omit<SyncState, 'location'> & { location: ParsedSyncLocation | null };
+
+export function parseSyncState(value: unknown): ParsedSyncState {
   if (!isRecord(value)) throw new Error('Sync data is not an object.');
   if (value.schemaVersion !== SYNC_SCHEMA_VERSION
     && value.schemaVersion !== PREVIOUS_SYNC_SCHEMA_VERSION
@@ -373,7 +373,7 @@ export async function loadSyncState(): Promise<SyncState> {
 export function migrateSyncState(value: unknown): { state: SyncState; migrated: boolean } {
   const state = parseSyncState(value);
   const rawSchema = isRecord(value) && typeof value.schemaVersion === 'number' ? value.schemaVersion : null;
-  if (rawSchema === SYNC_SCHEMA_VERSION) return { state, migrated: false };
+  if (rawSchema === SYNC_SCHEMA_VERSION) return { state: state as SyncState, migrated: false };
   return {
     state: {
       ...state,
@@ -402,9 +402,6 @@ export async function saveSyncState(state: SyncState): Promise<void> {
   if (storageKind() === 'browser') return;
   await invoke('save_sync_state', { state: JSON.stringify(state, null, 2) });
 }
-
-// Kept as compatibility exports for focused path tests; runtime I/O is implemented by LocalFolderSyncTransport.
-export { syncManifestPath, syncRootPath, syncSnapshotPath, syncSnapshotsPath } from './sync/local-folder-transport.ts';
 
 export function snapshotFingerprint(snapshot: SyncSnapshot): string {
   return JSON.stringify(snapshot.categories);

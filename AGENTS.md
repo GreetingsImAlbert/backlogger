@@ -4,7 +4,7 @@
 
 - Backlogger is an offline-first Tauri 2 app with a plain TypeScript/Vite/CSS interface. Windows and Android share this repository.
 - Keep the application identifier `local.backlogger.desktop` and the existing Windows app-data location unchanged.
-- Current Android work is defined in `mobile-implementation.md`; setup, safety gates, and acceptance checks are in `mobile.md`. `REMOVED.md` is historical context, not an active plan.
+- `mobile.md` and `mobile-implementation.md` still describe the retired provider and must be revised before more Android sync work. `REMOVED.md` is historical context, not an active plan.
 
 ## Commands
 
@@ -55,15 +55,14 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 - Preserve stable IDs, canonical category/task ordering, serialized saves, schema validation, backups, explicit recovery, and the desktop single-instance guard.
 - Task drag-and-drop stays within its category. Keep Move up/down actions as the keyboard and non-drag fallback.
 - Device preferences, credentials, transport bindings, device identity, and pending publication state never belong in portable notebook exports or shared snapshots.
-- Android Milestone 1 has native local persistence. Android OneDrive and document import/export remain disabled until their milestones implement and verify them.
+- Android has native local persistence. Supabase sync and document import/export remain disabled there until a revised mobile plan implements and verifies them.
 
 ## Sync safety
 
-- Local app data is authoritative; the shared folder is an exchange history containing `backlogger-sync/notebook.json` and immutable `backlogger-sync/snapshots/<id>.json` files.
-- Windows stores the selected parent directory and appends `backlogger-sync`. Android must bind the actual OneDrive folder item; never append the folder name twice.
-- Never initialize, reset, prune, or destructively test the live OneDrive `backlogger-sync` folder. Follow the gates in `mobile.md`; use `/backlogger-sync-test` for provider write tests.
+- Local app data is authoritative. Optional Windows cloud sync uses the signed-in user's Supabase notebook, immutable snapshots, and a versioned manifest.
+- Schema-1/2 folder locations are migration input only: disconnect them without accessing or changing the retired provider data.
 - Validate notebook identity and complete ancestry. Use ancestry—not timestamps or device revisions—to reconcile versions. Missing, partial, invalid, or unavailable remote data never means an empty notebook.
-- Preserve pending work, concurrent heads, and unresolved conflicts across restarts. Never overwrite an immutable snapshot or publish to an unconfirmed account/folder.
+- Preserve pending work, concurrent heads, and unresolved conflicts across restarts. Never overwrite an immutable snapshot or publish to an unconfirmed account.
 
 ## Working practice
 

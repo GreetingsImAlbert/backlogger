@@ -1493,6 +1493,7 @@ async function syncNow(): Promise<number> {
 
 function openSyncDialog() {
   const editor = openDialog('Sync');
+  editor.cancel.remove();
   syncDialogElement = editor.dialog;
   editor.dialog.addEventListener('close', () => {
     if (syncDialogElement === editor.dialog) syncDialogElement = null;
@@ -1756,7 +1757,7 @@ function openDialog(title: string) {
     }
   }, { once: true });
   dialog.showModal();
-  return { dialog, form, body, error, controls, save };
+  return { dialog, form, body, error, controls, cancel, save };
 }
 
 function textField(labelText: string, value: string) {

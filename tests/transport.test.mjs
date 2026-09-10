@@ -10,7 +10,7 @@ function versionOf(content) {
 }
 
 class MemoryTransport {
-  kind = 'local-folder';
+  kind = 'supabase';
   location;
   capabilities = {
     conditionalManifestWrite: 'strong',
@@ -20,11 +20,11 @@ class MemoryTransport {
 
   constructor(sharedFiles, name) {
     this.sharedFiles = sharedFiles;
-    this.location = { kind: 'local-folder', parentPath: name };
+    this.location = { kind: 'supabase', accountId: 'test-account', projectRef: name };
   }
 
   async resolveLocation() {
-    return { location: this.location, transportId: this.location.parentPath, displayPath: this.location.parentPath };
+    return { location: this.location, transportId: this.location.projectRef, displayPath: this.location.projectRef };
   }
 
   async connect() {

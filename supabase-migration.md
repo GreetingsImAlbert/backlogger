@@ -452,12 +452,12 @@ Automate these cases against fake/local Supabase:
 
 ### Milestone 6 handoff
 
-- **Status:** Automated acceptance coverage is implemented. Packaged two-profile and live-account acceptance remains user-owned and must pass before this milestone is marked complete.
+- **Status:** Complete. The user reported that the packaged two-profile and live-account acceptance tests pass before Milestone 7 began.
 - **Recovery coverage:** Deterministic coordinator tests cover interruption before snapshot creation, after immutable snapshot creation/before manifest CAS, after manifest CAS/before local pending-state removal, CAS retry exhaustion, concurrent-head preservation, and sequential convergence between distinct device profiles.
 - **Existing coverage reused:** Supabase transport tests cover authentication loss, account/project mismatch, RLS-style permission denial, offline responses, immutable collisions, pagination, guarded deletion, and monotonically versioned manifest CAS. The active UI now uses only Fetch and replace or the deterministic Merge everything union; legacy three-way merge code remains compatibility-tested but is no longer exposed.
 - **Secret audit:** `npm.cmd run security:secrets` scans tracked files plus available production artifacts for service-role JWTs/assignments, Google client secrets, and private keys. The publishable key remains intentionally client-visible.
 - **Remote safety:** No OneDrive folder is accessed by this milestone. Codex does not run local resets, pgTAP, linked database tests, or migrations; those commands and their results remain a user gate.
-- **Manual acceptance pending:** Use two isolated packaged Backlogger profiles with distinct app-data directories and the same disposable Google account. Verify first initialization, explicit second fetch, bidirectional sequential edits, concurrent offline Merge everything, restart recovery, cancellation, logout/session restoration, wrong-account rejection, and return-online recovery. Inspect database ownership, immutable snapshots, and increasing manifest versions after each phase.
+- **Manual acceptance:** The user completed the recommended packaged acceptance suite and reported that all tests pass.
 
 ## Milestone 7 — Remove retired folder sync and document the cutover
 
@@ -490,6 +490,14 @@ Automate these cases against fake/local Supabase:
 - Supabase sync passes the behavior and security acceptance suite.
 - The old local/OneDrive data remains available for rollback but is never touched by the new transport.
 - No secrets are tracked.
+
+### Milestone 7 handoff
+
+- **Status:** Implementation complete. The retired folder transport, folder path helpers, folder-only native commands, test-only folder environment variables, and obsolete runtime tests are removed.
+- **Compatibility:** Schema-1/2 folder locations remain accepted only inside the migration parser, which disconnects them without accessing the retired provider. Schema 3 and the active transport contract accept Supabase only.
+- **Documentation:** `README.md`, `AGENTS.md`, and `.env.example` now describe local-only use, optional Supabase/Google sync, development setup, recovery behavior, and client-secret boundaries. The existing mobile plans were intentionally left unchanged for the required follow-up revision.
+- **Verification:** `npm.cmd run check`, 50 unit tests, `npm.cmd run build`, `npm.cmd run security:secrets`, Rust formatting/checks, Windows packaging, and the shared Android x86_64 debug build pass. The Windows installer is `src-tauri/target/release/bundle/nsis/Backlogger_0.1.2_x64-setup.exe`; the Android APK is `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`.
+- **Database:** No database contract changed in this milestone, and Codex ran no Supabase operation. The user remains responsible for any desired clean-reset pgTAP/lint re-run.
 
 ### Required next action after Milestone 7
 

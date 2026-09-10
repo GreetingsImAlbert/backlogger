@@ -1,6 +1,6 @@
 import type { SyncLocation } from '../sync.ts';
 
-export type SyncTransportKind = 'local-folder' | 'onedrive' | 'supabase';
+export type SyncTransportKind = 'supabase';
 
 export type SyncTransportErrorCode =
   | 'location-unavailable'

@@ -20,15 +20,11 @@ import {
   reconcileManifestHeadIds,
   snapshotLeaves,
   storedDocumentFromSyncSnapshot,
-  syncManifestPath,
-  syncRootPath,
-  syncSnapshotPath,
   SYNC_CHECKPOINT_VERSION,
   SYNC_SCHEMA_VERSION,
   SYNC_SNAPSHOT_RETENTION_LIMIT,
   LEGACY_SYNC_SCHEMA_VERSION,
 } from '../src/sync.ts';
-import { LocalFolderSyncTransport, syncSnapshotsPath } from '../src/sync/local-folder-transport.ts';
 
 const notebook = {
   categories: [{
@@ -68,13 +64,10 @@ test('checkpoint snapshots are self-contained and use an explicit compatible ver
   assert.throws(() => parseSyncSnapshot({ ...checkpoint, checkpointVersion: 99 }), /checkpoint version/);
 });
 
-test('sync manifests and Windows folder paths are stable', () => {
+test('sync manifests remain stable', () => {
   const manifest = makeSyncManifest('notebook-1', 'device-1', ['head-1', 'head-1']);
   assert.deepEqual(parseSyncManifest(manifest), { ...manifest, headSnapshotIds: ['head-1'] });
   assert.deepEqual(parseSyncManifest({ ...manifest, prunedSnapshotIds: undefined }).prunedSnapshotIds, []);
-  assert.equal(syncRootPath('C:\\Users\\Albert\\OneDrive\\Backlogger'), 'C:\\Users\\Albert\\OneDrive\\Backlogger\\backlogger-sync');
-  assert.equal(syncManifestPath('C:\\Users\\Albert\\OneDrive\\Backlogger'), 'C:\\Users\\Albert\\OneDrive\\Backlogger\\backlogger-sync\\notebook.json');
-  assert.equal(syncSnapshotPath('C:\\Users\\Albert\\OneDrive\\Backlogger', 'snapshot-1'), 'C:\\Users\\Albert\\OneDrive\\Backlogger\\backlogger-sync\\snapshots\\snapshot-1.json');
 });
 
 test('legacy sync state migrates folderPath without dropping pending work', () => {
@@ -127,17 +120,6 @@ test('schema-3 accepts only explicit Supabase locations', () => {
   );
 });
 
-test('debug local transport resolves the explicit exchange root and reports best-effort writes', async () => {
-  const transport = new LocalFolderSyncTransport(
-    { kind: 'local-folder', parentPath: 'C:\\Users\\Albert\\OneDrive' },
-    { profile: 'debug', exchangeRootOverride: 'C:\\Temp\\backlogger-sync-test' },
-  );
-  const resolved = await transport.resolveLocation();
-  assert.equal(resolved.displayPath, 'C:\\Temp\\backlogger-sync-test');
-  assert.equal(transport.capabilities.conditionalManifestWrite, 'best-effort');
-  assert.equal(syncSnapshotsPath('C:\\Users\\Albert\\OneDrive', 'C:\\Temp\\backlogger-sync-test'), 'C:\\Temp\\backlogger-sync-test\\snapshots');
-});
-
 test('sync state rejects duplicate pending snapshot ids and unsupported manifests', () => {
   const state = makeSyncState('device-1');
   state.notebookId = 'notebook-1';
@@ -146,7 +128,7 @@ test('sync state rejects duplicate pending snapshot ids and unsupported manifest
   assert.throws(() => parseSyncManifest({ ...makeSyncManifest('notebook-1', 'device-1'), protocolVersion: 99 }), /unsupported manifest/);
 });
 
-test('sync state keeps folder-check timestamps optional for older installations', () => {
+test('sync state keeps check timestamps optional for older installations', () => {
   const state = makeSyncState('device-1');
   const parsed = parseSyncState({ ...state, lastCheckedAt: undefined, lastSuccessfulCheckAt: undefined });
   assert.equal(parsed.lastCheckedAt, null);

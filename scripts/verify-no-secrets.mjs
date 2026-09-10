@@ -7,6 +7,7 @@ const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root })
   .toString('utf8')
   .split('\0')
   .filter(Boolean);
+const sourceFiles = [...new Set([...tracked, '.env.example'])];
 function filesBelow(directory) {
   if (!existsSync(directory)) return [];
   return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -29,7 +30,7 @@ const forbidden = [
 ];
 
 const findings = [];
-for (const relativePath of [...tracked, ...generated]) {
+for (const relativePath of [...sourceFiles, ...generated]) {
   const path = resolve(root, relativePath);
   if (!existsSync(path) || statSync(path).isDirectory()) continue;
   const content = readFileSync(path).toString('utf8');
@@ -43,4 +44,4 @@ if (findings.length) {
   console.error(`Forbidden secrets found:\n${findings.join('\n')}`);
   process.exit(1);
 }
-console.log(`Secret scan passed (${tracked.length} tracked files plus available production artifacts).`);
+console.log(`Secret scan passed (${sourceFiles.length} source files plus available production artifacts).`);
