@@ -501,7 +501,7 @@ Automate these cases against fake/local Supabase:
 
 ### Required next action after Milestone 7
 
-Stop before implementing further Android sync work. Remind the user to revise `mobile-implementation.md` for Supabase/Google authentication and reconcile the broader setup and safety gates in `mobile.md`. The existing OneDrive/MSAL/Graph milestones are obsolete and must not be handed to Luna after this migration.
+Completed after the Windows release: `mobile-implementation.md` is now the consolidated Supabase/Google Android plan, including setup and safety gates. The retired `mobile.md` and its OneDrive/MSAL/Graph milestones were removed and must not be used for implementation.
 
 ## Standard verification commands
 

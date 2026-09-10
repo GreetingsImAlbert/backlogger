@@ -4,7 +4,7 @@
 
 - Backlogger is an offline-first Tauri 2 app with a plain TypeScript/Vite/CSS interface. Windows and Android share this repository.
 - Keep the application identifier `local.backlogger.desktop` and the existing Windows app-data location unchanged.
-- `mobile.md` and `mobile-implementation.md` still describe the retired provider and must be revised before more Android sync work. `REMOVED.md` is historical context, not an active plan.
+- `mobile-implementation.md` is the single Android plan and includes setup gates, implementation milestones, verification, and release criteria. `REMOVED.md` is historical context, not an active plan.
 
 ## Commands
 
@@ -69,5 +69,6 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 - Preserve unrelated changes in the working tree and keep secrets, tokens, signing keys, and machine-specific credentials out of Git.
 - The user runs Supabase migrations, resets, links, pushes, and database tests manually; prepare the files and commands, but do not run remote or destructive Supabase operations on their behalf.
 - The user creates Git commits manually; do not commit or amend history unless explicitly requested.
+- A sole user prompt of `cm` means: provide a commit message covering every uncommitted change since the last commit, following the repository's existing title, blank line, and bullet format.
 - Run the checks relevant to every changed layer. Record each mobile milestone's concise handoff and evidence beneath that milestone in `mobile-implementation.md`.
 - Do not recreate the retired `PLAN.md`, `PROGRESS.md`, `feature.md`, `feature_drop.md`, or `FEATURES.md` files.

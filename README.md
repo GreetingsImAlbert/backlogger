@@ -81,7 +81,7 @@ npm.cmd run android:dev
 npm.cmd run android:build
 ```
 
-Android currently has native local persistence; cloud sync and document import/export remain disabled pending the revised mobile plan. The current debug build targets x86_64 and is not a signed production release.
+Android currently has native local persistence; cloud sync and document import/export remain disabled pending the milestones in [mobile-implementation.md](mobile-implementation.md). The current debug build targets x86_64 and is not a signed production release.
 
 ## Project layout
 

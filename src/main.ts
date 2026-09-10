@@ -34,6 +34,7 @@ let syncQueue: Promise<void> = Promise.resolve();
 let syncDialogElement: HTMLDialogElement | null = null;
 let syncDialogRefresh: (() => void) | null = null;
 let syncDeferred = false;
+let syncPublishTimer: ReturnType<typeof setTimeout> | undefined;
 let authState: AuthState = getAuthState();
 let signInStartedAt: number | null = null;
 let cloudInspection: { accountId: string; manifest: SyncManifest | null; error: string | null } | null = null;
@@ -62,7 +63,7 @@ let dragPointerId: number | null = null;
 let dragHandleElement: HTMLElement | null = null;
 const SYNC_CHECK_TIMEOUT_MS = 8_000;
 const CLOSE_OPERATION_TIMEOUT_MS = 12_000;
-const CLOSE_SNAPSHOT_TIMEOUT_MS = 2_000;
+const SYNC_PUBLICATION_DEBOUNCE_MS = 10_000;
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text?: string) {
   const node = document.createElement(tag);
@@ -346,7 +347,7 @@ status.append(statusText, statusInfo);
 const statusActions = element('div', 'status-actions');
 const fetchUpdateButton = button('Fetch', () => void fetchAvailableUpdate(), 'quiet-button');
 const mergeUpdateButton = button('Merge', () => void mergeAvailableUpdate(), 'quiet-button');
-const retryFetchButton = button('Retry fetch', () => void retrySessionFetch(), 'quiet-button');
+const retryFetchButton = button('Retry sync', () => void retrySessionFetch(), 'quiet-button');
 fetchUpdateButton.hidden = true;
 mergeUpdateButton.hidden = true;
 retryFetchButton.hidden = true;
@@ -391,6 +392,12 @@ function setStatusMessage(message: string) {
 
 function setSyncStatusMessage(detail: string) {
   statusMessage = 'Syncing...';
+  statusDetailMessage = detail;
+  renderStatusBar();
+}
+
+function setSyncFailureStatus(detail: string) {
+  statusMessage = 'Sync failed';
   statusDetailMessage = detail;
   renderStatusBar();
 }
@@ -643,7 +650,7 @@ function syncStatusLabel(): string {
   if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Not logged in';
   if (syncState.status === 'paused') return 'Paused';
   if (syncState.conflicts.length) return 'Conflicts';
-  if (syncState.lastError) return 'Offline';
+  if (syncState.lastError) return 'Sync failed';
   return 'Connected';
 }
 
@@ -655,7 +662,7 @@ function syncStatusDetail(): string {
   if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Log in with Google to sync this notebook.';
   const pending = syncState.pendingSnapshots.length;
   if (syncState.conflicts.length) return `${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`;
-  if (syncState.lastError) return `Cloud sync is offline: ${syncState.lastError}`;
+  if (syncState.lastError) return `Cloud sync failed: ${syncState.lastError}`;
   if (syncState.status === 'paused') return `${pending} pending snapshot${pending === 1 ? '' : 's'} saved locally.`;
   const checked = formatSyncCheckTime(syncState.lastSuccessfulCheckAt);
   const checkedDetail = checked ? ` Last cloud check ${checked}.` : '';
@@ -901,7 +908,7 @@ async function checkForSharedUpdateUnsafe(allowFetching = false) {
     syncState.lastError = errorText(error);
     sessionPhase = 'offline';
     try { await saveSyncState(syncState); } catch { /* preserve the local backlog if metadata cannot be written */ }
-    setStatusMessage(`Could not check for shared updates: ${syncState.lastError}`);
+    setSyncFailureStatus(`Could not check for shared updates: ${syncState.lastError}`);
     render();
     return null;
   }
@@ -953,7 +960,7 @@ async function runSessionFetchUnsafe() {
       syncState.lastError = errorText(error);
       sessionPhase = 'offline';
       try { await saveSyncState(syncState); } catch { /* local data remains available */ }
-      setStatusMessage(`Could not publish pending local changes: ${syncState.lastError}`);
+      setSyncFailureStatus(`Could not publish pending local changes: ${syncState.lastError}`);
       render();
       return;
     }
@@ -961,7 +968,8 @@ async function runSessionFetchUnsafe() {
   const update = await checkForSharedUpdateUnsafe(true);
   if (!update) {
     sessionPhase = syncState.lastError ? 'offline' : 'ready';
-    setStatusMessage(syncState.lastError ? 'Working offline. Shared updates will be checked again.' : '');
+    if (syncState.lastError) setSyncFailureStatus(`Could not complete sync: ${syncState.lastError}`);
+    else setStatusMessage('');
     render();
     return;
   }
@@ -980,7 +988,7 @@ async function runSessionFetchUnsafe() {
     sessionPhase = 'offline';
     syncState.lastError = errorText(error);
     try { await saveSyncState(syncState); } catch { /* local data remains available */ }
-    setStatusMessage(`Could not fetch the shared backlog: ${syncState.lastError}`);
+    setSyncFailureStatus(`Could not fetch the shared backlog: ${syncState.lastError}`);
     render();
   }
 }
@@ -998,6 +1006,10 @@ function startSessionFetch(): Promise<void> {
 
 async function retrySessionFetch() {
   syncState.lastError = null;
+  if (sessionContentDirty && !syncState.pendingSnapshots.length) {
+    await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme));
+  }
+  setSyncStatusMessage('Retrying cloud sync.');
   await startSessionFetch();
 }
 
@@ -1068,7 +1080,8 @@ async function fetchAvailableUpdateUnsafe() {
   if (!fresh || fresh.snapshot.snapshotId !== requestedId) {
     if (!fresh) availableUpdate = null;
     sessionPhase = syncState.lastError ? 'offline' : 'ready';
-    setStatusMessage(syncState.lastError ? 'Could not recheck the cloud update. Retry when you are back online.' : fresh ? 'A newer cloud update is available.' : 'That cloud update is no longer available.');
+    if (syncState.lastError) setSyncFailureStatus(`Could not recheck the cloud update: ${syncState.lastError}`);
+    else setStatusMessage(fresh ? 'A newer cloud update is available.' : 'That cloud update is no longer available.');
     render();
     return;
   }
@@ -1102,7 +1115,7 @@ async function fetchAvailableUpdateUnsafe() {
     sessionPhase = 'offline';
     syncState.lastError = errorText(error);
     try { await saveSyncState(syncState); } catch { /* local data remains available */ }
-    setStatusMessage(`Could not fetch the shared update: ${syncState.lastError}`);
+    setSyncFailureStatus(`Could not fetch the shared update: ${syncState.lastError}`);
     render();
   }
 }
@@ -1264,6 +1277,40 @@ async function queueSyncSnapshot(document: StoredDocument): Promise<void> {
   }
 }
 
+function clearScheduledSyncPublication() {
+  if (syncPublishTimer) clearTimeout(syncPublishTimer);
+  syncPublishTimer = undefined;
+}
+
+function scheduleSyncPublication(sequence: number, delayMs = SYNC_PUBLICATION_DEBOUNCE_MS) {
+  clearScheduledSyncPublication();
+  if (!sessionContentDirty || !hasCloudBinding() || syncState.status !== 'connected') return;
+  syncPublishTimer = setTimeout(() => {
+    syncPublishTimer = undefined;
+    void publishSavedChanges(sequence);
+  }, delayMs);
+}
+
+async function publishSavedChanges(expectedSequence: number): Promise<void> {
+  await saveQueue;
+  if (expectedSequence !== saveSequence || !sessionContentDirty || !hasCloudBinding() || syncState.status !== 'connected') return;
+  if (taskEditorIsOpen()) {
+    syncDeferred = true;
+    return;
+  }
+  try {
+    await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme));
+    setSyncStatusMessage('Publishing saved local changes to Supabase.');
+    await startSessionFetch();
+  } catch (error) {
+    syncState.lastError = errorText(error);
+    sessionPhase = 'offline';
+    try { await saveSyncState(syncState); } catch { /* the local notebook remains authoritative */ }
+    setSyncFailureStatus(`Could not publish saved local changes: ${syncState.lastError}`);
+    render();
+  }
+}
+
 function hasLocalBacklog(): boolean {
   return notebook.categories.length > 0 || revision > 0;
 }
@@ -1393,6 +1440,7 @@ async function bindSupabaseAccount(): Promise<void> {
 }
 
 async function disconnectSyncUnsafe(): Promise<void> {
+  clearScheduledSyncPublication();
   syncState.status = 'disconnected';
   syncState.location = null;
   syncState.lastError = null;
@@ -1469,7 +1517,10 @@ async function handleAuthStateChange(next: AuthState): Promise<void> {
     if (next.status !== 'signed-in' || !next.userId) return;
     if (cloudLocation() && cloudLocation()?.accountId !== next.userId) await disconnectSyncUnsafe();
   });
-  if (next.status === 'signed-in' && next.userId) await inspectAuthenticatedAccount();
+  if (next.status === 'signed-in' && next.userId) {
+    await inspectAuthenticatedAccount();
+    if (sessionContentDirty) scheduleSyncPublication(saveSequence);
+  }
 }
 
 async function toggleSyncPause(): Promise<void> {
@@ -1478,7 +1529,12 @@ async function toggleSyncPause(): Promise<void> {
     syncState.status = syncState.status === 'paused' ? 'connected' : 'paused';
     syncState.lastError = null;
     await saveSyncState(syncState);
-    if (syncState.status === 'connected') await checkForSharedUpdateUnsafe();
+    if (syncState.status === 'connected') {
+      await checkForSharedUpdateUnsafe();
+      if (sessionContentDirty) scheduleSyncPublication(saveSequence, 0);
+    } else {
+      clearScheduledSyncPublication();
+    }
   });
 }
 
@@ -1686,6 +1742,7 @@ function queueSave(publishSync = false) {
         hasUnsavedChanges = false;
         retrySaveButton.hidden = true;
         setStorageNotice('Saved locally', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data is stored in this browser.');
+        if (sessionContentDirty) scheduleSyncPublication(sequence, publishSync ? 0 : SYNC_PUBLICATION_DEBOUNCE_MS);
       }
     })
     .catch(error => {
@@ -2127,6 +2184,7 @@ async function writeCloseSnapshot(): Promise<void> {
 }
 
 async function closeSession(): Promise<boolean> {
+  clearScheduledSyncPublication();
   try {
     await withTimeout(saveQueue, CLOSE_OPERATION_TIMEOUT_MS, 'The local save did not finish before closing.');
   } catch {
@@ -2152,17 +2210,17 @@ async function closeSession(): Promise<boolean> {
   const localNeedsPublish = sessionContentDirty || syncState.pendingSnapshots.length > 0;
   if (localNeedsPublish) {
     try {
-      await withTimeout(
-        writeCloseSnapshot(),
-        CLOSE_SNAPSHOT_TIMEOUT_MS,
-        'The sync publication did not finish before closing.',
-      );
+      setSyncStatusMessage('Publishing saved local changes before closing.');
+      await writeCloseSnapshot();
       sessionContentDirty = false;
       return true;
     } catch (error) {
       syncState.lastError = errorText(error);
       try { await saveSyncState(syncState); } catch { /* pending publication is already persisted when possible */ }
-      return true;
+      sessionPhase = 'offline';
+      setSyncFailureStatus(`Could not publish before closing: ${syncState.lastError}. The app was kept open; use Retry sync or close again to retry.`);
+      render();
+      return false;
     }
   }
   return true;
@@ -2223,6 +2281,10 @@ async function attemptPendingSync() {
   }
   if (syncState.pendingSnapshots.length) {
     await startSessionFetch();
+    return;
+  }
+  if (sessionContentDirty && !syncPublishTimer && hasCloudBinding() && syncState.status === 'connected') {
+    await publishSavedChanges(saveSequence);
     return;
   }
   await checkForSharedUpdate();
