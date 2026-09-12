@@ -1,5 +1,8 @@
 export type RuntimeKind = 'browser' | 'desktop' | 'android' | 'ios';
 
+/** Record/Realtime sync stays dormant until its staged cutover milestone. */
+export const RECORD_SYNC_ENABLED = false as const;
+
 interface TauriWindow extends Window {
   __TAURI_INTERNALS__?: unknown;
 }
@@ -13,6 +16,8 @@ export interface PlatformCapabilities {
   cloudSync: boolean;
   /** Supabase transport is Windows-only until Android callback/lifecycle work is verified. */
   supabaseSync: boolean;
+  /** Side-by-side v2 record sync. Disabled until the verified cutover. */
+  recordSync: boolean;
   desktopClose: boolean;
   mobileLifecycle: boolean;
 }
@@ -39,6 +44,7 @@ export function platformCapabilities(): PlatformCapabilities {
       documentImportExport: true,
       cloudSync: true,
       supabaseSync: true,
+      recordSync: RECORD_SYNC_ENABLED,
       desktopClose: true,
       mobileLifecycle: false,
     };
@@ -51,6 +57,7 @@ export function platformCapabilities(): PlatformCapabilities {
       documentImportExport: false,
       cloudSync: false,
       supabaseSync: false,
+      recordSync: RECORD_SYNC_ENABLED,
       desktopClose: false,
       mobileLifecycle: true,
     };
@@ -62,6 +69,7 @@ export function platformCapabilities(): PlatformCapabilities {
     documentImportExport: true,
     cloudSync: false,
     supabaseSync: false,
+    recordSync: RECORD_SYNC_ENABLED,
     desktopClose: false,
     mobileLifecycle: false,
   };
