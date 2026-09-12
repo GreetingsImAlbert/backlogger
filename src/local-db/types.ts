@@ -169,7 +169,9 @@ export interface LocalRepositoryTransaction {
   applyServerRecord(record: LocalSyncRecord): LocalSyncRecord;
   applyReconciliation(reconciliation: RecordReconciliation): LocalSyncRecord;
   acknowledgeMutation(acknowledgement: MutationAcknowledgement): AcknowledgementResult;
+  getRecord(recordType: SyncRecordType, recordId: string): LocalSyncRecord | null;
   getBase(recordType: SyncRecordType, recordId: string): LocalSyncRecord | null;
+  getSyncState(): RecordSyncState;
   listOutbox(): LocalOutboxEntry[];
   markOutboxAttempt(input: OutboxAttemptInput): LocalOutboxEntry;
   setCursor(lastChangeSeq: number): void;
@@ -193,6 +195,7 @@ export interface LocalRepository {
   applyServerRecord(record: LocalSyncRecord): Promise<LocalSyncRecord>;
   applyReconciliation(reconciliation: RecordReconciliation): Promise<LocalSyncRecord>;
   acknowledgeMutation(acknowledgement: MutationAcknowledgement): Promise<AcknowledgementResult>;
+  getRecord(recordType: SyncRecordType, recordId: string): Promise<LocalSyncRecord | null>;
   getBase(recordType: SyncRecordType, recordId: string): Promise<LocalSyncRecord | null>;
   listOutbox(): Promise<LocalOutboxEntry[]>;
   markOutboxAttempt(input: OutboxAttemptInput): Promise<LocalOutboxEntry>;

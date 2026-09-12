@@ -602,7 +602,9 @@ export class TransactionalLocalRepository implements LocalRepository {
       applyServerRecord: record => this.applyServerRecordIn(draft, record),
       applyReconciliation: reconciliation => this.applyReconciliationIn(draft, reconciliation),
       acknowledgeMutation: acknowledgement => this.acknowledgeMutationIn(draft, acknowledgement),
+      getRecord: (recordType, recordId) => this.getRecordIn(draft, recordType, recordId),
       getBase: (recordType, recordId) => this.getBaseIn(draft, recordType, recordId),
+      getSyncState: () => cloneValue(draft.syncState),
       listOutbox: () => this.listOutboxIn(draft),
       markOutboxAttempt: input => this.markOutboxAttemptIn(draft, input),
       setCursor: lastChangeSeq => this.setCursorIn(draft, lastChangeSeq),
@@ -951,6 +953,15 @@ export class TransactionalLocalRepository implements LocalRepository {
     return base ? cloneSyncRecord(base) : null;
   }
 
+  private getRecordIn(
+    draft: LocalRepositorySnapshot,
+    recordType: SyncRecordType,
+    recordId: string,
+  ): LocalSyncRecord | null {
+    const record = this.findRecord(draft, recordType, recordId);
+    return record ? cloneSyncRecord(record) : null;
+  }
+
   private listOutboxIn(draft: LocalRepositorySnapshot): LocalOutboxEntry[] {
     return cloneValue(draft.outbox).sort((first, second) => (
       first.createdAt.localeCompare(second.createdAt) || outboxKey(first).localeCompare(outboxKey(second))
@@ -1209,6 +1220,10 @@ export class TransactionalLocalRepository implements LocalRepository {
 
   acknowledgeMutation(acknowledgement: MutationAcknowledgement): Promise<AcknowledgementResult> {
     return this.transaction(transaction => transaction.acknowledgeMutation(acknowledgement));
+  }
+
+  async getRecord(recordType: SyncRecordType, recordId: string): Promise<LocalSyncRecord | null> {
+    return this.serialize(async () => this.getRecordIn(await this.loadedState(), recordType, recordId));
   }
 
   async getBase(recordType: SyncRecordType, recordId: string): Promise<LocalSyncRecord | null> {

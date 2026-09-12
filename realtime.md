@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–4 are implemented on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network. Milestone 4 awaits User Gate A schema application and verification.
+Status: Milestones 0–5 are implemented on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network.
 
 ## Implemented baseline
 
@@ -60,7 +60,7 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 
 - Added `20260913010000_create_sync_v2_records.sql` with v2 notebooks, categories, tasks, the shared sequence, append-only change ledger, RLS, Realtime publication, initialization, ordered cursor reads, and category/task OCC RPCs.
 - Added `sync_v2_records.test.sql` covering ownership, grants, validation, atomic initialization, cursor ordering, stale writes, versioning, idempotency, tombstones, and publication membership.
-- Do not regenerate `supabase/database.types.ts` in this turn. User Gate A must run the documented local/linked Supabase workflow and report its results before this milestone is marked verified.
+- The user completed User Gate A and regenerated `supabase/database.types.ts` from the applied v2 schema.
 
 ## Milestone 5 — Delta pull, durable outbox, and OCC push
 
@@ -76,6 +76,13 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 **Verify:** fake-transport tests cover pagination, gaps, duplicated/out-of-order rows, offline restart, stale versions, interruption before/after RPC, acknowledgement loss, bounded retry, wrong account/project, expired auth, and two clients converging without Realtime.
 
 **Done when:** polling/reconnect alone provides correct record-level convergence and no manual branch repair is possible or required.
+
+### Milestone 5 implementation handoff
+
+- Added a generated-type Supabase record transport using only authenticated v2 delta and OCC RPCs, with strict binding/payload validation and sanitized failures.
+- Added a serialized worker that performs pull–push–pull catch-up, atomically reconciles delta pages with their cursor, drains the durable outbox, retries stale writes three times, and retains failures for restart recovery.
+- Added foreground polling and in-transaction account/project/notebook guards; record sync remains disabled until cutover.
+- Verified pagination, gaps, duplicates, ordering, offline restart, lost acknowledgements, stale retries, auth/binding failures, serialized cycles, and two-client polling convergence.
 
 ## Milestone 6 — Supabase Realtime lifecycle
 
