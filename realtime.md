@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–3 are complete on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network.
+Status: Milestones 0–4 are implemented on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network. Milestone 4 awaits User Gate A schema application and verification.
 
 ## Implemented baseline
 
@@ -55,6 +55,12 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 ```
 
 **Done when:** the user reports successful local and linked checks and confirms both v2 tables are in the Realtime publication. Old tables remain untouched.
+
+### Milestone 4 implementation handoff
+
+- Added `20260913010000_create_sync_v2_records.sql` with v2 notebooks, categories, tasks, the shared sequence, append-only change ledger, RLS, Realtime publication, initialization, ordered cursor reads, and category/task OCC RPCs.
+- Added `sync_v2_records.test.sql` covering ownership, grants, validation, atomic initialization, cursor ordering, stale writes, versioning, idempotency, tombstones, and publication membership.
+- Do not regenerate `supabase/database.types.ts` in this turn. User Gate A must run the documented local/linked Supabase workflow and report its results before this milestone is marked verified.
 
 ## Milestone 5 — Delta pull, durable outbox, and OCC push
 

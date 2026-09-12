@@ -95,6 +95,190 @@ export type Database = {
           },
         ]
       }
+      sync_v2_categories: {
+        Row: {
+          category_id: string
+          change_seq: number
+          deleted_at: string | null
+          field_updated_at: Json
+          name: string
+          notebook_id: string
+          owner_id: string
+          sort_key: string
+          updated_at: string
+          updated_by_device_id: string
+          version: number
+        }
+        Insert: {
+          category_id: string
+          change_seq: number
+          deleted_at?: string | null
+          field_updated_at: Json
+          name: string
+          notebook_id: string
+          owner_id: string
+          sort_key: string
+          updated_at: string
+          updated_by_device_id: string
+          version: number
+        }
+        Update: {
+          category_id?: string
+          change_seq?: number
+          deleted_at?: string | null
+          field_updated_at?: Json
+          name?: string
+          notebook_id?: string
+          owner_id?: string
+          sort_key?: string
+          updated_at?: string
+          updated_by_device_id?: string
+          version?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "sync_v2_categories_notebook_owner_fk"
+            columns: ["notebook_id", "owner_id"]
+            isOneToOne: false
+            referencedRelation: "sync_v2_notebooks"
+            referencedColumns: ["notebook_id", "owner_id"]
+          },
+        ]
+      }
+      sync_v2_changes: {
+        Row: {
+          change_seq: number
+          created_at: string
+          expected_version: number
+          mutation_id: string | null
+          notebook_id: string
+          owner_id: string
+          payload: Json
+          record_id: string
+          record_type: string
+          request_payload: Json | null
+        }
+        Insert: {
+          change_seq?: number
+          created_at?: string
+          expected_version: number
+          mutation_id?: string | null
+          notebook_id: string
+          owner_id: string
+          payload: Json
+          record_id: string
+          record_type: string
+          request_payload?: Json | null
+        }
+        Update: {
+          change_seq?: number
+          created_at?: string
+          expected_version?: number
+          mutation_id?: string | null
+          notebook_id?: string
+          owner_id?: string
+          payload?: Json
+          record_id?: string
+          record_type?: string
+          request_payload?: Json | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "sync_v2_changes_notebook_owner_fk"
+            columns: ["notebook_id", "owner_id"]
+            isOneToOne: false
+            referencedRelation: "sync_v2_notebooks"
+            referencedColumns: ["notebook_id", "owner_id"]
+          },
+        ]
+      }
+      sync_v2_notebooks: {
+        Row: {
+          created_at: string
+          notebook_id: string
+          owner_id: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          notebook_id: string
+          owner_id: string
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          notebook_id?: string
+          owner_id?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      sync_v2_tasks: {
+        Row: {
+          category_id: string
+          change_seq: number
+          deadline_date: string | null
+          deleted_at: string | null
+          field_updated_at: Json
+          notebook_id: string
+          owner_id: string
+          scheduled_dates: Json
+          sort_key: string
+          task_id: string
+          title: string
+          updated_at: string
+          updated_by_device_id: string
+          version: number
+        }
+        Insert: {
+          category_id: string
+          change_seq: number
+          deadline_date?: string | null
+          deleted_at?: string | null
+          field_updated_at: Json
+          notebook_id: string
+          owner_id: string
+          scheduled_dates: Json
+          sort_key: string
+          task_id: string
+          title: string
+          updated_at: string
+          updated_by_device_id: string
+          version: number
+        }
+        Update: {
+          category_id?: string
+          change_seq?: number
+          deadline_date?: string | null
+          deleted_at?: string | null
+          field_updated_at?: Json
+          notebook_id?: string
+          owner_id?: string
+          scheduled_dates?: Json
+          sort_key?: string
+          task_id?: string
+          title?: string
+          updated_at?: string
+          updated_by_device_id?: string
+          version?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "sync_v2_tasks_category_fk"
+            columns: ["notebook_id", "owner_id", "category_id"]
+            isOneToOne: false
+            referencedRelation: "sync_v2_categories"
+            referencedColumns: ["notebook_id", "owner_id", "category_id"]
+          },
+          {
+            foreignKeyName: "sync_v2_tasks_notebook_owner_fk"
+            columns: ["notebook_id", "owner_id"]
+            isOneToOne: false
+            referencedRelation: "sync_v2_notebooks"
+            referencedColumns: ["notebook_id", "owner_id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never
@@ -134,6 +318,86 @@ export type Database = {
           manifest: Json
           manifest_version: number
         }[]
+      }
+      initialize_sync_v2_notebook: {
+        Args: { p_categories?: Json; p_notebook_id: string; p_tasks?: Json }
+        Returns: {
+          category_count: number
+          created_at: string
+          notebook_id: string
+          owner_id: string
+          task_count: number
+          updated_at: string
+        }[]
+      }
+      mutate_sync_v2_category: {
+        Args: {
+          p_category_id: string
+          p_expected_version: number
+          p_mutation_id: string
+          p_notebook_id: string
+          p_payload: Json
+        }
+        Returns: {
+          outcome: string
+          record: Json
+        }[]
+      }
+      mutate_sync_v2_task: {
+        Args: {
+          p_expected_version: number
+          p_mutation_id: string
+          p_notebook_id: string
+          p_payload: Json
+          p_task_id: string
+        }
+        Returns: {
+          outcome: string
+          record: Json
+        }[]
+      }
+      read_sync_v2_changes: {
+        Args: { p_after_seq?: number; p_limit?: number; p_notebook_id: string }
+        Returns: {
+          change_seq: number
+          notebook_id: string
+          owner_id: string
+          payload: Json
+          record_id: string
+          record_type: string
+        }[]
+      }
+      sync_v2_cascade_category_tasks: {
+        Args: {
+          p_category: Database["public"]["Tables"]["sync_v2_categories"]["Row"]
+          p_parent_mutation_id: string
+        }
+        Returns: undefined
+      }
+      sync_v2_category_payload: {
+        Args: {
+          p_row: Database["public"]["Tables"]["sync_v2_categories"]["Row"]
+        }
+        Returns: Json
+      }
+      sync_v2_iso_timestamp: { Args: { p_value: string }; Returns: string }
+      sync_v2_task_payload: {
+        Args: { p_row: Database["public"]["Tables"]["sync_v2_tasks"]["Row"] }
+        Returns: Json
+      }
+      sync_v2_valid_clock_map: {
+        Args: { p_fields: string[]; p_value: Json }
+        Returns: boolean
+      }
+      sync_v2_valid_date_array: { Args: { p_value: Json }; Returns: boolean }
+      sync_v2_validate_local_payload: {
+        Args: {
+          p_expected_version: number
+          p_payload: Json
+          p_record_id: string
+          p_record_type: string
+        }
+        Returns: undefined
       }
     }
     Enums: {
