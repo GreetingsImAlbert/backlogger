@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestone 0 complete; v2 contracts, validators, safety fixtures, and a dormant flag exist, but no active runtime or database behavior has changed. This plan replaces the snapshot/manifest protocol only after a verified side-by-side migration. Local-only use must continue to require no account or network.
+Status: Milestones 0–1 complete; v2 contracts, validation, pure reconciliation, ordering, safety fixtures, and a dormant flag exist, but no active runtime or database behavior has changed. This plan replaces the snapshot/manifest protocol only after a verified side-by-side migration. Local-only use must continue to require no account or network.
 
 ## Current-state assessment
 
@@ -106,6 +106,17 @@ After any merge, save the merged row and outbox intent in one local transaction.
 **Verify:** table-driven tests cover every rule in both local/server directions, multiple fields, equal timestamps, clock rejection, delete/edit, parent deletion, duplicate/out-of-order input, and order collisions.
 
 **Done when:** reconciliation decisions require no UI, SQLite, or Supabase code.
+
+### Milestone 1 handoff
+
+- Added pure `src/sync-v2/merge.ts` reconciliation. `reconcileRecord(base, local, server, options)` returns the local row, newest acknowledged base, OCC `expectedVersion`, explicit action, and fields still requiring upload without mutating its inputs.
+- Field changes are compared against the base using business values and their allow-listed field clocks; generic version/sequence metadata never creates an upload. Concurrent independent fields combine, same-field conflicts use canonical timestamps then device ID, and `scheduledDates` remains one atomic field.
+- Tombstones dominate edits as complete rows in both directions. `cascadeCategoryTombstones` deterministically returns only active children requiring tombstones and is idempotent, so a stale task edit cannot restore a deleted category.
+- `applyServerRecord` accepts only forward canonical version/sequence progress, returns exact duplicates and older ordered events as no-ops, and rejects contradictory canonical rows.
+- Added pure `src/sync-v2/ordering.ts` helpers: evenly spaced fixed-width ranks, midpoint insertion, automatic deterministic rebalance when rank space is exhausted/invalid, `sortKey` then ID collision ordering, and category-scoped task moves only.
+- Added table-driven coverage for local/server-only edits, independent and same-field changes in both directions, equal-time ties, arrays, metadata isolation, clock rejection, deletion, new rows, duplicates, out-of-order events, version/sequence contradictions, category cascades, every move direction, rank exhaustion/collisions, tombstones, and cross-category rejection.
+- Verification on 2026-09-12: `npm.cmd run check`, all 74 `npm.cmd test` tests, `npm.cmd run build`, and `git diff --check` pass. `RECORD_SYNC_ENABLED` remains `false`; no UI, storage, provider, account, Rust, or database path was accessed or changed. Manual actions: none.
+- Remaining work starts at Milestone 2: implement the SQLite repository and one-time legacy JSON import around these interfaces without activating the v2 runtime.
 
 ## Milestone 2 — SQLite local repository and legacy JSON import
 

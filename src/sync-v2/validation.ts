@@ -21,7 +21,7 @@ import {
   type TaskSyncRecord,
 } from './types.ts';
 
-const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+export const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 const LOCAL_METADATA_KEYS = [
   'recordType',
@@ -127,7 +127,11 @@ function scheduledDates(value: unknown, label: string): string[] {
   return parsed;
 }
 
-function parseFieldClock(value: unknown, label: string, options: ClockValidationOptions): FieldClock {
+export function parseSyncFieldClock(
+  value: unknown,
+  options: ClockValidationOptions = {},
+  label = 'Sync field clock',
+): FieldClock {
   if (!isObject(value)) throw new Error(`${label} must be an object.`);
   assertExactKeys(value, ['at', 'deviceId'], label);
   return {
@@ -145,7 +149,7 @@ function parseFieldClockMap<Field extends string>(
   if (!isObject(value)) throw new Error(`${label} must be an object.`);
   assertExactKeys(value, fields, label);
   return Object.fromEntries(
-    fields.map(field => [field, parseFieldClock(value[field], `${label}.${field}`, options)]),
+    fields.map(field => [field, parseSyncFieldClock(value[field], options, `${label}.${field}`)]),
   ) as FieldClockMap<Field>;
 }
 
