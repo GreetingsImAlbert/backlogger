@@ -29,6 +29,13 @@ export interface RecordSyncWorkerOptions {
   onLocalCommit?: () => void | Promise<void>;
 }
 
+export interface RecordSyncCycleRunner {
+  runCycle(): Promise<RecordSyncCycleResult>;
+  startPeriodicPull(runImmediately?: boolean): void;
+  stopPeriodicPull(): void;
+  setRealtimeDegraded(message: string | null): Promise<void>;
+}
+
 function bindingMatches(first: RecordSyncBinding, second: RecordSyncBinding): boolean {
   return first.accountId === second.accountId
     && first.projectRef === second.projectRef
@@ -106,6 +113,7 @@ export class RecordSyncWorker {
   private readonly onLocalCommit: () => void | Promise<void>;
   private cycleQueue: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private realtimeError: string | null = null;
 
   constructor(
     repository: LocalRepository,
@@ -286,7 +294,7 @@ export class RecordSyncWorker {
       const pulledBeforePush = await this.pullAll();
       const pushed = await this.drainOutbox();
       const pulledAfterPush = await this.pullAll();
-      await this.setStatus('live', null);
+      await this.setStatus(this.realtimeError === null ? 'live' : 'degraded', this.realtimeError);
       return {
         pulled: pulledBeforePush + pulledAfterPush,
         pushed: pushed.pushed,
@@ -306,9 +314,9 @@ export class RecordSyncWorker {
     return result;
   }
 
-  startPeriodicPull(): void {
+  startPeriodicPull(runImmediately = true): void {
     if (this.timer !== null) return;
-    void this.runCycle().catch(() => undefined);
+    if (runImmediately) void this.runCycle().catch(() => undefined);
     this.timer = setInterval(() => {
       void this.runCycle().catch(() => undefined);
     }, this.pollIntervalMs);
@@ -318,5 +326,10 @@ export class RecordSyncWorker {
     if (this.timer === null) return;
     clearInterval(this.timer);
     this.timer = null;
+  }
+
+  async setRealtimeDegraded(message: string | null): Promise<void> {
+    this.realtimeError = message;
+    if (message !== null) await this.setStatus('degraded', message);
   }
 }

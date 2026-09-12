@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–5 are implemented on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network.
+Status: Milestones 0–6 are implemented on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network.
 
 ## Implemented baseline
 
@@ -98,6 +98,13 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 **Verify:** two-client tests measure immediate propagation and cover burst edits, echo, event-before-response, response-before-event, duplicate event, dropped socket, token refresh, sleep/resume, offline edits, process kill, and reconnect catch-up.
 
 **Done when:** connected devices normally update within seconds and disabling Realtime changes latency only, not correctness.
+
+### Milestone 6 implementation handoff
+
+- Added one authenticated, notebook-scoped channel covering category/task inserts, updates, and deletes; events only coalesce wake-ups for validated cursor pulls.
+- Subscription completes before catch-up. JWT refresh, channel teardown, bounded reconnect backoff, foreground/network resume, and stale-channel guards are handled centrally.
+- Periodic polling remains active when Realtime degrades, so socket loss affects latency rather than correctness. Record sync remains disabled until cutover.
+- Verified subscription ordering, burst coalescing, degraded polling, reconnection, token refresh, sign-out, pause/resume, stale events, and serialized catch-up.
 
 ## Milestone 7 — Safe legacy cloud bootstrap and protocol cutover
 

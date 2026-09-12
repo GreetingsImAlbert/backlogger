@@ -353,3 +353,20 @@ test('overlapping foreground requests are serialized into complete pull-push-pul
   assert.equal(maximumActivePulls, 1);
   assert.equal(transport.pullCalls, 4);
 });
+
+test('successful polling stays degraded while Realtime is unavailable and recovers after resubscription', async () => {
+  const server = new MemoryRecordServer();
+  const transport = new MemoryRecordTransport(server);
+  const { repository } = await boundRepository('realtime-state');
+  const syncWorker = worker(repository, transport);
+
+  await syncWorker.setRealtimeDegraded('Realtime connection failed.');
+  await syncWorker.runCycle();
+  assert.equal((await repository.readModel()).syncState.status, 'degraded');
+  assert.match((await repository.readModel()).syncState.lastError, /Realtime connection failed/i);
+
+  await syncWorker.setRealtimeDegraded(null);
+  await syncWorker.runCycle();
+  assert.equal((await repository.readModel()).syncState.status, 'live');
+  assert.equal((await repository.readModel()).syncState.lastError, null);
+});
