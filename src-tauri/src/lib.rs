@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use sqlx::Executor;
 use std::{
     fs,
     io::{ErrorKind, Write},
@@ -8,10 +11,91 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_sql::{DbInstances, DbPool, Migration, MigrationKind};
 
 const OAUTH_CALLBACK_ADDRESS: &str = "127.0.0.1:17428";
 const OAUTH_CALLBACK_URL: &str = "http://127.0.0.1:17428/auth/callback";
+const LOCAL_DATABASE_URL: &str = "sqlite:backlogger-v2.db";
 static OAUTH_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn local_database_migrations() -> Vec<Migration> {
+    vec![Migration {
+        version: 1,
+        description: "create_local_sync_v2_repository",
+        sql: include_str!("../migrations/0001_local_sync_v2.sql"),
+        kind: MigrationKind::Up,
+    }]
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSqlStatement {
+    query: String,
+    values: Vec<JsonValue>,
+}
+
+fn is_allowed_local_write(query: &str) -> bool {
+    let normalized = query.trim().to_ascii_uppercase();
+    !normalized.contains(';')
+        && (normalized.starts_with("DELETE FROM LOCAL_")
+            || normalized.starts_with("INSERT INTO LOCAL_"))
+}
+
+#[tauri::command]
+async fn execute_local_database_transaction(
+    instances: tauri::State<'_, DbInstances>,
+    database: String,
+    statements: Vec<LocalSqlStatement>,
+) -> Result<(), String> {
+    if database != LOCAL_DATABASE_URL {
+        return Err("The local repository requested an unknown database.".into());
+    }
+    if statements
+        .iter()
+        .any(|item| !is_allowed_local_write(&item.query))
+    {
+        return Err("The local repository requested an unsupported database operation.".into());
+    }
+
+    let databases = instances.0.read().await;
+    let database = databases
+        .get(&database)
+        .ok_or_else(|| "The local repository database is not loaded.".to_string())?;
+    let pool = match database {
+        DbPool::Sqlite(pool) => pool,
+    };
+    let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
+    for statement in statements {
+        let mut query = sqlx::query(&statement.query);
+        for value in statement.values {
+            query = match value {
+                JsonValue::Null => query.bind(Option::<String>::None),
+                JsonValue::Bool(value) => query.bind(i64::from(value)),
+                JsonValue::Number(value) => {
+                    if let Some(value) = value.as_i64() {
+                        query.bind(value)
+                    } else if let Some(value) = value.as_u64() {
+                        let value = i64::try_from(value)
+                            .map_err(|_| "A local database integer is out of range.".to_string())?;
+                        query.bind(value)
+                    } else {
+                        query.bind(value.as_f64().unwrap_or_default())
+                    }
+                }
+                JsonValue::String(value) => query.bind(value),
+                value => query.bind(value.to_string()),
+            };
+        }
+        transaction
+            .execute(query)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
+}
 
 fn oauth_response(stream: &mut TcpStream, status: &str, body: &str) {
     let response = format!(
@@ -170,6 +254,22 @@ fn load_notebook_backup(app: AppHandle) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
+fn read_legacy_notebook_for_migration(app: AppHandle) -> Result<Option<String>, String> {
+    let path = notebook_path(&app)?;
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match fs::read_to_string(path.with_extension("json.bak")) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
 fn save_notebook(app: AppHandle, document: String) -> Result<(), String> {
     serde_json::from_str::<serde_json::Value>(&document).map_err(|error| error.to_string())?;
     let path = notebook_path(&app)?;
@@ -238,10 +338,12 @@ fn set_app_theme(window: tauri::WebviewWindow, theme: String) -> Result<(), Stri
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(desktop)]
     let mut builder = tauri::Builder::default();
-    #[cfg(not(desktop))]
-    let builder = tauri::Builder::default();
+    builder = builder.plugin(
+        tauri_plugin_sql::Builder::default()
+            .add_migrations(LOCAL_DATABASE_URL, local_database_migrations())
+            .build(),
+    );
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -273,6 +375,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_notebook,
             load_notebook_backup,
+            read_legacy_notebook_for_migration,
             save_notebook,
             load_sync_state,
             save_sync_state,
@@ -280,7 +383,8 @@ pub fn run() {
             set_app_theme,
             read_document_file,
             write_document_file,
-            start_oauth_callback_listener
+            start_oauth_callback_listener,
+            execute_local_database_transaction
         ])
         .run(tauri::generate_context!())
         .expect("error while running Backlogger");

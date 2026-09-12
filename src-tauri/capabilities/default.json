@@ -10,6 +10,7 @@
     "core:window:allow-set-always-on-top",
     "dialog:default",
     "deep-link:default",
+    "sql:default",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

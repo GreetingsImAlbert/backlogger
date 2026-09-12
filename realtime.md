@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–1 complete; v2 contracts, validation, pure reconciliation, ordering, safety fixtures, and a dormant flag exist, but no active runtime or database behavior has changed. This plan replaces the snapshot/manifest protocol only after a verified side-by-side migration. Local-only use must continue to require no account or network.
+Status: Milestones 0–2 complete; the dormant v2 contracts, merge engine, ordering, SQLite repository, browser/test adapters, and one-time legacy importer exist, but the UI and active sync runtime still use the current JSON/snapshot path. This plan replaces that path only after a verified side-by-side migration. Local-only use must continue to require no account or network.
 
 ## Current-state assessment
 
@@ -133,6 +133,16 @@ After any merge, save the merged row and outbox intent in one local transaction.
 **Verify:** clean install, populated legacy file, empty file, malformed file, duplicate IDs, interrupted migration, repeat launch, rollback, and Windows/Android database reopen tests.
 
 **Done when:** SQLite can faithfully round-trip the current notebook and durable sync metadata without changing the active UI path.
+
+### Milestone 2 handoff
+
+- Added registered Tauri SQL SQLite migration `src-tauri/migrations/0001_local_sync_v2.sql` for category/task rows, acknowledged bases, account-scoped coalescing outbox entries, sync metadata, local preferences, and bounded recovery backups. Desktop and mobile capabilities allow connection/read operations; writes use one narrow Rust transaction command so a multi-row repository commit always uses one SQLx transaction.
+- Added the stable `src/local-db/index.ts` boundary. `LocalRepository` provides serialized atomic read/transaction operations, create/edit/reorder/tombstone commands, category-delete cascading, canonical row application, three-way reconciliation persistence, mutation acknowledgement/attempt handling, durable base/outbox/cursor/state access, preferences, and recovery-backup creation/listing.
+- `openTauriLocalRepository` always selects SQLite in Tauri. Browser preview uses an isolated localStorage adapter, and tests can use the same repository with an in-memory store. None of these modules are imported by `main.ts`; `RECORD_SYNC_ENABLED` remains `false` and the live JSON/Supabase snapshot behavior is unchanged.
+- First repository open reads but never modifies `backlogger.json` (or its backup only when the primary is absent), validates the complete legacy document and globally unique task IDs, keeps exact source JSON as a recovery backup, preserves stable IDs/preferences, assigns deterministic initial ranks and clocks, and writes records plus the completion marker atomically. Missing input creates an empty repository; invalid/empty/partial input and injected write interruption leave SQLite unmarked and empty so retry is safe. Completed imports never run twice.
+- Added real file-backed SQLite tests for clean, populated, valid-empty, empty-file, malformed, duplicate-ID, interrupted, repeated, callback rollback, durable-write rollback, close/reopen, metadata/outbox/base round-trip, acknowledgement supersession, reconciliation, ordering scope, tombstone cascading, and browser-preview preservation. All 84 tests pass.
+- Runtime evidence on 2026-09-12: `npm.cmd run check`, `npm.cmd test`, `npm.cmd run build`, `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`, Windows-host `cargo check --manifest-path src-tauri/Cargo.toml`, and `git diff --check` pass. `npm.cmd run android:build` also produced the x86_64 debug APK with the native SQLite plugin. No adb target was connected, so device UI/data-path QA waits for Milestone 3 when the repository is active. Manual actions: none; no Supabase contract changed.
+- Remaining work starts at Milestone 3: route every UI mutation and read projection through `LocalRepository`, preserve the old path behind the disabled flag until cutover, and then perform actual Windows/Android restart and crash-after-commit QA.
 
 ## Milestone 3 — Route the UI through the local repository
 

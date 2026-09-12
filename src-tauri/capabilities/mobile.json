@@ -4,5 +4,5 @@
   "description": "Default mobile capability",
   "windows": ["main"],
   "platforms": ["android", "iOS"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "sql:default"]
 }
