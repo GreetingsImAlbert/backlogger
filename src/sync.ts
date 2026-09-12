@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Category, Notebook, Task } from './model.ts';
-import { parseStoredDocument, SCHEMA_VERSION, storageKind, type StoredDocument, type Theme, type ViewMode } from './storage.ts';
+import { parseStoredDocument, SCHEMA_VERSION, storageKind, type ColorTheme, type StoredDocument, type Theme, type ViewMode } from './storage.ts';
 
 export const LEGACY_SYNC_SCHEMA_VERSION = 1 as const;
 export const PREVIOUS_SYNC_SCHEMA_VERSION = 2 as const;
@@ -447,12 +447,17 @@ export function notebookFromSnapshot(snapshot: SyncSnapshot): Notebook {
   return { categories: cloneCategories(snapshot.categories) };
 }
 
-export function storedDocumentFromSyncSnapshot(snapshot: SyncSnapshot, viewMode: ViewMode = 'all', theme: Theme = 'dark'): StoredDocument {
+export function storedDocumentFromSyncSnapshot(
+  snapshot: SyncSnapshot,
+  viewMode: ViewMode = 'all',
+  theme: Theme = 'dark',
+  colorTheme: ColorTheme = 'neutral',
+): StoredDocument {
   return parseStoredDocument({
     schemaVersion: SCHEMA_VERSION,
     revision: snapshot.revision,
     categories: cloneCategories(snapshot.categories),
-    preferences: { viewMode, theme },
+    preferences: { viewMode, theme, colorTheme },
   });
 }
 

@@ -23,6 +23,10 @@ export function weekStart(value: string): string {
   return shiftDate(value, -((parseDate(value).getUTCDay() + 6) % 7));
 }
 
+export function centeredWeekStart(value: string): string {
+  return shiftDate(value, -3);
+}
+
 export function dateLabel(value: string): string {
   return parseDate(value).toLocaleDateString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',

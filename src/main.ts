@@ -1,11 +1,11 @@
 import './style.css';
 import { open as openNativeFile, save as saveNativeFile } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { compactDate, compactDateList, dateLabel, localToday, normalizeDates, parseDate, shiftDate, weekStart } from './dates';
+import { centeredWeekStart, compactDate, compactDateList, dateLabel, localToday, normalizeDates, parseDate, shiftDate, weekdayCode } from './dates';
 import type { Category, Notebook, Task } from './model';
 import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
-import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
+import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type ColorTheme, type StoredDocument, type Theme, type ViewMode } from './storage';
 import { hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeEverything, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncManifest, type SyncSnapshot, type SyncState, type SupabaseLocation } from './sync';
 import { SyncCoordinator } from './sync/coordinator';
 import { SupabaseSyncTransport } from './sync/supabase-transport';
@@ -20,6 +20,7 @@ let notebook: Notebook = { categories: [] };
 let hasUnsavedChanges = false;
 let viewMode: ViewMode = 'all';
 let theme: Theme = 'dark';
+let colorTheme: ColorTheme = 'neutral';
 let revision = 0;
 let storageReady = false;
 let storageBlocked = false;
@@ -51,6 +52,8 @@ let statusDetailMessage = '';
 let availableUpdate: AvailableUpdate | null = null;
 let ignoredUpdateIds = new Set<string>();
 let closeInProgress = false;
+let windowPinned = false;
+let windowPinChangeInFlight = false;
 let syncRetentionMessage = '';
 let sessionFetchInFlight: Promise<void> | null = null;
 type DragState =
@@ -103,6 +106,7 @@ const icons = {
   grip: '<path d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
   moon: '<path d="M20 14a8 8 0 0 1-10-10 8.5 8.5 0 1 0 10 10Z"/>',
+  pin: '<path d="M9 3v4l-3 3v2h12v-2l-3-3V3"/><path d="M12 12v9"/>',
 };
 function decorateIcon(node: HTMLElement, icon: keyof typeof icons, label: string) {
   node.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[icon]}</svg>`;
@@ -288,12 +292,21 @@ document.addEventListener('pointerup', finishPointerDrag, { passive: false });
 document.addEventListener('pointercancel', clearDragSession);
 
 document.addEventListener('click', event => {
+  if (!themePicker.contains(event.target as Node)) {
+    themePicker.classList.remove('is-open');
+    themeButton.setAttribute('aria-expanded', 'false');
+  }
   document.querySelectorAll<HTMLDetailsElement>('.action-menu[open]').forEach(menu => {
     if (!menu.contains(event.target as Node)) menu.open = false;
   });
 });
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
+  if (themePicker.classList.contains('is-open')) {
+    themePicker.classList.remove('is-open');
+    themeButton.setAttribute('aria-expanded', 'false');
+    focusWithoutScrolling(themeButton);
+  }
   document.querySelectorAll<HTMLDetailsElement>('.action-menu[open]').forEach(menu => {
     menu.open = false;
     focusWithoutScrolling(menu.querySelector('summary'));
@@ -305,12 +318,54 @@ const header = element('header', 'app-header');
 const titleBar = element('div', 'title-bar');
 titleBar.append(element('h1', '', 'Backlogger'));
 const headerActions = element('div', 'header-actions');
-const themeButton = iconButton('sun', 'Switch to light mode', () => {
+const themePicker = element('div', 'theme-picker');
+const themeButton = iconButton('sun', 'Choose appearance', () => {
+  themePicker.classList.toggle('is-open');
+  themeButton.setAttribute('aria-expanded', String(themePicker.classList.contains('is-open')));
+});
+themeButton.setAttribute('aria-haspopup', 'true');
+themeButton.setAttribute('aria-expanded', 'false');
+const themePopover = element('div', 'theme-popover');
+themePopover.setAttribute('role', 'group');
+themePopover.setAttribute('aria-label', 'Appearance');
+const modeButton = iconButton('sun', 'Switch to light mode', () => {
   theme = theme === 'dark' ? 'light' : 'dark';
   applyTheme();
   queueSave(false);
 });
-headerActions.append(themeButton);
+const paletteDivider = element('span', 'theme-divider');
+paletteDivider.setAttribute('aria-hidden', 'true');
+const paletteOptions: Array<{ id: ColorTheme; label: string; color: string }> = [
+  { id: 'neutral', label: 'Graphite', color: '#8b8b8b' },
+  { id: 'violet', label: 'Violet', color: '#9b87f5' },
+  { id: 'ocean', label: 'Ocean', color: '#4f9fda' },
+  { id: 'forest', label: 'Forest', color: '#58a978' },
+  { id: 'rose', label: 'Rose', color: '#d66b86' },
+];
+const paletteButtons = paletteOptions.map(option => {
+  const swatch = button('', () => {
+    colorTheme = option.id;
+    applyTheme();
+    queueSave(false);
+  }, 'theme-swatch');
+  swatch.style.setProperty('--swatch-color', option.color);
+  swatch.setAttribute('aria-label', `${option.label} color theme`);
+  swatch.title = option.label;
+  return { ...option, button: swatch };
+});
+themePopover.append(modeButton, paletteDivider, ...paletteButtons.map(option => option.button));
+themePicker.append(themeButton, themePopover);
+themePicker.addEventListener('pointerleave', event => {
+  if (event.pointerType !== 'mouse') return;
+  themePicker.classList.remove('is-open');
+  themeButton.setAttribute('aria-expanded', 'false');
+  const focused = document.activeElement;
+  if (focused instanceof HTMLElement && themePicker.contains(focused)) focused.blur();
+});
+const pinButton = iconButton('pin', 'Keep window on top', () => void toggleWindowPin());
+pinButton.hidden = !capabilities.desktopClose;
+pinButton.setAttribute('aria-pressed', 'false');
+headerActions.append(themePicker, pinButton);
 titleBar.append(headerActions);
 header.append(titleBar);
 const viewSwitch = element('div', 'view-switch');
@@ -430,7 +485,12 @@ function setStorageNotice(title: string, detail: string) {
 
 function applyTheme() {
   document.documentElement.dataset.theme = theme;
-  decorateIcon(themeButton, theme === 'dark' ? 'sun' : 'moon', `Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`);
+  document.documentElement.dataset.colorTheme = colorTheme;
+  decorateIcon(themeButton, theme === 'dark' ? 'sun' : 'moon', 'Choose appearance');
+  themeButton.setAttribute('aria-haspopup', 'true');
+  themeButton.setAttribute('aria-expanded', String(themePicker.classList.contains('is-open')));
+  decorateIcon(modeButton, theme === 'dark' ? 'sun' : 'moon', `Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`);
+  paletteButtons.forEach(option => option.button.setAttribute('aria-pressed', String(option.id === colorTheme)));
   void setNativeTheme(theme).catch(error => console.error('Could not update window theme', error));
 }
 
@@ -449,7 +509,7 @@ async function exportCurrentDocument() {
     setStatusMessage('Import and export will be available on Android in a later milestone.');
     return;
   }
-  const stored = makeStoredDocument(notebook, revision, viewMode, theme);
+  const stored = makeStoredDocument(notebook, revision, viewMode, theme, colorTheme);
   const raw = JSON.stringify(stored, null, 2);
   try {
     if (capabilities.nativeDocuments) {
@@ -494,7 +554,7 @@ function parseImportPayload(raw: string): ImportPayload {
     }
     try {
       const snapshot = parseSyncSnapshot(value, 'Sync snapshot');
-      return { document: storedDocumentFromSyncSnapshot(snapshot, viewMode, theme), syncSnapshot: snapshot };
+      return { document: storedDocumentFromSyncSnapshot(snapshot, viewMode, theme, colorTheme), syncSnapshot: snapshot };
     } catch {
       throw storedError;
     }
@@ -617,6 +677,24 @@ function withSyncTimeout<T>(operation: Promise<T>): Promise<T> {
   return withTimeout(operation, SYNC_CHECK_TIMEOUT_MS, 'The cloud sync check timed out.');
 }
 
+async function toggleWindowPin() {
+  if (!capabilities.desktopClose || windowPinChangeInFlight) return;
+  const nextPinned = !windowPinned;
+  windowPinChangeInFlight = true;
+  pinButton.disabled = true;
+  try {
+    await getCurrentWindow().setAlwaysOnTop(nextPinned);
+    windowPinned = nextPinned;
+    pinButton.setAttribute('aria-pressed', String(windowPinned));
+    decorateIcon(pinButton, 'pin', windowPinned ? 'Stop keeping window on top' : 'Keep window on top');
+  } catch (error) {
+    setStatusMessage(`Could not change window pin: ${errorText(error)}`);
+  } finally {
+    windowPinChangeInFlight = false;
+    pinButton.disabled = false;
+  }
+}
+
 function cloudLocation(location: SyncState['location'] = syncState.location): SupabaseLocation | null {
   return location?.kind === 'supabase' ? location : null;
 }
@@ -705,7 +783,7 @@ async function compactSyncHistory(coordinator: SyncCoordinator): Promise<boolean
     const boundaryIndex = lineage.length - retainedDescendantCount - 1;
     if (boundaryIndex < 0) return false;
     const boundary = lineage[boundaryIndex];
-    const checkpointDocument = storedDocumentFromSyncSnapshot(boundary, viewMode, theme);
+    const checkpointDocument = storedDocumentFromSyncSnapshot(boundary, viewMode, theme, colorTheme);
     const checkpoint = makeCheckpointSnapshot(checkpointDocument, syncState);
     createdSnapshots = [checkpoint];
     let parentId = checkpoint.snapshotId;
@@ -919,7 +997,7 @@ function checkForSharedUpdate(allowFetching = false): Promise<AvailableUpdate | 
 }
 
 async function applyFetchedSnapshot(snapshot: SyncSnapshot): Promise<void> {
-  const localDocument = makeStoredDocument(notebook, revision, viewMode, theme);
+  const localDocument = makeStoredDocument(notebook, revision, viewMode, theme, colorTheme);
   await writeStoredDocument(localDocument);
   notebook = notebookFromSnapshot(snapshot);
   revision = Math.max(revision, snapshot.revision);
@@ -1007,7 +1085,7 @@ function startSessionFetch(): Promise<void> {
 async function retrySessionFetch() {
   syncState.lastError = null;
   if (sessionContentDirty && !syncState.pendingSnapshots.length) {
-    await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme));
+    await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme, colorTheme));
   }
   setSyncStatusMessage('Retrying cloud sync.');
   await startSessionFetch();
@@ -1046,7 +1124,7 @@ function askFetchConfirmation(): Promise<CloudDifferenceAction | null> {
 }
 
 async function applyEverythingMerge(snapshot: SyncSnapshot): Promise<void> {
-  await writeStoredDocument(makeStoredDocument(notebook, revision, viewMode, theme));
+  await writeStoredDocument(makeStoredDocument(notebook, revision, viewMode, theme, colorTheme));
   const merged = mergeEverything(notebook, notebookFromSnapshot(snapshot));
   if (notebookFingerprint(merged) === snapshotFingerprint(snapshot)) {
     await applyFetchedSnapshot(snapshot);
@@ -1299,7 +1377,7 @@ async function publishSavedChanges(expectedSequence: number): Promise<void> {
     return;
   }
   try {
-    await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme));
+    await queueSyncSnapshot(makeStoredDocument(notebook, revision, viewMode, theme, colorTheme));
     setSyncStatusMessage('Publishing saved local changes to Supabase.');
     await startSessionFetch();
   } catch (error) {
@@ -1351,7 +1429,7 @@ async function bindSupabaseAccount(): Promise<void> {
       if (!(await askStartSyncConfirmation())) return;
       const notebookId = syncState.notebookId ?? crypto.randomUUID();
       const nextState = { ...syncState, notebookId };
-      const checkpoint = makeCheckpointSnapshot(makeStoredDocument(notebook, revision, viewMode, theme), nextState);
+      const checkpoint = makeCheckpointSnapshot(makeStoredDocument(notebook, revision, viewMode, theme, colorTheme), nextState);
       const initialManifest = makeSyncManifest(notebookId, syncState.deviceId, [checkpoint.snapshotId]);
       const initialized = await coordinator.initializeNotebook(checkpoint, initialManifest);
       cloudInspection = { accountId: location.accountId, manifest: initialized.manifest, error: null };
@@ -1730,7 +1808,7 @@ function queueSave(publishSync = false) {
     setStatusMessage('Saving is paused because the existing local data could not be validated.');
     return;
   }
-  const documentToSave = makeStoredDocument(notebook, ++revision, viewMode, theme);
+  const documentToSave = makeStoredDocument(notebook, ++revision, viewMode, theme, colorTheme);
   const sequence = ++saveSequence;
   setStorageNotice('Saving locally…', capabilities.nativeLocalStorage ? 'Writing a versioned file in the app-data folder.' : 'Writing to browser local storage for this preview.');
   saveQueue = saveQueue
@@ -1908,7 +1986,7 @@ function editTask(category: Category, task?: Task) {
   });
   categoryLabel.append(categorySelect);
   let selected = [...(task?.scheduledDates ?? [])];
-  let week = weekStart(localToday());
+  let visibleWeekStart = centeredWeekStart(localToday());
   const calendar = element('fieldset', 'calendar');
   calendar.append(element('legend', '', 'Work dates'));
   const weekNav = element('div', 'week-nav');
@@ -1932,10 +2010,10 @@ function editTask(category: Category, task?: Task) {
       ? 'Some work dates are after the deadline. You can still save.' : '';
   };
   function drawCalendar() {
-    range.textContent = `${dateLabel(week)} – ${dateLabel(shiftDate(week, 6))}`;
+    range.textContent = `${dateLabel(visibleWeekStart)} – ${dateLabel(shiftDate(visibleWeekStart, 6))}`;
     days.replaceChildren();
-    ['M', 'T', 'W', 'H', 'F', 'A', 'S'].forEach((code, index) => {
-      const date = shiftDate(week, index);
+    Array.from({ length: 7 }, (_, index) => shiftDate(visibleWeekStart, index)).forEach((date, index) => {
+      const code = weekdayCode(date);
       const day = button(`${code} ${parseDate(date).getUTCDate()}`, () => {
         selected = selected.includes(date) ? selected.filter(value => value !== date) : normalizeDates([...selected, date]);
         drawCalendar();
@@ -1957,8 +2035,8 @@ function editTask(category: Category, task?: Task) {
     });
     updateAdvisory();
   }
-  weekNav.append(button('‹', () => { week = shiftDate(week, -7); drawCalendar(); }), range,
-    button('›', () => { week = shiftDate(week, 7); drawCalendar(); }));
+  weekNav.append(button('‹', () => { visibleWeekStart = shiftDate(visibleWeekStart, -7); drawCalendar(); }), range,
+    button('›', () => { visibleWeekStart = shiftDate(visibleWeekStart, 7); drawCalendar(); }));
   weekNav.firstElementChild!.setAttribute('aria-label', 'Previous week');
   weekNav.lastElementChild!.setAttribute('aria-label', 'Next week');
   calendar.append(weekNav, days, selectedDates);
@@ -2010,6 +2088,8 @@ function render() {
   tomorrowView.title = dateLabel(tomorrow);
   addCategory.disabled = !editingReady;
   themeButton.disabled = !editingReady;
+  modeButton.disabled = !editingReady;
+  paletteButtons.forEach(option => { option.button.disabled = !editingReady; });
   allView.disabled = todayView.disabled = tomorrowView.disabled = !editingReady;
   importButton.disabled = exportButton.disabled = !editingReady || !capabilities.documentImportExport;
   if (!capabilities.documentImportExport) {
@@ -2158,7 +2238,7 @@ async function writeCloseSnapshot(): Promise<void> {
       : pendingBaseParents.length
         ? pendingBaseParents
         : syncState.knownHeadSnapshotIds;
-  const document = makeStoredDocument(notebook, revision, viewMode, theme);
+  const document = makeStoredDocument(notebook, revision, viewMode, theme, colorTheme);
   const contentFingerprint = notebookFingerprint(notebook);
   if (!syncState.mergeParentSnapshotIds.length && syncState.lastPublishedContentFingerprint === contentFingerprint) {
     syncState.pendingSnapshots = [];
@@ -2299,6 +2379,7 @@ async function loadInitialData() {
       notebook = { categories: stored.categories };
       viewMode = stored.preferences.viewMode;
       theme = stored.preferences.theme;
+      colorTheme = stored.preferences.colorTheme;
       applyTheme();
       revision = stored.revision;
     }

@@ -30,6 +30,94 @@
   --danger: #b42323;
   --shadow: 0 8px 32px #00000012;
 }
+:root[data-color-theme='violet'] {
+  --bg: #211f29;
+  --surface: #302c3b;
+  --hover: #3a3448;
+  --text: #f1edf7;
+  --muted: #afa5bc;
+  --border: #494158;
+  --primary: #b9a4ff;
+  --on-primary: #1e1630;
+  --danger: #ff9cae;
+}
+:root[data-theme='light'][data-color-theme='violet'] {
+  --bg: #f2ecfa;
+  --surface: #e8def5;
+  --hover: #dccced;
+  --text: #292332;
+  --muted: #6f617e;
+  --border: #c9b7dc;
+  --primary: #6845c2;
+  --on-primary: #ffffff;
+  --danger: #b12a47;
+}
+:root[data-color-theme='ocean'] {
+  --bg: #192329;
+  --surface: #25343c;
+  --hover: #2d3e48;
+  --text: #e9f1f4;
+  --muted: #9eafb8;
+  --border: #3b4e58;
+  --primary: #77c4ee;
+  --on-primary: #10232e;
+  --danger: #ff9f9f;
+}
+:root[data-theme='light'][data-color-theme='ocean'] {
+  --bg: #eaf6fb;
+  --surface: #dceff7;
+  --hover: #cae5f1;
+  --text: #1d2b32;
+  --muted: #58727f;
+  --border: #afd3e3;
+  --primary: #0e709f;
+  --on-primary: #ffffff;
+  --danger: #b42323;
+}
+:root[data-color-theme='forest'] {
+  --bg: #19251f;
+  --surface: #26352d;
+  --hover: #2e4036;
+  --text: #eaf2ed;
+  --muted: #9fb2a5;
+  --border: #3b5143;
+  --primary: #76c393;
+  --on-primary: #10281a;
+  --danger: #ff9e9e;
+}
+:root[data-theme='light'][data-color-theme='forest'] {
+  --bg: #edf7ef;
+  --surface: #dfeee2;
+  --hover: #cee5d4;
+  --text: #203027;
+  --muted: #597362;
+  --border: #b6d5be;
+  --primary: #1f7543;
+  --on-primary: #ffffff;
+  --danger: #b42323;
+}
+:root[data-color-theme='rose'] {
+  --bg: #291e22;
+  --surface: #3a2930;
+  --hover: #46313a;
+  --text: #f5ecef;
+  --muted: #b9a2aa;
+  --border: #59404a;
+  --primary: #ef9bb2;
+  --on-primary: #32131d;
+  --danger: #ff9ba3;
+}
+:root[data-theme='light'][data-color-theme='rose'] {
+  --bg: #fbeef2;
+  --surface: #f4dfe6;
+  --hover: #eccdd7;
+  --text: #34242a;
+  --muted: #7c626b;
+  --border: #ddb6c3;
+  --primary: #a93459;
+  --on-primary: #ffffff;
+  --danger: #a82036;
+}
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; min-width: 300px; }
@@ -46,6 +134,18 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
 .icon-button { border: 0; border-radius: 8px; display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 7px; background: transparent; color: var(--muted); cursor: pointer; flex-shrink: 0; }
 .icon-button svg { width: 18px; height: 18px; }
 .icon-button:hover, .icon-button:focus-visible, .action-menu[open] > summary { background: var(--hover); color: var(--text); }
+.icon-button[aria-pressed="true"] { background: var(--hover); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+.theme-picker { position: relative; display: flex; }
+.theme-picker::after { content: ''; position: absolute; top: 100%; right: 0; width: 100%; height: 6px; }
+.theme-popover { position: absolute; right: 0; top: calc(100% + 4px); z-index: 7; display: flex; align-items: center; gap: 4px; padding: 5px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); box-shadow: var(--shadow); opacity: 0; visibility: hidden; pointer-events: none; transform: translateY(-3px); transition: opacity 120ms ease, transform 120ms ease, visibility 120ms; }
+.theme-picker:hover > .theme-popover, .theme-picker:focus-within > .theme-popover, .theme-picker.is-open > .theme-popover { opacity: 1; visibility: visible; pointer-events: auto; transform: translateY(0); }
+.theme-popover > .icon-button { width: 28px; height: 28px; padding: 6px; }
+.theme-divider { width: 1px; height: 18px; margin: 0 2px; background: var(--border); flex: 0 0 auto; }
+.theme-swatch { position: relative; display: grid; place-items: center; width: 26px; height: 28px; padding: 0; border: 0; border-radius: 7px; background: transparent; }
+.theme-swatch::before { content: ''; width: 14px; height: 14px; border-radius: 50%; background: var(--swatch-color); box-shadow: inset 0 0 0 1px #ffffff40; transition: transform 120ms ease, box-shadow 120ms ease; }
+.theme-swatch:hover { background: var(--hover); }
+.theme-swatch:hover::before { transform: scale(1.12); }
+.theme-swatch[aria-pressed='true']::before { box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--text); }
 .view-switch { display: inline-flex; gap: 2px; margin-top: 20px; padding: 3px; background: var(--surface); border-radius: 10px; }
 .view-button { border: 0; border-radius: 7px; padding: 6px 16px; background: transparent; color: var(--muted); font-size: 12px; }
 .view-button[aria-pressed='true'] { background: var(--hover); color: var(--text); }

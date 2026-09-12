@@ -9,12 +9,13 @@ const BROWSER_BACKUP_KEY = `${BROWSER_STORAGE_KEY}.bak`;
 
 export type ViewMode = 'all' | 'today' | 'tomorrow';
 export type Theme = 'dark' | 'light';
+export type ColorTheme = 'neutral' | 'violet' | 'ocean' | 'forest' | 'rose';
 
 export interface StoredDocument {
   schemaVersion: typeof SCHEMA_VERSION;
   revision: number;
   categories: Category[];
-  preferences: { viewMode: ViewMode; theme: Theme };
+  preferences: { viewMode: ViewMode; theme: Theme; colorTheme: ColorTheme };
 }
 
 export function storageKind(): 'desktop' | 'android' | 'browser' {
@@ -33,6 +34,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isViewMode(value: unknown): value is ViewMode {
   return value === 'all' || value === 'today' || value === 'tomorrow';
+}
+
+function isColorTheme(value: unknown): value is ColorTheme {
+  return value === 'neutral' || value === 'violet' || value === 'ocean' || value === 'forest' || value === 'rose';
 }
 
 function requiredString(value: unknown, field: string): string {
@@ -88,6 +93,9 @@ export function parseStoredDocument(value: unknown): StoredDocument {
   if (value.preferences.theme !== undefined && value.preferences.theme !== 'dark' && value.preferences.theme !== 'light') {
     throw new Error('Stored data has an invalid theme.');
   }
+  if (value.preferences.colorTheme !== undefined && !isColorTheme(value.preferences.colorTheme)) {
+    throw new Error('Stored data has an invalid color theme.');
+  }
   const categories = value.categories.map(parseCategory);
   const categoryIds = new Set<string>();
   categories.forEach(category => {
@@ -98,7 +106,11 @@ export function parseStoredDocument(value: unknown): StoredDocument {
     schemaVersion: SCHEMA_VERSION,
     revision: value.revision,
     categories,
-    preferences: { viewMode: value.preferences.viewMode, theme: value.preferences.theme ?? 'dark' },
+    preferences: {
+      viewMode: value.preferences.viewMode,
+      theme: value.preferences.theme ?? 'dark',
+      colorTheme: value.preferences.colorTheme ?? 'neutral',
+    },
   };
 }
 
@@ -111,7 +123,13 @@ export function parseStoredText(raw: string): StoredDocument {
   }
 }
 
-export function makeStoredDocument(notebook: Notebook, revision: number, viewMode: ViewMode, theme: Theme = 'dark'): StoredDocument {
+export function makeStoredDocument(
+  notebook: Notebook,
+  revision: number,
+  viewMode: ViewMode,
+  theme: Theme = 'dark',
+  colorTheme: ColorTheme = 'neutral',
+): StoredDocument {
   return {
     schemaVersion: SCHEMA_VERSION,
     revision,
@@ -123,7 +141,7 @@ export function makeStoredDocument(notebook: Notebook, revision: number, viewMod
         deadlineDate: task.deadlineDate === null ? null : (parseDate(task.deadlineDate), task.deadlineDate),
       })),
     })),
-    preferences: { viewMode, theme },
+    preferences: { viewMode, theme, colorTheme },
   };
 }
 

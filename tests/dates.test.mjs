@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compactDate, compactDateList, dateLabel, normalizeDates, parseDate, shiftDate, weekStart } from '../src/dates.ts';
+import { centeredWeekStart, compactDate, compactDateList, dateLabel, normalizeDates, parseDate, shiftDate, weekStart } from '../src/dates.ts';
 
 test('calendar navigation crosses months, leap days, and years without skipping days', () => {
   assert.equal(shiftDate('2028-02-28', 1), '2028-02-29');
@@ -8,6 +8,13 @@ test('calendar navigation crosses months, leap days, and years without skipping 
   assert.equal(shiftDate('2026-12-31', 1), '2027-01-01');
   assert.equal(weekStart('2027-01-03'), '2026-12-28');
   assert.equal(weekStart('2027-01-04'), '2027-01-04');
+});
+
+test('the task date picker places its reference day in the middle of seven days', () => {
+  const start = centeredWeekStart('2026-09-12');
+  assert.equal(start, '2026-09-09');
+  assert.equal(shiftDate(start, 3), '2026-09-12');
+  assert.equal(shiftDate(start, 6), '2026-09-15');
 });
 
 test('rejects impossible dates instead of silently rolling to another month', () => {

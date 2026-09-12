@@ -15,17 +15,21 @@ const notebook = {
   }],
 };
 
-test('existing backlogs without a theme stay readable and light mode round-trips', () => {
+test('existing backlogs without appearance preferences stay readable and appearance round-trips', () => {
   const original = makeStoredDocument(notebook, 4, 'today');
   const legacy = { ...original, preferences: { viewMode: 'today' } };
   const loaded = parseStoredDocument(legacy);
   assert.equal(loaded.preferences.theme, 'dark');
+  assert.equal(loaded.preferences.colorTheme, 'neutral');
   assert.deepEqual(loaded.categories, original.categories);
   const light = makeStoredDocument(notebook, 5, 'all', 'light');
   assert.equal(parseStoredText(JSON.stringify(light)).preferences.theme, 'light');
+  const rose = makeStoredDocument(notebook, 5, 'all', 'light', 'rose');
+  assert.equal(parseStoredText(JSON.stringify(rose)).preferences.colorTheme, 'rose');
   const tomorrow = makeStoredDocument(notebook, 6, 'tomorrow');
   assert.equal(parseStoredText(JSON.stringify(tomorrow)).preferences.viewMode, 'tomorrow');
   assert.throws(() => parseStoredDocument({ ...original, preferences: { viewMode: 'all', theme: 'invalid' } }), /theme/);
+  assert.throws(() => parseStoredDocument({ ...original, preferences: { viewMode: 'all', colorTheme: 'invalid' } }), /color theme/);
 });
 
 test('stored documents have a version, revision, preferences, and normalized dates', () => {
