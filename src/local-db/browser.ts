@@ -1,4 +1,5 @@
 import { TransactionalLocalRepository } from './repository.ts';
+import { parsePortableText, type PortableDocument } from '../storage.ts';
 import type {
   LocalRepository,
   LocalRepositoryDependencies,
@@ -45,5 +46,24 @@ export async function openBrowserLocalRepository(
   const primary = storage.getItem(LEGACY_DOCUMENT_KEY);
   const legacyDocumentJson = primary === null ? storage.getItem(LEGACY_BACKUP_KEY) : primary;
   await repository.initialize(legacyDocumentJson);
+  return repository;
+}
+
+export function readBrowserLegacyRecoveryCandidate(
+  storage: BrowserKeyValueStorage = window.localStorage,
+): PortableDocument | null {
+  const raw = storage.getItem(LEGACY_BACKUP_KEY);
+  return raw === null ? null : parsePortableText(raw);
+}
+
+export async function openBrowserLocalRepositoryFromLegacyBackup(
+  storage: BrowserKeyValueStorage = window.localStorage,
+  dependencies: LocalRepositoryDependencies = {},
+): Promise<LocalRepository> {
+  const raw = storage.getItem(LEGACY_BACKUP_KEY);
+  if (raw === null) throw new Error('No valid local backup was found.');
+  parsePortableText(raw);
+  const repository = new TransactionalLocalRepository(new BrowserLocalStateStore(storage), dependencies);
+  await repository.initialize(raw);
   return repository;
 }

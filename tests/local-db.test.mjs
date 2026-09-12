@@ -14,8 +14,12 @@ import { reconcileRecord } from '../src/sync-v2/index.ts';
 
 const NOW = '2026-09-12T04:00:00.000Z';
 const LATER = '2026-09-12T04:01:00.000Z';
-const MIGRATION_SQL = await readFile(
+const INITIAL_MIGRATION_SQL = await readFile(
   new URL('../src-tauri/migrations/0001_local_sync_v2.sql', import.meta.url),
+  'utf8',
+);
+const REVISION_MIGRATION_SQL = await readFile(
+  new URL('../src-tauri/migrations/0002_local_document_revision.sql', import.meta.url),
   'utf8',
 );
 
@@ -67,7 +71,11 @@ class NodeSqliteDatabase {
 
   constructor(path) {
     this.database = new DatabaseSync(path);
-    this.database.exec(MIGRATION_SQL);
+    this.database.exec(INITIAL_MIGRATION_SQL);
+    const columns = this.database.prepare('PRAGMA table_info(local_sync_meta)').all();
+    if (!columns.some(column => column.name === 'document_revision')) {
+      this.database.exec(REVISION_MIGRATION_SQL);
+    }
   }
 
   async select(query, values = []) {
@@ -144,6 +152,7 @@ test('SQLite imports a populated legacy notebook atomically and preserves its ex
     backupId: 'sqlite-2',
   });
   const model = await repository.readModel();
+  assert.equal(model.documentRevision, 8);
   assert.deepEqual(model.notebook, {
     categories: [
       {
@@ -480,4 +489,94 @@ test('browser preview imports once without modifying legacy localStorage', async
   storage.setItem('backlogger.document.v1', legacyJson({ categories: [] }));
   const reopened = await openBrowserLocalRepository(storage, dependencies('browser-reopen'));
   assert.deepEqual((await reopened.readModel()).notebook.categories.map(category => category.id), ['category-a', 'category-b']);
+});
+
+test('whole-notebook replacement is atomic, preserves preferences, and records hidden tombstones', async () => {
+  const store = new InMemoryLocalStateStore();
+  const repository = new TransactionalLocalRepository(store, dependencies('replace'));
+  await repository.initialize(legacyJson());
+  const before = await repository.readModel();
+  const backup = JSON.stringify({ schemaVersion: 2, revision: 8, categories: before.notebook.categories });
+
+  await repository.replaceNotebook({
+    notebook: {
+      categories: [{
+        ...before.notebook.categories[0],
+        name: 'Imported',
+        tasks: [before.notebook.categories[0].tasks[0]],
+      }],
+    },
+    editedAt: LATER,
+    deviceId: before.syncState.deviceId,
+    minimumRevision: 20,
+    recoveryBackup: { documentJson: backup, reason: 'before-import-replacement' },
+  });
+  const replaced = await repository.readModel();
+  assert.equal(replaced.documentRevision, 20);
+  assert.deepEqual(replaced.preferences, before.preferences);
+  assert.equal(replaced.notebook.categories[0].name, 'Imported');
+  assert.equal(replaced.records.categories.find(record => record.id === 'category-b')?.deletedAt, LATER);
+  assert.equal(replaced.records.tasks.find(record => record.id === 'task-b')?.deletedAt, LATER);
+  assert.equal((await repository.listRecoveryBackups())[0].reason, 'before-import-replacement');
+
+  const committedBeforeFailure = store.inspect();
+  store.failNextSave = true;
+  await assert.rejects(repository.replaceNotebook({
+    notebook: { categories: [] },
+    editedAt: LATER,
+    deviceId: before.syncState.deviceId,
+  }), /injected local store failure/i);
+  assert.deepEqual(store.inspect(), committedBeforeFailure);
+});
+
+test('undo-style replacement recreates deleted IDs without removing their tombstones', async () => {
+  const { repository } = (() => {
+    const store = new InMemoryLocalStateStore();
+    return { repository: new TransactionalLocalRepository(store, dependencies('undo')) };
+  })();
+  await repository.initialize(legacyJson());
+  const original = (await repository.readModel()).notebook;
+  const deviceId = (await repository.readModel()).syncState.deviceId;
+  await repository.replaceNotebook({
+    notebook: { categories: [original.categories[0]] },
+    editedAt: LATER,
+    deviceId,
+  });
+  await repository.replaceNotebook({
+    notebook: original,
+    editedAt: LATER,
+    deviceId,
+  });
+
+  const restored = await repository.readModel();
+  const restoredSecond = restored.notebook.categories.find(category => category.name === 'Second');
+  assert.ok(restoredSecond);
+  assert.notEqual(restoredSecond.id, 'category-b');
+  assert.equal(restored.records.categories.find(record => record.id === 'category-b')?.deletedAt, LATER);
+  assert.equal(restored.records.categories.find(record => record.id === restoredSecond.id)?.deletedAt, null);
+});
+
+test('whole-notebook replacement persists category order, task order, and cross-category task moves', async () => {
+  const store = new InMemoryLocalStateStore();
+  const repository = new TransactionalLocalRepository(store, dependencies('ordering'));
+  await repository.initialize(legacyJson());
+  const initial = await repository.readModel();
+  const [first, second] = initial.notebook.categories;
+  const [alpha, beta] = first.tasks;
+
+  await repository.replaceNotebook({
+    notebook: {
+      categories: [
+        { ...second, tasks: [beta, alpha] },
+        { ...first, tasks: [] },
+      ],
+    },
+    editedAt: LATER,
+    deviceId: initial.syncState.deviceId,
+  });
+
+  const moved = await repository.readModel();
+  assert.deepEqual(moved.notebook.categories.map(category => category.id), ['category-b', 'category-a']);
+  assert.deepEqual(moved.notebook.categories[0].tasks.map(task => task.id), ['task-b', 'task-a']);
+  assert.ok(moved.records.tasks.every(task => task.categoryId === 'category-b'));
 });

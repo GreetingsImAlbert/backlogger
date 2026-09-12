@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeStoredDocument, parseStoredDocument, parseStoredText, readStoredBackup, SCHEMA_VERSION, writeStoredDocument } from '../src/storage.ts';
+import { makePortableDocument, makeStoredDocument, parsePortableText, parseStoredDocument, parseStoredText, readStoredBackup, SCHEMA_VERSION, writeStoredDocument } from '../src/storage.ts';
 
 const notebook = {
   categories: [{
@@ -77,4 +77,18 @@ test('browser writes keep the last valid document as a backup', async () => {
   } finally {
     delete globalThis.window;
   }
+});
+
+test('portable exports contain only active content and revision while legacy exports remain importable', () => {
+  const portable = makePortableDocument(notebook, 12);
+  assert.deepEqual(Object.keys(portable).sort(), ['categories', 'revision', 'schemaVersion']);
+  assert.equal('preferences' in portable, false);
+  assert.equal('syncState' in portable, false);
+  assert.deepEqual(parsePortableText(JSON.stringify(portable)), portable);
+
+  const legacy = makeStoredDocument(notebook, 7, 'today', 'light', 'forest');
+  const migrated = parsePortableText(JSON.stringify(legacy));
+  assert.equal(migrated.revision, 7);
+  assert.deepEqual(migrated.categories, legacy.categories);
+  assert.equal('preferences' in migrated, false);
 });

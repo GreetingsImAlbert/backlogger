@@ -1,6 +1,7 @@
 import { normalizeDates } from '../dates.ts';
+import type { Notebook } from '../model.ts';
 import type { StoredDocument } from '../storage.ts';
-import { parseStoredText } from '../storage.ts';
+import { PORTABLE_SCHEMA_VERSION, parsePortableDocument, parsePortableText, parseStoredText } from '../storage.ts';
 import {
   CATEGORY_SYNC_FIELDS,
   RECORD_SYNC_STATE_VERSION,
@@ -43,6 +44,7 @@ import {
   type LocalStateStore,
   type OutboxAttemptInput,
   type ReorderRecordsInput,
+  type ReplaceNotebookInput,
   type SoftDeleteInput,
 } from './types.ts';
 
@@ -54,6 +56,7 @@ const DEFAULT_PREFERENCES: LocalPreferences = {
 
 const SNAPSHOT_KEYS = [
   'schemaVersion',
+  'documentRevision',
   'categories',
   'tasks',
   'bases',
@@ -64,6 +67,8 @@ const SNAPSHOT_KEYS = [
   'legacyImportComplete',
   'legacyImportedAt',
 ] as const;
+
+const LEGACY_SNAPSHOT_KEYS = SNAPSHOT_KEYS.filter(key => key !== 'documentRevision');
 
 function cloneValue<Value>(value: Value): Value {
   return JSON.parse(JSON.stringify(value)) as Value;
@@ -172,7 +177,7 @@ function parseRecoveryBackup(value: unknown, now: number): LocalRecoveryBackup {
   if (!isObject(value)) throw new Error('Local recovery backup must be an object.');
   assertExactKeys(value, ['backupId', 'createdAt', 'reason', 'documentJson'], 'Local recovery backup');
   const documentJson = requiredString(value.documentJson, 'Local recovery backup.documentJson');
-  parseStoredText(documentJson);
+  parsePortableText(documentJson);
   return {
     backupId: requiredString(value.backupId, 'Local recovery backup.backupId'),
     createdAt: canonicalTimestamp(value.createdAt, 'Local recovery backup.createdAt', now),
@@ -193,13 +198,42 @@ function recordsEqual(first: LocalSyncRecord, second: LocalSyncRecord): boolean 
   return JSON.stringify(first) === JSON.stringify(second);
 }
 
+function projectNotebook(state: LocalRepositorySnapshot): Notebook {
+  const activeCategories = state.categories
+    .filter(category => category.deletedAt === null)
+    .sort(compareBySortKeyThenId);
+  const activeCategoryIds = new Set(activeCategories.map(category => category.id));
+  const tasksByCategory = new Map<string, TaskSyncRecord[]>();
+  for (const task of state.tasks) {
+    if (task.deletedAt !== null || !activeCategoryIds.has(task.categoryId)) continue;
+    const tasks = tasksByCategory.get(task.categoryId) ?? [];
+    tasks.push(task);
+    tasksByCategory.set(task.categoryId, tasks);
+  }
+  return {
+    categories: activeCategories.map(category => ({
+      id: category.id,
+      name: category.name,
+      tasks: (tasksByCategory.get(category.id) ?? [])
+        .sort(compareBySortKeyThenId)
+        .map(task => ({
+          id: task.id,
+          title: task.title,
+          scheduledDates: [...task.scheduledDates],
+          deadlineDate: task.deadlineDate,
+        })),
+    })),
+  };
+}
+
 export function parseLocalRepositorySnapshot(
   value: unknown,
   options: { now?: number } = {},
 ): LocalRepositorySnapshot {
   if (!isObject(value)) throw new Error('Local repository snapshot must be an object.');
-  assertExactKeys(value, SNAPSHOT_KEYS, 'Local repository snapshot');
-  if (value.schemaVersion !== LOCAL_REPOSITORY_SCHEMA_VERSION) {
+  const legacySnapshot = value.schemaVersion === 1;
+  assertExactKeys(value, legacySnapshot && !Object.hasOwn(value, 'documentRevision') ? LEGACY_SNAPSHOT_KEYS : SNAPSHOT_KEYS, 'Local repository snapshot');
+  if (!legacySnapshot && value.schemaVersion !== LOCAL_REPOSITORY_SCHEMA_VERSION) {
     throw new Error('Local repository snapshot uses an unsupported schema version.');
   }
   if (!Array.isArray(value.categories) || !Array.isArray(value.tasks) || !Array.isArray(value.bases)) {
@@ -273,8 +307,21 @@ export function parseLocalRepositorySnapshot(
   if (!legacyImportComplete && legacyImportedAt !== null) {
     throw new Error('An incomplete legacy import cannot have a completion time.');
   }
+  const migratedDocumentRevision = recoveryBackups.reduce((highest, backup) => {
+    try {
+      return Math.max(highest, parsePortableText(backup.documentJson).revision);
+    } catch {
+      return highest;
+    }
+  }, 0);
+  const storedDocumentRevision = Object.hasOwn(value, 'documentRevision')
+    ? nonnegativeInteger(value.documentRevision, 'Local document revision')
+    : 0;
   return {
     schemaVersion: LOCAL_REPOSITORY_SCHEMA_VERSION,
+    documentRevision: legacySnapshot
+      ? Math.max(storedDocumentRevision, migratedDocumentRevision)
+      : storedDocumentRevision,
     categories,
     tasks,
     bases,
@@ -290,6 +337,7 @@ export function parseLocalRepositorySnapshot(
 function defaultSnapshot(deviceId: string): LocalRepositorySnapshot {
   return {
     schemaVersion: LOCAL_REPOSITORY_SCHEMA_VERSION,
+    documentRevision: 0,
     categories: [],
     tasks: [],
     bases: [],
@@ -476,6 +524,7 @@ export class TransactionalLocalRepository implements LocalRepository {
           });
         });
         draft.preferences = cloneValue(document.preferences);
+        draft.documentRevision = document.revision;
         backupId = this.createId();
         draft.recoveryBackups.push({
           backupId,
@@ -512,32 +561,9 @@ export class TransactionalLocalRepository implements LocalRepository {
   async readModel(): Promise<LocalReadModel> {
     return this.serialize(async () => {
       const state = await this.loadedState();
-      const activeCategories = state.categories
-        .filter(category => category.deletedAt === null)
-        .sort(compareBySortKeyThenId);
-      const activeCategoryIds = new Set(activeCategories.map(category => category.id));
-      const tasksByCategory = new Map<string, TaskSyncRecord[]>();
-      for (const task of state.tasks) {
-        if (task.deletedAt !== null || !activeCategoryIds.has(task.categoryId)) continue;
-        const tasks = tasksByCategory.get(task.categoryId) ?? [];
-        tasks.push(task);
-        tasksByCategory.set(task.categoryId, tasks);
-      }
       return {
-        notebook: {
-          categories: activeCategories.map(category => ({
-            id: category.id,
-            name: category.name,
-            tasks: (tasksByCategory.get(category.id) ?? [])
-              .sort(compareBySortKeyThenId)
-              .map(task => ({
-                id: task.id,
-                title: task.title,
-                scheduledDates: [...task.scheduledDates],
-                deadlineDate: task.deadlineDate,
-              })),
-            })),
-        },
+        notebook: projectNotebook(state),
+        documentRevision: state.documentRevision,
         records: {
           categories: cloneValue(state.categories),
           tasks: cloneValue(state.tasks),
@@ -582,6 +608,7 @@ export class TransactionalLocalRepository implements LocalRepository {
       setCursor: lastChangeSeq => this.setCursorIn(draft, lastChangeSeq),
       setSyncState: state => this.setSyncStateIn(draft, state),
       setPreferences: preferences => this.setPreferencesIn(draft, preferences),
+      replaceNotebook: input => this.replaceNotebookIn(draft, input),
       createRecoveryBackup: (documentJson, reason) => this.createRecoveryBackupIn(draft, documentJson, reason),
       listRecoveryBackups: () => this.listRecoveryBackupsIn(draft),
     };
@@ -733,12 +760,13 @@ export class TransactionalLocalRepository implements LocalRepository {
     const existing = draft.tasks.find(record => record.id === recordId);
     if (!existing) throw new Error('The task does not exist.');
     if (existing.deletedAt !== null) throw new Error('A deleted task cannot be edited.');
-    const parent = draft.categories.find(record => record.id === existing.categoryId && record.deletedAt === null);
+    const destinationCategoryId = input.categoryId ?? existing.categoryId;
+    const parent = draft.categories.find(record => record.id === destinationCategoryId && record.deletedAt === null);
     if (!parent) throw new Error('A task under a deleted category cannot be edited.');
     const record = cloneValue(existing);
     const editClock = clock(input.editedAt, input.deviceId, this.validationNow());
     let changed = false;
-    for (const field of ['title', 'scheduledDates', 'deadlineDate', 'sortKey'] as const) {
+    for (const field of ['categoryId', 'title', 'scheduledDates', 'deadlineDate', 'sortKey'] as const) {
       if (!Object.hasOwn(input, field)) continue;
       const rawValue = input[field];
       if (rawValue === undefined) continue;
@@ -973,12 +1001,158 @@ export class TransactionalLocalRepository implements LocalRepository {
     draft.preferences = parsePreferences(preferences);
   }
 
+  private replaceNotebookIn(draft: LocalRepositorySnapshot, input: ReplaceNotebookInput): void {
+    const minimumRevision = input.minimumRevision === undefined
+      ? 0
+      : nonnegativeInteger(input.minimumRevision, 'Minimum document revision');
+    const portable = parsePortableDocument({
+      schemaVersion: PORTABLE_SCHEMA_VERSION,
+      revision: minimumRevision,
+      categories: input.notebook.categories,
+    });
+    const editedAt = clock(input.editedAt, input.deviceId, this.validationNow()).at;
+    const before = projectNotebook(draft);
+    if (input.recoveryBackup) {
+      this.createRecoveryBackupIn(
+        draft,
+        input.recoveryBackup.documentJson,
+        input.recoveryBackup.reason,
+      );
+    }
+
+    const freshId = (used: Set<string>): string => {
+      for (let attempt = 0; attempt < 1_000; attempt += 1) {
+        const candidate = this.createId();
+        if (!used.has(candidate)) {
+          used.add(candidate);
+          return candidate;
+        }
+      }
+      throw new Error('Could not allocate a unique local record ID.');
+    };
+
+    const usedCategoryIds = new Set(draft.categories.map(record => record.id));
+    const categoryIdMap = new Map<string, string>();
+    for (const category of portable.categories) {
+      const existing = draft.categories.find(record => record.id === category.id);
+      categoryIdMap.set(
+        category.id,
+        existing?.deletedAt ? freshId(usedCategoryIds) : category.id,
+      );
+    }
+    const desiredCategoryIds = portable.categories.map(category => categoryIdMap.get(category.id)!);
+    const currentCategoryIds = draft.categories
+      .filter(record => record.deletedAt === null)
+      .sort(compareBySortKeyThenId)
+      .map(record => record.id);
+    const categoryOrderChanged = JSON.stringify(currentCategoryIds) !== JSON.stringify(desiredCategoryIds);
+    const categorySortKeys = categoryOrderChanged ? generateEvenSortKeys(desiredCategoryIds.length) : [];
+
+    portable.categories.forEach((category, index) => {
+      const id = desiredCategoryIds[index];
+      const existing = draft.categories.find(record => record.id === id && record.deletedAt === null);
+      const sortKey = categoryOrderChanged ? categorySortKeys[index] : existing!.sortKey;
+      if (existing) {
+        this.editCategoryIn(draft, id, {
+          name: category.name,
+          sortKey,
+          editedAt,
+          deviceId: input.deviceId,
+        });
+      } else {
+        this.createCategoryIn(draft, {
+          id,
+          name: category.name,
+          sortKey,
+          editedAt,
+          deviceId: input.deviceId,
+        });
+      }
+    });
+
+    const usedTaskIds = new Set(draft.tasks.map(record => record.id));
+    const taskIdMap = new Map<string, string>();
+    for (const category of portable.categories) {
+      for (const task of category.tasks) {
+        const existing = draft.tasks.find(record => record.id === task.id);
+        taskIdMap.set(task.id, existing?.deletedAt ? freshId(usedTaskIds) : task.id);
+      }
+    }
+    const desiredTaskIds = new Set<string>();
+    for (const category of portable.categories) {
+      const categoryId = categoryIdMap.get(category.id)!;
+      const mappedTaskIds = category.tasks.map(task => taskIdMap.get(task.id)!);
+      mappedTaskIds.forEach(id => desiredTaskIds.add(id));
+      const currentTaskIds = draft.tasks
+        .filter(record => record.deletedAt === null && record.categoryId === categoryId)
+        .sort(compareBySortKeyThenId)
+        .map(record => record.id);
+      const taskOrderChanged = JSON.stringify(currentTaskIds) !== JSON.stringify(mappedTaskIds);
+      const taskSortKeys = taskOrderChanged ? generateEvenSortKeys(mappedTaskIds.length) : [];
+      category.tasks.forEach((task, index) => {
+        const id = mappedTaskIds[index];
+        const existing = draft.tasks.find(record => record.id === id && record.deletedAt === null);
+        const sortKey = taskOrderChanged ? taskSortKeys[index] : existing!.sortKey;
+        if (existing) {
+          this.editTaskIn(draft, id, {
+            categoryId,
+            title: task.title,
+            scheduledDates: task.scheduledDates,
+            deadlineDate: task.deadlineDate,
+            sortKey,
+            editedAt,
+            deviceId: input.deviceId,
+          });
+        } else {
+          this.createTaskIn(draft, {
+            id,
+            categoryId,
+            title: task.title,
+            scheduledDates: task.scheduledDates,
+            deadlineDate: task.deadlineDate,
+            sortKey,
+            editedAt,
+            deviceId: input.deviceId,
+          });
+        }
+      });
+    }
+
+    for (const task of [...draft.tasks]) {
+      if (task.deletedAt === null && !desiredTaskIds.has(task.id)) {
+        this.softDeleteIn(draft, {
+          recordType: 'task',
+          recordId: task.id,
+          deletedAt: editedAt,
+          deviceId: input.deviceId,
+        });
+      }
+    }
+    const desiredCategoryIdSet = new Set(desiredCategoryIds);
+    for (const category of [...draft.categories]) {
+      if (category.deletedAt === null && !desiredCategoryIdSet.has(category.id)) {
+        this.softDeleteIn(draft, {
+          recordType: 'category',
+          recordId: category.id,
+          deletedAt: editedAt,
+          deviceId: input.deviceId,
+        });
+      }
+    }
+
+    const contentChanged = JSON.stringify(before) !== JSON.stringify(projectNotebook(draft));
+    draft.documentRevision = Math.max(
+      minimumRevision,
+      draft.documentRevision + (contentChanged ? 1 : 0),
+    );
+  }
+
   private createRecoveryBackupIn(
     draft: LocalRepositorySnapshot,
     documentJson: string,
     reason: string,
   ): LocalRecoveryBackup {
-    parseStoredText(documentJson);
+    parsePortableText(documentJson);
     const backup: LocalRecoveryBackup = {
       backupId: this.createId(),
       createdAt: this.timestamp(),
@@ -1059,6 +1233,10 @@ export class TransactionalLocalRepository implements LocalRepository {
 
   setPreferences(preferences: LocalPreferences): Promise<void> {
     return this.transaction(transaction => transaction.setPreferences(preferences));
+  }
+
+  replaceNotebook(input: ReplaceNotebookInput): Promise<void> {
+    return this.transaction(transaction => transaction.replaceNotebook(input));
   }
 
   createRecoveryBackup(documentJson: string, reason: string): Promise<LocalRecoveryBackup> {

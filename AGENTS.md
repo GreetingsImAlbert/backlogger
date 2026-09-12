@@ -69,6 +69,6 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 - Preserve unrelated changes in the working tree and keep secrets, tokens, signing keys, and machine-specific credentials out of Git.
 - The user runs Supabase migrations, resets, links, pushes, and database tests manually; prepare the files and commands, but do not run remote or destructive Supabase operations on their behalf.
 - The user creates Git commits manually; do not commit or amend history unless explicitly requested.
-- A sole user prompt of `cm` means: provide a commit message covering every uncommitted change since the last commit, following the repository's existing title, blank line, and bullet format. Always place the entire commit message inside a fenced `text` code block.
+- A sole user prompt of `cm` means: provide a concise commit message covering every uncommitted change since the last commit, following the repository's existing title, blank line, and bullet format. Summarize major changes rather than listing implementation details. Always place the entire commit message inside a fenced `text` code block.
 - Run the checks relevant to every changed layer. Record each mobile milestone's concise handoff and evidence beneath that milestone in `mobile-implementation.md`.
 - Do not recreate the retired `PLAN.md`, `PROGRESS.md`, `feature.md`, `feature_drop.md`, or `FEATURES.md` files.

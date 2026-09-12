@@ -19,12 +19,20 @@ const LOCAL_DATABASE_URL: &str = "sqlite:backlogger-v2.db";
 static OAUTH_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn local_database_migrations() -> Vec<Migration> {
-    vec![Migration {
-        version: 1,
-        description: "create_local_sync_v2_repository",
-        sql: include_str!("../migrations/0001_local_sync_v2.sql"),
-        kind: MigrationKind::Up,
-    }]
+    vec![
+        Migration {
+            version: 1,
+            description: "create_local_sync_v2_repository",
+            sql: include_str!("../migrations/0001_local_sync_v2.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 2,
+            description: "add_local_document_revision",
+            sql: include_str!("../migrations/0002_local_document_revision.sql"),
+            kind: MigrationKind::Up,
+        },
+    ]
 }
 
 #[derive(Deserialize)]

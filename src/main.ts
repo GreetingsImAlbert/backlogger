@@ -3,9 +3,15 @@ import { open as openNativeFile, save as saveNativeFile } from '@tauri-apps/plug
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { centeredWeekStart, compactDate, compactDateList, dateLabel, localToday, normalizeDates, parseDate, shiftDate, weekdayCode } from './dates';
 import type { Category, Notebook, Task } from './model';
+import {
+  openLocalRepository,
+  openLocalRepositoryFromLegacyBackup,
+  readLegacyRecoveryCandidate,
+  type LocalRepository,
+} from './local-db';
 import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
-import { makeStoredDocument, parseStoredText, readDocumentFile, readStoredBackup, readStoredDocument, setNativeTheme, storageKind, writeDocumentFile, writeStoredDocument, type ColorTheme, type StoredDocument, type Theme, type ViewMode } from './storage';
+import { makePortableDocument, makeStoredDocument, parsePortableText, readDocumentFile, setNativeTheme, storageKind, writeDocumentFile, type ColorTheme, type PortableDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
 import { hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, makeCheckpointSnapshot, makeSyncManifest, makeSyncSnapshot, makeSyncState, mergeEverything, notebookFingerprint, notebookFromSnapshot, parseSyncSnapshot, saveSyncState, snapshotFingerprint, snapshotLeaves, storedDocumentFromSyncSnapshot, SYNC_SNAPSHOT_RETENTION_LIMIT, type SyncManifest, type SyncSnapshot, type SyncState, type SupabaseLocation } from './sync';
 import { SyncCoordinator } from './sync/coordinator';
 import { SupabaseSyncTransport } from './sync/supabase-transport';
@@ -17,6 +23,8 @@ const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('App container is missing.');
 const capabilities = platformCapabilities();
 let notebook: Notebook = { categories: [] };
+let localRepository: LocalRepository | null = null;
+let localDeviceId = '';
 let hasUnsavedChanges = false;
 let viewMode: ViewMode = 'all';
 let theme: Theme = 'dark';
@@ -26,6 +34,7 @@ let storageReady = false;
 let storageBlocked = false;
 let saveSequence = 0;
 let saveQueue: Promise<void> = Promise.resolve();
+let retryLocalWrite: (() => Promise<void>) | null = null;
 let undoState: Notebook | null = null;
 let undoTimer: ReturnType<typeof setTimeout> | undefined;
 let syncState: SyncState = makeSyncState('pending');
@@ -134,7 +143,7 @@ function actionMenu(label: string, items: HTMLButtonElement[]) {
 }
 
 function editingIsReady(): boolean {
-  return storageReady && !storageBlocked && !closeInProgress && (sessionPhase === 'ready' || sessionPhase === 'offline');
+  return storageReady && !storageBlocked && !closeInProgress && !hasUnsavedChanges;
 }
 
 function clearDropIndicator() {
@@ -249,8 +258,8 @@ function commitPointerDrop(state: DragState, target: HTMLElement, position: Drop
       ? reorderCategories(notebook.categories, state.categoryId, targetCategoryId, position)
       : null;
     if (!sourceCategory || !targetCategory || !reordered) return;
-    commit(() => {
-      notebook.categories = reordered;
+    void commit(draft => {
+      draft.categories = reordered;
     }, `Moved ${sourceCategory.name} ${position} ${targetCategory.name}.`);
     return;
   }
@@ -271,8 +280,8 @@ function commitPointerDrop(state: DragState, target: HTMLElement, position: Drop
     )
     : null;
   if (!sourceTask || !targetTask || !reordered) return;
-  commit(() => {
-    notebook.categories = reordered;
+  void commit(draft => {
+    draft.categories = reordered;
   }, `Moved ${sourceTask.title} ${position} ${targetTask.title}.`);
 }
 
@@ -329,9 +338,7 @@ const themePopover = element('div', 'theme-popover');
 themePopover.setAttribute('role', 'group');
 themePopover.setAttribute('aria-label', 'Appearance');
 const modeButton = iconButton('sun', 'Switch to light mode', () => {
-  theme = theme === 'dark' ? 'light' : 'dark';
-  applyTheme();
-  queueSave(false);
+  void updatePreferences({ theme: theme === 'dark' ? 'light' : 'dark' });
 });
 const paletteDivider = element('span', 'theme-divider');
 paletteDivider.setAttribute('aria-hidden', 'true');
@@ -344,9 +351,7 @@ const paletteOptions: Array<{ id: ColorTheme; label: string; color: string }> = 
 ];
 const paletteButtons = paletteOptions.map(option => {
   const swatch = button('', () => {
-    colorTheme = option.id;
-    applyTheme();
-    queueSave(false);
+    void updatePreferences({ colorTheme: option.id });
   }, 'theme-swatch');
   swatch.style.setProperty('--swatch-color', option.color);
   swatch.setAttribute('aria-label', `${option.label} color theme`);
@@ -382,7 +387,7 @@ const noticeTitle = element('strong');
 const noticeDetail = element('span');
 const noticeActions = element('span', 'storage-actions');
 const recoverButton = button('Recover backup', () => void recoverBackup(), 'quiet-button');
-const retrySaveButton = button('Retry save', () => queueSave(), 'quiet-button');
+const retrySaveButton = button('Retry save', () => void retryLocalWrite?.(), 'quiet-button');
 recoverButton.hidden = true;
 retrySaveButton.hidden = true;
 noticeActions.append(recoverButton, retrySaveButton);
@@ -423,14 +428,10 @@ importInput.addEventListener('change', () => {
   if (file) void inspectImport(file);
 });
 const undoButton = button('Undo', () => {
-  if (!undoState || storageBlocked || closeInProgress || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
-  notebook = undoState;
+  if (!undoState || !editingIsReady()) return;
+  const restored = structuredClone(undoState);
   clearUndo();
-  sessionContentDirty = true;
-  render();
-  queueSave();
-  setStatusMessage('Deletion undone.');
-  focusWithoutScrolling(addCategory);
+  void commitNotebookReplacement(restored, 'Deletion undone.').then(() => focusWithoutScrolling(addCategory));
 });
 undoButton.hidden = true;
 const actions = element('div', 'bottom-actions');
@@ -495,9 +496,7 @@ function applyTheme() {
 }
 
 function setView(mode: ViewMode) {
-  viewMode = mode;
-  render();
-  queueSave(false);
+  void updatePreferences({ viewMode: mode });
 }
 
 function taskCount(categories: Notebook['categories']): number {
@@ -509,7 +508,7 @@ async function exportCurrentDocument() {
     setStatusMessage('Import and export will be available on Android in a later milestone.');
     return;
   }
-  const stored = makeStoredDocument(notebook, revision, viewMode, theme, colorTheme);
+  const stored = makePortableDocument(notebook, revision);
   const raw = JSON.stringify(stored, null, 2);
   try {
     if (capabilities.nativeDocuments) {
@@ -538,13 +537,13 @@ async function exportCurrentDocument() {
 }
 
 interface ImportPayload {
-  document: StoredDocument;
+  document: PortableDocument;
   syncSnapshot: SyncSnapshot | null;
 }
 
 function parseImportPayload(raw: string): ImportPayload {
   try {
-    return { document: parseStoredText(raw), syncSnapshot: null };
+    return { document: parsePortableText(raw), syncSnapshot: null };
   } catch (storedError) {
     let value: unknown;
     try {
@@ -554,14 +553,17 @@ function parseImportPayload(raw: string): ImportPayload {
     }
     try {
       const snapshot = parseSyncSnapshot(value, 'Sync snapshot');
-      return { document: storedDocumentFromSyncSnapshot(snapshot, viewMode, theme, colorTheme), syncSnapshot: snapshot };
+      return {
+        document: makePortableDocument(notebookFromSnapshot(snapshot), snapshot.revision),
+        syncSnapshot: snapshot,
+      };
     } catch {
       throw storedError;
     }
   }
 }
 
-function showImportDialog(fileName: string, imported: StoredDocument, syncSnapshot: SyncSnapshot | null = null) {
+function showImportDialog(fileName: string, imported: PortableDocument, syncSnapshot: SyncSnapshot | null = null) {
   const editor = openDialog('Import backlog?');
   editor.body.append(
     element('p', '', `Import “${fileName}” and replace the current list?`),
@@ -571,12 +573,19 @@ function showImportDialog(fileName: string, imported: StoredDocument, syncSnapsh
     editor.body.append(element('p', 'advisory', `This is a Backlogger sync snapshot from ${formatSyncCheckTime(syncSnapshot.createdAt) || 'an earlier time'}. It was converted to a normal local import; device theme and view stay local.`));
   }
   editor.save.textContent = syncSnapshot ? 'Import snapshot and save' : 'Import and save';
-  editor.form.addEventListener('submit', event => {
+  editor.form.addEventListener('submit', async event => {
     event.preventDefault();
-    commit(() => {
-      notebook = { categories: imported.categories };
-      viewMode = imported.preferences.viewMode;
-      revision = Math.max(revision, imported.revision);
+    editor.save.disabled = true;
+    const saved = await commitNotebookReplacement(
+      { categories: imported.categories },
+      syncSnapshot ? `Recovered ${fileName} as a local import.` : `Imported ${fileName}.`,
+      {
+        canUndo: true,
+        minimumRevision: imported.revision,
+        recoveryReason: 'before-import-replacement',
+      },
+    );
+    if (saved) {
       if (syncSnapshot && capabilities.supabaseSync && hasCloudBinding() && syncState.status !== 'disconnected') {
         syncState.currentSnapshotId = syncSnapshot.snapshotId;
         syncState.knownHeadSnapshotIds = [...new Set([...syncState.knownHeadSnapshotIds, syncSnapshot.snapshotId])];
@@ -585,11 +594,20 @@ function showImportDialog(fileName: string, imported: StoredDocument, syncSnapsh
         syncState.mergeParentSnapshotIds = [];
         syncState.conflicts = [];
         syncState.lastError = null;
+        try {
+          await saveSyncState(syncState);
+        } catch (error) {
+          syncState.lastError = errorText(error);
+          setSyncFailureStatus(`The backlog was imported locally, but sync metadata could not be saved: ${syncState.lastError}`);
+        }
       }
       storageBlocked = false;
       recoverButton.hidden = true;
-    }, syncSnapshot ? `Recovered ${fileName} as a local import.` : `Imported ${fileName}.`, true);
-    editor.dialog.close();
+      editor.dialog.close();
+    } else {
+      editor.save.disabled = false;
+      editor.error.textContent = 'The import was validated but could not be saved locally.';
+    }
   });
 }
 
@@ -997,10 +1015,17 @@ function checkForSharedUpdate(allowFetching = false): Promise<AvailableUpdate | 
 }
 
 async function applyFetchedSnapshot(snapshot: SyncSnapshot): Promise<void> {
-  const localDocument = makeStoredDocument(notebook, revision, viewMode, theme, colorTheme);
-  await writeStoredDocument(localDocument);
-  notebook = notebookFromSnapshot(snapshot);
-  revision = Math.max(revision, snapshot.revision);
+  const backup = JSON.stringify(makePortableDocument(notebook, revision), null, 2);
+  await performLocalWrite(
+    repository => repository.replaceNotebook({
+      notebook: notebookFromSnapshot(snapshot),
+      editedAt: new Date().toISOString(),
+      deviceId: localDeviceId,
+      minimumRevision: snapshot.revision,
+      recoveryBackup: { documentJson: backup, reason: 'before-cloud-fetch-replacement' },
+    }),
+    { retryOperation: () => applyFetchedSnapshot(snapshot) },
+  );
   syncState.currentSnapshotId = snapshot.snapshotId;
   syncState.lastPublishedSnapshotId = snapshot.snapshotId;
   syncState.lastPublishedRevision = snapshot.revision;
@@ -1014,8 +1039,6 @@ async function applyFetchedSnapshot(snapshot: SyncSnapshot): Promise<void> {
   syncState.lastError = null;
   sessionContentDirty = false;
   availableUpdate = null;
-  queueSave(false);
-  await saveQueue;
   await saveSyncState(syncState);
 }
 
@@ -1124,15 +1147,23 @@ function askFetchConfirmation(): Promise<CloudDifferenceAction | null> {
 }
 
 async function applyEverythingMerge(snapshot: SyncSnapshot): Promise<void> {
-  await writeStoredDocument(makeStoredDocument(notebook, revision, viewMode, theme, colorTheme));
   const merged = mergeEverything(notebook, notebookFromSnapshot(snapshot));
   if (notebookFingerprint(merged) === snapshotFingerprint(snapshot)) {
     await applyFetchedSnapshot(snapshot);
     setStatusMessage('Everything was already included in the cloud backlog; no merge snapshot was needed.');
     return;
   }
-  notebook = merged;
-  revision = Math.max(revision, snapshot.revision);
+  const backup = JSON.stringify(makePortableDocument(notebook, revision), null, 2);
+  await performLocalWrite(
+    repository => repository.replaceNotebook({
+      notebook: merged,
+      editedAt: new Date().toISOString(),
+      deviceId: localDeviceId,
+      minimumRevision: snapshot.revision,
+      recoveryBackup: { documentJson: backup, reason: 'before-cloud-merge' },
+    }),
+    { retryOperation: () => applyEverythingMerge(snapshot) },
+  );
   const currentId = acceptedSnapshotId();
   syncState.pendingSnapshots = [];
   syncState.mergeParentSnapshotIds = [...new Set([currentId, snapshot.snapshotId].filter((id): id is string => Boolean(id)))];
@@ -1142,8 +1173,9 @@ async function applyEverythingMerge(snapshot: SyncSnapshot): Promise<void> {
   syncState.lastError = null;
   availableUpdate = null;
   sessionContentDirty = true;
+  saveSequence += 1;
   await saveSyncState(syncState);
-  queueSave(true);
+  scheduleSyncPublication(saveSequence, 0);
   setSyncStatusMessage('Saving and publishing the combined local and cloud backlog.');
   render();
 }
@@ -1229,6 +1261,9 @@ async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: numb
     syncDeferred = true;
     return { applied: 0, conflicts: syncState.conflicts.length };
   }
+  if (sessionContentDirty && !syncState.pendingSnapshots.length) {
+    return { applied: 0, conflicts: syncState.conflicts.length };
+  }
   if (syncState.conflicts.length) return { applied: 0, conflicts: syncState.conflicts.length };
   const manifest = await coordinator.readManifest();
   if (!manifest || manifest.notebookId !== syncState.notebookId) throw new Error('The connected cloud notebook has no matching manifest.');
@@ -1241,14 +1276,22 @@ async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: numb
     if (!syncState.pendingSnapshots.length) {
       const fallback = completeLeaves.at(-1);
       if (fallback) {
-        notebook = notebookFromSnapshot(fallback);
-        revision = Math.max(revision, fallback.revision);
+        const backup = JSON.stringify(makePortableDocument(notebook, revision), null, 2);
+        await performLocalWrite(
+          repository => repository.replaceNotebook({
+            notebook: notebookFromSnapshot(fallback),
+            editedAt: new Date().toISOString(),
+            deviceId: localDeviceId,
+            minimumRevision: fallback.revision,
+            recoveryBackup: { documentJson: backup, reason: 'before-cloud-recovery' },
+          }),
+          { retryOperation: () => reconcileSync().then(() => undefined) },
+        );
         syncState.currentSnapshotId = fallback.snapshotId;
         syncState.lastPublishedContentFingerprint = snapshotFingerprint(fallback);
         syncState.processedSnapshotIds = [...new Set([...syncState.processedSnapshotIds, ...snapshotAncestry(fallback.snapshotId, snapshots)])];
         syncState.lastError = null;
         await saveSyncState(syncState);
-        queueSave(false);
         render();
         setStatusMessage('Recovered the latest validated shared snapshot.');
         return { applied: 1, conflicts: 0 };
@@ -1294,17 +1337,28 @@ async function reconcileSyncUnsafe(): Promise<{ applied: number; conflicts: numb
     break;
   }
   if (applied && !syncState.conflicts.length) {
-    notebook = workingNotebook;
-    revision = Math.max(revision, ...leaves.map(snapshot => snapshot.revision), revision);
+    const remoteRevision = Math.max(revision, ...leaves.map(snapshot => snapshot.revision), revision);
+    const backup = JSON.stringify(makePortableDocument(notebook, revision), null, 2);
+    await performLocalWrite(
+      repository => repository.replaceNotebook({
+        notebook: workingNotebook,
+        editedAt: new Date().toISOString(),
+        deviceId: localDeviceId,
+        minimumRevision: remoteRevision,
+        recoveryBackup: { documentJson: backup, reason: 'before-cloud-reconciliation' },
+      }),
+      { retryOperation: () => reconcileSync().then(() => undefined) },
+    );
     if (syncState.currentSnapshotId) {
-      syncState.lastPublishedRevision = revision + 1;
+      syncState.lastPublishedRevision = revision;
       await saveSyncState(syncState);
-      queueSave(false);
       render();
       setStatusMessage(`Applied ${applied} remote snapshot${applied === 1 ? '' : 's'}.`);
     } else {
       await saveSyncState(syncState);
-      queueSave(true);
+      sessionContentDirty = true;
+      saveSequence += 1;
+      scheduleSyncPublication(saveSequence, 0);
       render();
       setSyncStatusMessage('Saving and publishing the combined local and cloud backlog.');
     }
@@ -1728,8 +1782,9 @@ function openSyncDialog() {
     syncState.conflicts = [];
     syncState.lastError = null;
     sessionContentDirty = true;
+    saveSequence += 1;
     await saveSyncState(syncState);
-    queueSave(true);
+    scheduleSyncPublication(saveSequence, 0);
     setSyncStatusMessage('Saving and publishing the combined local and cloud backlog.');
     refresh();
   }
@@ -1767,10 +1822,147 @@ function openSyncDialog() {
   refresh();
 }
 
+async function refreshLocalProjection(): Promise<void> {
+  if (!localRepository) throw new Error('The local repository is not open.');
+  const model = await localRepository.readModel();
+  notebook = model.notebook;
+  revision = model.documentRevision;
+  viewMode = model.preferences.viewMode;
+  theme = model.preferences.theme;
+  colorTheme = model.preferences.colorTheme;
+  localDeviceId = model.syncState.deviceId;
+  applyTheme();
+}
+
+interface LocalWriteOptions {
+  contentChanged?: boolean;
+  publishImmediately?: boolean;
+  afterCommit?: () => void | Promise<void>;
+  retryOperation?: () => Promise<void>;
+}
+
+async function performLocalWrite(
+  operation: (repository: LocalRepository) => Promise<void>,
+  options: LocalWriteOptions = {},
+): Promise<void> {
+  if (!storageReady || storageBlocked || closeInProgress || !localRepository) {
+    throw new Error('Local data is not ready for changes.');
+  }
+  hasUnsavedChanges = true;
+  retrySaveButton.hidden = true;
+  setStorageNotice(
+    'Saving locally…',
+    capabilities.nativeLocalStorage ? 'Committing to the local database.' : 'Committing to browser preview storage.',
+  );
+  render();
+  const write = saveQueue.then(async () => {
+    await operation(localRepository!);
+    await refreshLocalProjection();
+  });
+  saveQueue = write.then(() => undefined, () => undefined);
+  try {
+    await write;
+    if (options.contentChanged) {
+      sessionContentDirty = true;
+      saveSequence += 1;
+    }
+    await options.afterCommit?.();
+    hasUnsavedChanges = false;
+    retryLocalWrite = null;
+    retrySaveButton.hidden = true;
+    setStorageNotice(
+      'Saved locally',
+      capabilities.nativeLocalStorage ? 'Your backlog is stored in this device database.' : 'Preview data is stored in this browser.',
+    );
+    if (options.contentChanged) {
+      scheduleSyncPublication(
+        saveSequence,
+        options.publishImmediately ? 0 : SYNC_PUBLICATION_DEBOUNCE_MS,
+      );
+    }
+    render();
+  } catch (error) {
+    retryLocalWrite = () => (options.retryOperation?.() ?? performLocalWrite(operation, options)).catch(() => undefined);
+    retrySaveButton.hidden = false;
+    setStorageNotice('Save failed', 'The attempted change was not committed. Retry the local transaction when ready.');
+    setStatusMessage(`Could not save local data: ${errorText(error)}`);
+    render();
+    throw error;
+  }
+}
+
+async function updatePreferences(update: Partial<{ viewMode: ViewMode; theme: Theme; colorTheme: ColorTheme }>) {
+  const next = { viewMode, theme, colorTheme, ...update };
+  try {
+    await performLocalWrite(repository => repository.setPreferences(next));
+  } catch {
+    // The persistent status and retry action already describe the failure.
+  }
+}
+
+interface NotebookCommitOptions {
+  canUndo?: boolean;
+  minimumRevision?: number;
+  publishImmediately?: boolean;
+  recoveryReason?: string;
+}
+
+async function commitNotebookReplacement(
+  nextNotebook: Notebook,
+  message: string,
+  options: NotebookCommitOptions = {},
+): Promise<boolean> {
+  if (!editingIsReady() || !localRepository) return false;
+  const previousNotebook = structuredClone(notebook);
+  const contentChanged = notebookFingerprint(previousNotebook) !== notebookFingerprint(nextNotebook);
+  const recoveryBackup = options.recoveryReason
+    ? {
+        documentJson: JSON.stringify(makePortableDocument(previousNotebook, revision), null, 2),
+        reason: options.recoveryReason,
+      }
+    : undefined;
+  clearUndo();
+  try {
+    await performLocalWrite(
+      repository => repository.replaceNotebook({
+        notebook: nextNotebook,
+        editedAt: new Date().toISOString(),
+        deviceId: localDeviceId,
+        minimumRevision: options.minimumRevision,
+        recoveryBackup,
+      }),
+      {
+        contentChanged,
+        publishImmediately: options.publishImmediately,
+        afterCommit: () => {
+          if (options.canUndo) undoState = previousNotebook;
+        },
+      },
+    );
+    if (syncState.lastError) setSyncFailureStatus(syncState.lastError);
+    else if (options.canUndo) setStatusMessage(message);
+    else setStatusMessage('');
+    undoButton.hidden = !options.canUndo;
+    if (options.canUndo) {
+      undoTimer = setTimeout(() => {
+        const focused = document.activeElement === undoButton;
+        clearUndo();
+        if (syncState.lastError) setSyncFailureStatus(syncState.lastError);
+        else setStatusMessage('');
+        if (focused) focusWithoutScrolling(addCategory);
+      }, 15_000);
+      focusWithoutScrolling(undoButton);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function recoverBackup() {
   recoverButton.disabled = true;
   try {
-    const backup = await readStoredBackup();
+    const backup = await readLegacyRecoveryCandidate();
     if (!backup) {
       setStatusMessage('No valid local backup was found.');
       return;
@@ -1781,55 +1973,28 @@ async function recoverBackup() {
       element('p', 'import-summary', `Recover ${backup.categories.length} categor${backup.categories.length === 1 ? 'y' : 'ies'} and ${taskCount(backup.categories)} task(s) from the last valid backup?`),
     );
     editor.save.textContent = 'Recover and save';
-    editor.form.addEventListener('submit', event => {
+    editor.form.addEventListener('submit', async event => {
       event.preventDefault();
-      commit(() => {
-        notebook = { categories: backup.categories };
-        viewMode = backup.preferences.viewMode;
-        revision = backup.revision;
+      editor.save.disabled = true;
+      try {
+        localRepository = await openLocalRepositoryFromLegacyBackup();
+        await refreshLocalProjection();
         storageBlocked = false;
         recoverButton.hidden = true;
-      }, 'Backup recovered.', true);
-      editor.dialog.close();
+        setStorageNotice('Saved locally', 'Your backlog is stored in this device database.');
+        setStatusMessage('Backup recovered.');
+        render();
+        editor.dialog.close();
+      } catch (error) {
+        editor.error.textContent = `Backup recovery failed: ${errorText(error)}`;
+        editor.save.disabled = false;
+      }
     });
   } catch (error) {
-    setStatusMessage(`Backup recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    setStatusMessage(`Backup recovery failed: ${errorText(error)}`);
   } finally {
     recoverButton.disabled = false;
   }
-}
-
-function queueSave(publishSync = false) {
-  if (!storageReady) return;
-  hasUnsavedChanges = true;
-  retrySaveButton.hidden = true;
-  if (storageBlocked) {
-    setStorageNotice('Saved data needs attention', 'Your edits remain open but are not being overwritten.');
-    setStatusMessage('Saving is paused because the existing local data could not be validated.');
-    return;
-  }
-  const documentToSave = makeStoredDocument(notebook, ++revision, viewMode, theme, colorTheme);
-  const sequence = ++saveSequence;
-  setStorageNotice('Saving locally…', capabilities.nativeLocalStorage ? 'Writing a versioned file in the app-data folder.' : 'Writing to browser local storage for this preview.');
-  saveQueue = saveQueue
-    .catch(() => undefined)
-    .then(() => writeStoredDocument(documentToSave))
-    .then(async () => {
-      if (publishSync) await queueSyncSnapshot(documentToSave);
-      if (sequence === saveSequence) {
-        hasUnsavedChanges = false;
-        retrySaveButton.hidden = true;
-        setStorageNotice('Saved locally', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data is stored in this browser.');
-        if (sessionContentDirty) scheduleSyncPublication(sequence, publishSync ? 0 : SYNC_PUBLICATION_DEBOUNCE_MS);
-      }
-    })
-    .catch(error => {
-      if (sequence === saveSequence) {
-        retrySaveButton.hidden = false;
-        setStorageNotice('Save failed', 'Your changes remain open. Retry the local save when ready.');
-        setStatusMessage(`Could not save local data: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    });
 }
 
 function clearUndo() {
@@ -1838,25 +2003,10 @@ function clearUndo() {
   undoButton.hidden = true;
 }
 
-function commit(change: () => void, message: string, canUndo = false) {
-  if (storageBlocked || closeInProgress || (sessionPhase !== 'ready' && sessionPhase !== 'offline')) return;
-  clearUndo();
-  if (canUndo) undoState = structuredClone(notebook);
-  change();
-  sessionContentDirty = true;
-  render();
-  queueSave(false);
-  setStatusMessage(canUndo ? message : '');
-  undoButton.hidden = !canUndo;
-  if (canUndo) {
-    undoTimer = setTimeout(() => {
-      const focused = document.activeElement === undoButton;
-      clearUndo();
-      setStatusMessage('');
-      if (focused) focusWithoutScrolling(addCategory);
-    }, 15_000);
-    focusWithoutScrolling(undoButton);
-  }
+function commit(change: (draft: Notebook) => void, message: string, canUndo = false): Promise<boolean> {
+  const draft = structuredClone(notebook);
+  change(draft);
+  return commitNotebookReplacement(draft, message, { canUndo });
 }
 
 function openDialog(title: string) {
@@ -1911,31 +2061,38 @@ function editCategory(category?: Category) {
   const field = textField('Category name', category?.name ?? '');
   editor.body.append(field.label);
   field.input.focus();
-  editor.form.addEventListener('submit', event => {
+  editor.form.addEventListener('submit', async event => {
     event.preventDefault();
     const name = field.input.value.trim();
     if (!name) { editor.error.textContent = 'Enter a category name.'; return; }
-    commit(() => {
-      if (category) category.name = name;
-      else notebook.categories.push({ id: crypto.randomUUID(), name, tasks: [] });
+    editor.save.disabled = true;
+    const saved = await commit(draft => {
+      if (category) {
+        const target = draft.categories.find(item => item.id === category.id);
+        if (target) target.name = name;
+      } else {
+        draft.categories.push({ id: crypto.randomUUID(), name, tasks: [] });
+      }
     }, category ? 'Category renamed.' : 'Category added.');
-    editor.dialog.close();
+    if (saved) editor.dialog.close();
+    else editor.save.disabled = false;
   });
 }
 
 function removeCategory(category: Category) {
-  const remove = () => commit(() => {
-    notebook.categories = notebook.categories.filter(item => item.id !== category.id);
+  const remove = () => commit(draft => {
+    draft.categories = draft.categories.filter(item => item.id !== category.id);
   }, `Deleted ${category.name}.`, true);
   if (category.tasks.length === 0) { remove(); return; }
   const editor = openDialog('Delete category?');
   editor.body.append(element('p', '', `Delete ${category.name} and its ${category.tasks.length} task(s)?`));
   editor.save.textContent = 'Delete category and tasks';
   editor.save.className = 'danger-button';
-  editor.form.addEventListener('submit', event => {
+  editor.form.addEventListener('submit', async event => {
     event.preventDefault();
-    remove();
-    editor.dialog.close();
+    editor.save.disabled = true;
+    if (await remove()) editor.dialog.close();
+    else editor.save.disabled = false;
   });
 }
 
@@ -1943,8 +2100,8 @@ function moveCategory(category: Category, direction: -1 | 1) {
   const index = notebook.categories.indexOf(category);
   const next = index + direction;
   if (index < 0 || next < 0 || next >= notebook.categories.length) return;
-  commit(() => {
-    [notebook.categories[index], notebook.categories[next]] = [notebook.categories[next], notebook.categories[index]];
+  void commit(draft => {
+    [draft.categories[index], draft.categories[next]] = [draft.categories[next], draft.categories[index]];
   }, `Moved ${category.name} ${direction < 0 ? 'up' : 'down'}.`);
 }
 
@@ -1952,8 +2109,10 @@ function moveTask(category: Category, task: Task, direction: -1 | 1) {
   const index = category.tasks.indexOf(task);
   const next = index + direction;
   if (index < 0 || next < 0 || next >= category.tasks.length) return;
-  commit(() => {
-    [category.tasks[index], category.tasks[next]] = [category.tasks[next], category.tasks[index]];
+  void commit(draft => {
+    const draftCategory = draft.categories.find(item => item.id === category.id);
+    if (!draftCategory) return;
+    [draftCategory.tasks[index], draftCategory.tasks[next]] = [draftCategory.tasks[next], draftCategory.tasks[index]];
   }, `Moved ${task.title} ${direction < 0 ? 'up' : 'down'}.`);
 }
 
@@ -1967,8 +2126,9 @@ function isScheduledOn(task: Task, date: string): boolean {
 
 function markTaskDone(task: Task, today = localToday()) {
   if (!isScheduledToday(task, today)) return;
-  commit(() => {
-    task.scheduledDates = task.scheduledDates.filter(date => date !== today);
+  void commit(draft => {
+    const draftTask = draft.categories.flatMap(category => category.tasks).find(item => item.id === task.id);
+    if (draftTask) draftTask.scheduledDates = draftTask.scheduledDates.filter(date => date !== today);
   }, `Marked ${task.title} done.`);
 }
 
@@ -2047,7 +2207,7 @@ function editTask(category: Category, task?: Task) {
     clearDeadline, advisory);
   drawCalendar();
   title.input.focus();
-  editor.form.addEventListener('submit', event => {
+  editor.form.addEventListener('submit', async event => {
     event.preventDefault();
     const name = title.input.value.trim();
     if (!name) { editor.error.textContent = 'Enter a task title.'; return; }
@@ -2055,17 +2215,24 @@ function editTask(category: Category, task?: Task) {
       const dates = normalizeDates(selected);
       if (deadline.value) parseDate(deadline.value);
       const destination = notebook.categories.find(item => item.id === categorySelect.value) ?? category;
-      commit(() => {
+      editor.save.disabled = true;
+      const saved = await commit(draft => {
+        const draftCategory = draft.categories.find(item => item.id === category.id);
+        const draftDestination = draft.categories.find(item => item.id === destination.id);
+        if (!draftCategory || !draftDestination) return;
         if (task) {
-          Object.assign(task, { title: name, scheduledDates: dates, deadlineDate: deadline.value || null });
+          const draftTask = draftCategory.tasks.find(item => item.id === task.id);
+          if (!draftTask) return;
+          Object.assign(draftTask, { title: name, scheduledDates: dates, deadlineDate: deadline.value || null });
           if (destination !== category) {
-            category.tasks = category.tasks.filter(item => item.id !== task.id);
-            destination.tasks.push(task);
+            draftCategory.tasks = draftCategory.tasks.filter(item => item.id !== task.id);
+            draftDestination.tasks.push(draftTask);
           }
         }
-        else category.tasks.push({ id: crypto.randomUUID(), title: name, scheduledDates: dates, deadlineDate: deadline.value || null });
+        else draftCategory.tasks.push({ id: crypto.randomUUID(), title: name, scheduledDates: dates, deadlineDate: deadline.value || null });
       }, task && destination !== category ? `Task moved to ${destination.name}.` : task ? 'Task updated.' : 'Task added.');
-      editor.dialog.close();
+      if (saved) editor.dialog.close();
+      else editor.save.disabled = false;
     } catch (error) {
       editor.error.textContent = error instanceof Error ? error.message : 'Unable to save this task.';
     }
@@ -2078,7 +2245,7 @@ function render() {
   list.replaceChildren();
   const today = localToday();
   const tomorrow = shiftDate(today, 1);
-  const editingReady = storageReady && !storageBlocked && !closeInProgress && (sessionPhase === 'ready' || sessionPhase === 'offline');
+  const editingReady = editingIsReady();
   allView.setAttribute('aria-pressed', String(viewMode === 'all'));
   todayView.setAttribute('aria-pressed', String(viewMode === 'today'));
   tomorrowView.setAttribute('aria-pressed', String(viewMode === 'tomorrow'));
@@ -2174,8 +2341,9 @@ function render() {
       } else {
         row.append(content);
       }
-      const remove = button('Delete', () => commit(() => {
-        category.tasks = category.tasks.filter(item => item.id !== task.id);
+      const remove = button('Delete', () => void commit(draft => {
+        const draftCategory = draft.categories.find(item => item.id === category.id);
+        if (draftCategory) draftCategory.tasks = draftCategory.tasks.filter(item => item.id !== task.id);
       }, `Deleted ${task.title}.`, true), 'quiet-button task-delete');
       remove.disabled = !editingReady;
       remove.setAttribute('aria-label', `Delete task ${task.title}`);
@@ -2374,15 +2542,8 @@ setInterval(() => void attemptPendingSync(), 15_000);
 
 async function loadInitialData() {
   try {
-    const stored = await readStoredDocument();
-    if (stored) {
-      notebook = { categories: stored.categories };
-      viewMode = stored.preferences.viewMode;
-      theme = stored.preferences.theme;
-      colorTheme = stored.preferences.colorTheme;
-      applyTheme();
-      revision = stored.revision;
-    }
+    localRepository = await openLocalRepository();
+    await refreshLocalProjection();
     try {
       syncState = await loadSyncState();
       syncReady = true;
@@ -2398,7 +2559,7 @@ async function loadInitialData() {
       : syncState.lastPublishedRevision !== null && revision > syncState.lastPublishedRevision;
     sessionContentDirty = syncState.pendingSnapshots.length > 0 || (syncState.status === 'connected' && fingerprintChanged);
     recoverButton.hidden = true;
-    setStorageNotice(stored ? 'Saved locally' : 'Local data ready', capabilities.nativeLocalStorage ? 'Your backlog is stored on this device.' : 'Preview data will be stored in this browser.');
+    setStorageNotice('Local data ready', capabilities.nativeLocalStorage ? 'Your backlog is stored in this device database.' : 'Preview data will be stored in this browser.');
     sessionPhase = syncLoadError ? 'offline' : 'ready';
     render();
     if (syncReady && syncState.status === 'connected' && authState.status === 'signed-in') void inspectAuthenticatedAccount();

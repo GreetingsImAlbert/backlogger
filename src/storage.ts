@@ -4,6 +4,7 @@ import type { Category, Notebook, Task } from './model.ts';
 import { isTauriRuntime } from './platform/capabilities.ts';
 
 export const SCHEMA_VERSION = 1 as const;
+export const PORTABLE_SCHEMA_VERSION = 2 as const;
 const BROWSER_STORAGE_KEY = 'backlogger.document.v1';
 const BROWSER_BACKUP_KEY = `${BROWSER_STORAGE_KEY}.bak`;
 
@@ -22,6 +23,12 @@ export function storageKind(): 'desktop' | 'android' | 'browser' {
   if (!isTauriRuntime()) return 'browser';
   const userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent.toLowerCase();
   return userAgent.includes('android') ? 'android' : 'desktop';
+}
+
+export interface PortableDocument {
+  schemaVersion: typeof PORTABLE_SCHEMA_VERSION;
+  revision: number;
+  categories: Category[];
 }
 
 export async function setNativeTheme(theme: Theme): Promise<void> {
@@ -123,6 +130,61 @@ export function parseStoredText(raw: string): StoredDocument {
   }
 }
 
+function assertGloballyUniqueTaskIds(categories: Category[]): void {
+  const taskIds = new Set<string>();
+  for (const category of categories) {
+    for (const task of category.tasks) {
+      if (taskIds.has(task.id)) throw new Error('Stored data has duplicate task ids across categories.');
+      taskIds.add(task.id);
+    }
+  }
+}
+
+export function parsePortableDocument(value: unknown): PortableDocument {
+  if (isRecord(value) && value.schemaVersion === SCHEMA_VERSION) {
+    const legacy = parseStoredDocument(value);
+    assertGloballyUniqueTaskIds(legacy.categories);
+    return {
+      schemaVersion: PORTABLE_SCHEMA_VERSION,
+      revision: legacy.revision,
+      categories: legacy.categories,
+    };
+  }
+  if (!isRecord(value)) throw new Error('Stored data is not an object.');
+  const keys = Object.keys(value).sort();
+  if (keys.join(',') !== ['categories', 'revision', 'schemaVersion'].sort().join(',')) {
+    throw new Error('This export contains unsupported or device-specific fields.');
+  }
+  if (value.schemaVersion !== PORTABLE_SCHEMA_VERSION) {
+    throw new Error('This saved data uses an unsupported version.');
+  }
+  if (typeof value.revision !== 'number' || !Number.isInteger(value.revision) || value.revision < 0) {
+    throw new Error('Stored data has an invalid revision.');
+  }
+  if (!Array.isArray(value.categories)) throw new Error('Stored data has invalid categories.');
+  const categories = value.categories.map(parseCategory);
+  const categoryIds = new Set<string>();
+  for (const category of categories) {
+    if (categoryIds.has(category.id)) throw new Error('Stored data has duplicate category ids.');
+    categoryIds.add(category.id);
+  }
+  assertGloballyUniqueTaskIds(categories);
+  return {
+    schemaVersion: PORTABLE_SCHEMA_VERSION,
+    revision: value.revision,
+    categories,
+  };
+}
+
+export function parsePortableText(raw: string): PortableDocument {
+  try {
+    return parsePortableDocument(JSON.parse(raw) as unknown);
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error('The selected file is not valid JSON.');
+    throw error;
+  }
+}
+
 export function makeStoredDocument(
   notebook: Notebook,
   revision: number,
@@ -143,6 +205,14 @@ export function makeStoredDocument(
     })),
     preferences: { viewMode, theme, colorTheme },
   };
+}
+
+export function makePortableDocument(notebook: Notebook, revision: number): PortableDocument {
+  return parsePortableDocument({
+    schemaVersion: PORTABLE_SCHEMA_VERSION,
+    revision,
+    categories: notebook.categories,
+  });
 }
 
 export async function readStoredDocument(): Promise<StoredDocument | null> {

@@ -11,7 +11,7 @@ import type {
   TaskSyncRecord,
 } from '../sync-v2/index.ts';
 
-export const LOCAL_REPOSITORY_SCHEMA_VERSION = 1 as const;
+export const LOCAL_REPOSITORY_SCHEMA_VERSION = 2 as const;
 export const LOCAL_DATABASE_URL = 'sqlite:backlogger-v2.db';
 export const MAX_LOCAL_RECOVERY_BACKUPS = 20;
 
@@ -41,12 +41,13 @@ export interface LocalRecoveryBackup {
   backupId: string;
   createdAt: string;
   reason: string;
-  /** Exact validated legacy JSON. This never becomes a portable export implicitly. */
+  /** Exact validated legacy or portable JSON. This never becomes a portable export implicitly. */
   documentJson: string;
 }
 
 export interface LocalRepositorySnapshot {
   schemaVersion: typeof LOCAL_REPOSITORY_SCHEMA_VERSION;
+  documentRevision: number;
   categories: CategorySyncRecord[];
   tasks: TaskSyncRecord[];
   bases: LocalSyncRecord[];
@@ -60,6 +61,7 @@ export interface LocalRepositorySnapshot {
 
 export interface LocalReadModel {
   notebook: Notebook;
+  documentRevision: number;
   records: {
     categories: CategorySyncRecord[];
     tasks: TaskSyncRecord[];
@@ -105,12 +107,24 @@ export interface EditCategoryInput {
 }
 
 export interface EditTaskInput {
+  categoryId?: string;
   title?: string;
   scheduledDates?: string[];
   deadlineDate?: string | null;
   sortKey?: string;
   editedAt: string;
   deviceId: string;
+}
+
+export interface ReplaceNotebookInput {
+  notebook: Notebook;
+  editedAt: string;
+  deviceId: string;
+  minimumRevision?: number;
+  recoveryBackup?: {
+    documentJson: string;
+    reason: string;
+  };
 }
 
 export type ReorderRecordsInput =
@@ -161,6 +175,7 @@ export interface LocalRepositoryTransaction {
   setCursor(lastChangeSeq: number): void;
   setSyncState(state: RecordSyncState): void;
   setPreferences(preferences: LocalPreferences): void;
+  replaceNotebook(input: ReplaceNotebookInput): void;
   createRecoveryBackup(documentJson: string, reason: string): LocalRecoveryBackup;
   listRecoveryBackups(): LocalRecoveryBackup[];
 }
@@ -184,6 +199,7 @@ export interface LocalRepository {
   setCursor(lastChangeSeq: number): Promise<void>;
   setSyncState(state: RecordSyncState): Promise<void>;
   setPreferences(preferences: LocalPreferences): Promise<void>;
+  replaceNotebook(input: ReplaceNotebookInput): Promise<void>;
   createRecoveryBackup(documentJson: string, reason: string): Promise<LocalRecoveryBackup>;
   listRecoveryBackups(): Promise<LocalRecoveryBackup[]>;
   close(): Promise<void>;

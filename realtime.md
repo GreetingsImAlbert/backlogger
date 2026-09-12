@@ -1,162 +1,24 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–2 complete; the dormant v2 contracts, merge engine, ordering, SQLite repository, browser/test adapters, and one-time legacy importer exist, but the UI and active sync runtime still use the current JSON/snapshot path. This plan replaces that path only after a verified side-by-side migration. Local-only use must continue to require no account or network.
+Status: Milestones 0–3 are complete on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network.
 
-## Current-state assessment
+## Implemented baseline
 
-- The UI currently mutates one in-memory `Notebook` and persists the entire document as `backlogger.json`.
-- Supabase currently stores immutable whole-notebook snapshots plus one manifest. It has notebook-level revisions, not per-category/task versions.
-- Deletes remove records from the document; there are no tombstones or retained per-record bases.
-- Sync is driven by debounce, polling, startup, and close handling. Supabase Realtime is not configured.
-- Concurrent snapshot branches are preserved, but a newly connecting device rejects multiple branches before it can use Merge. The record protocol below removes that dead end.
-- Keep the existing IDs, UI, Google/Supabase authentication, RLS ownership boundary, exports, and legacy data as migration inputs. Replace the local persistence and sync engines.
+- Record contracts, strict validators, merge logic, deterministic ordering, and legacy graph fixtures live under `src/sync-v2/`.
+- Windows UI reads and writes through `LocalRepository`; transactions are serialized and the visible projection updates only after a durable commit.
+- SQLite stores categories, tasks, acknowledged bases, a coalescing outbox, sync metadata/cursor, local preferences, and bounded recovery backups.
+- Synced records use stable IDs, per-field clocks, `updated_at`, `updated_by_device_id`, `version`, `deleted_at`, `sort_key`, and server-assigned `change_seq`.
+- Three-way reconciliation uploads local-only changes, applies server-only changes, merges different fields, resolves the same field by clock then device ID, and makes deletion win over edits.
+- Category deletion cascades task tombstones. Import replacement and undo preserve tombstone history; portable exports contain active categories/tasks and revision only.
+- The original JSON file and legacy Supabase snapshot tables remain untouched migration inputs. Never dual-write after cutover.
+- `platformCapabilities().recordSync` remains disabled until the explicit cutover milestone.
 
-## Fixed architecture
+## Execution rules
 
-1. Production Windows and Android use SQLite through Tauri SQL as the local database. Browser preview may use a test/localStorage adapter behind the same repository interface.
-2. UI code calls only the local repository. It never calls Supabase. A successful local transaction updates the visible UI immediately and queues durable background work.
-3. Supabase is canonical for acknowledged shared state. Unsynced local rows and the outbox remain authoritative until acknowledged; network failure never blocks editing.
-4. Realtime is a low-latency wake-up signal, not the correctness mechanism. Startup, reconnect, focus/resume, periodic safety checks, and every Realtime event run an idempotent delta pull.
-5. App-level deletion is always a soft delete. Subscribe to `INSERT`, `UPDATE`, and `DELETE`, but normal deletes arrive as `UPDATE` events carrying `deleted_at`. Do not physically purge tombstones in the first release.
-6. Retain the legacy JSON and Supabase snapshot tables untouched through rollout. Never dual-write old and new protocols after a device completes cutover.
-
-## Record contract
-
-Synced category business fields: `id`, `name`, `sort_key`.
-
-Synced task business fields: `id`, `category_id`, `title`, `scheduled_dates`, `deadline_date`, `sort_key`.
-
-Every category/task also has:
-
-- `notebook_id` and `owner_id` remotely;
-- `updated_at` as the latest business-field edit time;
-- `version` as the last server-accepted integer version;
-- nullable `deleted_at` tombstone time;
-- `updated_by_device_id` for deterministic timestamp ties;
-- `field_updated_at`, an allow-listed map of business field to `{ at, deviceId }` so a later edit to one field cannot incorrectly win a conflict on another field;
-- server-assigned `change_seq`, drawn from one sequence shared by both record tables and their change ledger, for lossless cursor-based catch-up. Sequence gaps are allowed; ordering must not depend on timestamps.
-
-Local SQLite additionally stores:
-
-- a base copy of every last-acknowledged record, including its version and field clocks;
-- one coalescing outbox row per dirty record with attempt/error metadata;
-- sync metadata: device ID, account/project/notebook binding, last applied `change_seq`, state, and last error;
-- local-only preferences and bounded recovery backups. None of these enter portable exports or Supabase records.
-
-Use stable string IDs already present in Backlogger. Render active rows by `sort_key`, then `id` as a deterministic tie-breaker. Implement/test one rank helper for insertion and drag reorder; never infer order from timestamps.
-
-## Reconciliation rules
-
-Compare `base`, `local`, and `server` for one record at a time:
-
-| Condition | Result |
-|---|---|
-| Only local differs from base | Upload local using base/server `version` as the expected version. |
-| Only server differs from base | Apply server locally and replace the base. |
-| Both changed different fields | Combine the independently changed fields. |
-| Both changed the same field to the same value | Keep the value and newest field clock. |
-| Both changed the same field differently | Keep the value with the newer field clock; tie-break by `deviceId`. |
-| Either side deleted while the other edited | Deletion wins; retain/publish the tombstone. |
-| Category is deleted | Hide the category and its tasks immediately; queue task tombstones without allowing stale task edits to restore it. |
-
-After any merge, save the merged row and outbox intent in one local transaction. Send a mutation with `expected_version`. The server either accepts it, increments `version`, assigns `change_seq`, and returns the canonical row, or returns the current row as stale. On stale, reconcile again and retry a bounded three times. Never overwrite without a matching version.
-
-`scheduled_dates` is one field for conflict purposes. Import, category deletion, and reordering may update several records but must use one local SQLite transaction. A clock more than five minutes in the future is invalid; document that same-field latest-edit behavior otherwise assumes reasonably correct device clocks.
-
-## Instructions for each milestone agent
-
-- Implement only the assigned milestone and read all earlier handoffs first.
-- Preserve unrelated changes, `local.backlogger.desktop`, the Windows app-data location, and independent Windows/Android versions.
-- Add focused modules; do not move the new repository, merge engine, transport, or Realtime lifecycle into `src/main.ts`.
-- Do not run Supabase migrations, resets, links, pushes, or database tests. Prepare them and stop at the stated user gate.
-- Do not commit. Append a short `### Milestone N handoff` with changed files, tests, runtime evidence, remaining manual actions, and stable interfaces.
-- Keep the old protocol operational behind a feature flag until the cutover milestone explicitly changes the default.
-
-## Milestone 0 — Freeze contracts and safety fixtures
-
-**Prerequisites:** none.
-
-1. Add pure TypeScript record, field-clock, mutation, acknowledgement, cursor, and sync-state types under `src/sync-v2/`.
-2. Define schema validators for all local/remote rows. Reject unknown record types, invalid dates, invalid versions, future clocks, wrong notebook/account IDs, and malformed field-clock keys.
-3. Add synthetic legacy fixtures covering one snapshot head, multiple complete heads, an orphan snapshot, and missing ancestry. Do not copy private task contents into Git.
-4. Add a disabled-by-default `recordSync` capability/feature flag. Existing runtime behavior must remain unchanged.
-
-**Verify:** existing checks remain green; validator/fixture tests pass; no database or UI behavior changes.
-
-**Done when:** all later milestones share one explicit contract and can run without accessing a real account.
-
-### Milestone 0 handoff
-
-- Added the stable `src/sync-v2/index.ts` boundary, exporting discriminated category/task records, exact per-field clocks, local/remote identities, OCC mutation acknowledgements, the change cursor, sync state, and strict parsers.
-- Validators reject unknown types and fields, malformed/missing field clocks, invalid or noncanonical dates/timestamps, clocks over five minutes ahead, invalid local/remote versions and sequences, inconsistent mutation envelopes, and wrong notebook/account/project bindings.
-- Added synthetic legacy graph fixtures for one head, two complete heads, an unlisted orphan leaf, and missing ancestry. Fixtures contain only invented category/task data.
-- Added `platformCapabilities().recordSync`, backed by the compile-time `RECORD_SYNC_ENABLED = false`; no UI, storage, Supabase, or active sync module imports the v2 boundary.
-- Verification on 2026-09-12: `npm.cmd run check`, all 58 `npm.cmd test` tests, `npm.cmd run build`, and `git diff --check` pass. No provider or real account was accessed. Manual actions: none.
-- Remaining work starts at Milestone 1: implement only the pure merge/ordering engine against these exported contracts; do not enable `recordSync`.
-
-## Milestone 1 — Pure merge and ordering engine
-
-**Prerequisite:** Milestone 0.
-
-1. Implement three-way field comparison exactly as specified above. Keep metadata out of business-field comparisons.
-2. Implement field-clock comparison, deterministic device-ID ties, version handling, deletion dominance, and category-delete cascading decisions.
-3. Implement stable `sort_key` generation and deterministic collision fallback. Reordering remains limited to a task's category.
-4. Make every operation pure and idempotent. Applying the same server row or Realtime event twice must be a no-op.
-
-**Verify:** table-driven tests cover every rule in both local/server directions, multiple fields, equal timestamps, clock rejection, delete/edit, parent deletion, duplicate/out-of-order input, and order collisions.
-
-**Done when:** reconciliation decisions require no UI, SQLite, or Supabase code.
-
-### Milestone 1 handoff
-
-- Added pure `src/sync-v2/merge.ts` reconciliation. `reconcileRecord(base, local, server, options)` returns the local row, newest acknowledged base, OCC `expectedVersion`, explicit action, and fields still requiring upload without mutating its inputs.
-- Field changes are compared against the base using business values and their allow-listed field clocks; generic version/sequence metadata never creates an upload. Concurrent independent fields combine, same-field conflicts use canonical timestamps then device ID, and `scheduledDates` remains one atomic field.
-- Tombstones dominate edits as complete rows in both directions. `cascadeCategoryTombstones` deterministically returns only active children requiring tombstones and is idempotent, so a stale task edit cannot restore a deleted category.
-- `applyServerRecord` accepts only forward canonical version/sequence progress, returns exact duplicates and older ordered events as no-ops, and rejects contradictory canonical rows.
-- Added pure `src/sync-v2/ordering.ts` helpers: evenly spaced fixed-width ranks, midpoint insertion, automatic deterministic rebalance when rank space is exhausted/invalid, `sortKey` then ID collision ordering, and category-scoped task moves only.
-- Added table-driven coverage for local/server-only edits, independent and same-field changes in both directions, equal-time ties, arrays, metadata isolation, clock rejection, deletion, new rows, duplicates, out-of-order events, version/sequence contradictions, category cascades, every move direction, rank exhaustion/collisions, tombstones, and cross-category rejection.
-- Verification on 2026-09-12: `npm.cmd run check`, all 74 `npm.cmd test` tests, `npm.cmd run build`, and `git diff --check` pass. `RECORD_SYNC_ENABLED` remains `false`; no UI, storage, provider, account, Rust, or database path was accessed or changed. Manual actions: none.
-- Remaining work starts at Milestone 2: implement the SQLite repository and one-time legacy JSON import around these interfaces without activating the v2 runtime.
-
-## Milestone 2 — SQLite local repository and legacy JSON import
-
-**Prerequisite:** Milestone 1.
-
-**Likely files:** `src/local-db/*`, `src-tauri/src/lib.rs`, `src-tauri/Cargo.toml`, `package.json`, Tauri capabilities/configuration, storage tests.
-
-1. Add Tauri SQL with SQLite and registered transactional migrations for category, task, base, outbox, sync-meta, preference, and recovery-backup tables.
-2. Expose a narrow `LocalRepository` interface. Include atomic read model, create/edit/reorder/soft-delete, apply-server-row, acknowledge-mutation, outbox, base, cursor, backup, and transaction operations.
-3. On first launch only, validate `backlogger.json`, create a recovery backup, import active categories/tasks with stable IDs and initial sort keys, then mark migration complete in the same SQLite transaction.
-4. Never delete or rename `backlogger.json` or its backup. A failed import rolls back SQLite and leaves the current app path usable.
-5. Keep a fake in-memory repository for unit tests and a browser-preview adapter; production Tauri must use SQLite.
-
-**Verify:** clean install, populated legacy file, empty file, malformed file, duplicate IDs, interrupted migration, repeat launch, rollback, and Windows/Android database reopen tests.
-
-**Done when:** SQLite can faithfully round-trip the current notebook and durable sync metadata without changing the active UI path.
-
-### Milestone 2 handoff
-
-- Added registered Tauri SQL SQLite migration `src-tauri/migrations/0001_local_sync_v2.sql` for category/task rows, acknowledged bases, account-scoped coalescing outbox entries, sync metadata, local preferences, and bounded recovery backups. Desktop and mobile capabilities allow connection/read operations; writes use one narrow Rust transaction command so a multi-row repository commit always uses one SQLx transaction.
-- Added the stable `src/local-db/index.ts` boundary. `LocalRepository` provides serialized atomic read/transaction operations, create/edit/reorder/tombstone commands, category-delete cascading, canonical row application, three-way reconciliation persistence, mutation acknowledgement/attempt handling, durable base/outbox/cursor/state access, preferences, and recovery-backup creation/listing.
-- `openTauriLocalRepository` always selects SQLite in Tauri. Browser preview uses an isolated localStorage adapter, and tests can use the same repository with an in-memory store. None of these modules are imported by `main.ts`; `RECORD_SYNC_ENABLED` remains `false` and the live JSON/Supabase snapshot behavior is unchanged.
-- First repository open reads but never modifies `backlogger.json` (or its backup only when the primary is absent), validates the complete legacy document and globally unique task IDs, keeps exact source JSON as a recovery backup, preserves stable IDs/preferences, assigns deterministic initial ranks and clocks, and writes records plus the completion marker atomically. Missing input creates an empty repository; invalid/empty/partial input and injected write interruption leave SQLite unmarked and empty so retry is safe. Completed imports never run twice.
-- Added real file-backed SQLite tests for clean, populated, valid-empty, empty-file, malformed, duplicate-ID, interrupted, repeated, callback rollback, durable-write rollback, close/reopen, metadata/outbox/base round-trip, acknowledgement supersession, reconciliation, ordering scope, tombstone cascading, and browser-preview preservation. All 84 tests pass.
-- Runtime evidence on 2026-09-12: `npm.cmd run check`, `npm.cmd test`, `npm.cmd run build`, `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`, Windows-host `cargo check --manifest-path src-tauri/Cargo.toml`, and `git diff --check` pass. `npm.cmd run android:build` also produced the x86_64 debug APK with the native SQLite plugin. No adb target was connected, so device UI/data-path QA waits for Milestone 3 when the repository is active. Manual actions: none; no Supabase contract changed.
-- Remaining work starts at Milestone 3: route every UI mutation and read projection through `LocalRepository`, preserve the old path behind the disabled flag until cutover, and then perform actual Windows/Android restart and crash-after-commit QA.
-
-## Milestone 3 — Route the UI through the local repository
-
-**Prerequisite:** Milestone 2. Supabase behavior remains on the old protocol or disabled by flag.
-
-1. Replace direct document mutation/save orchestration with repository commands. `main.ts` may retain a rendered projection, but every edit must commit locally before being considered successful.
-2. Reload or patch the projection only from the committed local result. No auth/network state may disable ordinary create, edit, reorder, complete, delete, theme, or view controls.
-3. Convert category/task deletion to hidden tombstones. Undo creates a new local edit; it must not erase tombstone history silently.
-4. Adapt import/export: exports include active notebook content only; imports transact active upserts plus tombstones for replaced local records. Exclude bases, versions, clocks, outbox, auth, bindings, and preferences.
-5. Preserve recovery, serialized writes, scroll/focus behavior, and all current Windows/Android local features.
-
-**Verify:** all local UI flows, restart, crash after commit, backup/recovery, import replacement, undo, ordering, signed-out mode, and current test suite.
-
-**Done when:** the UI has no direct dependency on JSON persistence or Supabase and local edits remain instant.
+- Keep sync-v2 repository, merge, transport, and Realtime lifecycle logic out of `src/main.ts`.
+- Never use timestamps as the change cursor and never let auth or network failure block local editing.
+- The user runs all Supabase migrations, resets, links, pushes, type generation, and database tests manually.
+- Do not commit. Preserve `local.backlogger.desktop`, the Windows app-data location, unrelated changes, and the old protocol until cutover.
 
 ## Milestone 4 — Supabase record schema, OCC RPCs, RLS, and publication
 

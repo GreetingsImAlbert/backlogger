@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import Database from '@tauri-apps/plugin-sql';
+import { parsePortableText, type PortableDocument } from '../storage.ts';
 import { RECORD_SYNC_STATE_VERSION, type LocalSyncRecord } from '../sync-v2/index.ts';
 import { TransactionalLocalRepository } from './repository.ts';
 import {
@@ -61,6 +62,7 @@ interface OutboxRow extends JsonRecordRow {
 
 interface MetaRow extends Record<string, unknown> {
   schema_version: number;
+  document_revision: number;
   device_id: string;
   account_id: string | null;
   project_ref: string | null;
@@ -174,7 +176,8 @@ export class SqliteLocalStateStore implements LocalStateStore {
     if (preferences.length !== 1) throw new Error('The local database is missing its preferences.');
     const meta = metaRows[0];
     return {
-      schemaVersion: integer(meta.schema_version, 'Local repository schema version') as 1,
+      schemaVersion: integer(meta.schema_version, 'Local repository schema version') as LocalRepositorySnapshot['schemaVersion'],
+      documentRevision: integer(meta.document_revision, 'Local document revision'),
       categories: categories.map(categoryFromRow) as LocalRepositorySnapshot['categories'],
       tasks: tasks.map(taskFromRow) as LocalRepositorySnapshot['tasks'],
       bases: bases.map(row => parseJson(row.record_json, 'Local base row') as LocalSyncRecord),
@@ -274,11 +277,11 @@ export class SqliteLocalStateStore implements LocalStateStore {
     }
     statements.push(insert(
       `INSERT INTO local_sync_meta (
-        singleton, schema_version, device_id, account_id, project_ref, notebook_id, last_change_seq,
+        singleton, schema_version, document_revision, device_id, account_id, project_ref, notebook_id, last_change_seq,
         state, last_error, legacy_import_complete, legacy_imported_at
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        snapshot.schemaVersion, snapshot.syncState.deviceId, snapshot.syncState.accountId,
+        snapshot.schemaVersion, snapshot.documentRevision, snapshot.syncState.deviceId, snapshot.syncState.accountId,
         snapshot.syncState.projectRef, snapshot.syncState.notebookId, snapshot.syncState.lastChangeSeq,
         snapshot.syncState.status, snapshot.syncState.lastError, snapshot.legacyImportComplete ? 1 : 0,
         snapshot.legacyImportedAt,
@@ -343,6 +346,32 @@ export async function openTauriLocalRepository(
       await repository.close();
     } catch {
       // Preserve the import/open failure, which is the actionable error.
+    }
+    throw error;
+  }
+}
+
+export async function readTauriLegacyRecoveryCandidate(): Promise<PortableDocument | null> {
+  const raw = await invoke<string | null>('load_notebook_backup');
+  return raw === null ? null : parsePortableText(raw);
+}
+
+export async function openTauriLocalRepositoryFromLegacyBackup(
+  dependencies: LocalRepositoryDependencies = {},
+): Promise<LocalRepository> {
+  const raw = await invoke<string | null>('load_notebook_backup');
+  if (raw === null) throw new Error('No valid local backup was found.');
+  parsePortableText(raw);
+  const database = await TauriLocalSqlDatabase.open();
+  const repository = new TransactionalLocalRepository(new SqliteLocalStateStore(database), dependencies);
+  try {
+    await repository.initialize(raw);
+    return repository;
+  } catch (error) {
+    try {
+      await repository.close();
+    } catch {
+      // Preserve the recovery failure, which is the actionable error.
     }
     throw error;
   }
