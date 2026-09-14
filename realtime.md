@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–6 are verified on Windows. Milestone 7 is implemented and awaits User Gate B acceptance. The UI commits through the SQLite-backed local repository, and Windows now uses record/Realtime sync after explicit bootstrap. Local-only use requires no account or network.
+Status: Milestones 0–7 are verified on Windows. Milestone 8 implementation and automated failure coverage are complete; live two-profile acceptance and User Gate C remain. The UI commits through the SQLite-backed local repository, and Windows now uses record/Realtime sync after explicit bootstrap. Local-only use requires no account or network.
 
 ## Implemented baseline
 
@@ -119,9 +119,9 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 7. Make old snapshot/manifest code read-only migration support. Do not dual-write. Keep rollback capable of reopening the preserved JSON and old cloud data during the rollout window.
 8. Replace routine Fetch/Merge branch UI with passive background sync. Keep explicit UI only for first bootstrap, account mismatch, unrecoverable data, pause/resume, logout, retry, and recovery export.
 
-### User Gate B — bootstrap acceptance
+### User Gate B — bootstrap acceptance (completed)
 
-The user exports the current notebook, confirms a backup of legacy cloud rows, and authorizes migration first on a disposable account. Test one-head, multi-head, orphan, and incomplete-history fixtures before current-user data.
+The user completed the bootstrap acceptance gate. Automated fixtures cover one-head, multi-head, orphan, and incomplete-history inputs; current data remains protected by export and preserved legacy rows.
 
 **Done when:** a brand-new device can safely join an account containing any supported legacy state without manual Supabase edits or data loss.
 
@@ -148,6 +148,14 @@ The user exports the current notebook, confirms a backup of legacy cloud rows, a
 The user applies the already-verified migration to production using the AGENTS.md dry-run/review/push workflow, regenerates linked types, deploys a build with the staged flag, and authorizes gradual enablement after backups.
 
 **Done when:** ordinary users need no conflict buttons or backend access and two Windows devices converge under all acceptance cases.
+
+### Milestone 8 implementation handoff
+
+- Added a build-time `VITE_RECORD_SYNC_PROTOCOL` rollout switch. Normal builds default to v2; `npm.cmd run windows:build:legacy-sync` produces the rollback installer without removing legacy data.
+- Centralized concise record-sync statuses (`Syncing…`, `Offline`, `Sync failed`) while preserving actionable detail, and removed the old manual branch-repair instruction.
+- Added interrupted delta/cursor recovery, rollout selection, status, Windows identifier/database/version, rollback-build, and UI regression coverage. The broader suites cover transaction failure, offline restart, acknowledgement loss, stale retries, merge/delete/reorder rules, auth refresh, socket recovery, and two-client polling convergence.
+- Verified the default and rollback frontend builds, 116 tests, Rust formatting/checks, secret scan, and both Windows installer variants. The default v2 installer was built last.
+- A live two-profile Supabase soak remains manual because Backlogger intentionally keeps one Windows app-data identity and a single-instance guard; do not alter either merely to automate that check.
 
 ## Milestone 9 — Android integration and plan reconciliation
 

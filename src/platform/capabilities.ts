@@ -1,7 +1,8 @@
+import { RECORD_SYNC_ENABLED } from '../sync-v2/rollout.ts';
+
 export type RuntimeKind = 'browser' | 'desktop' | 'android' | 'ios';
 
-/** Windows uses record/Realtime sync after the staged protocol cutover. */
-export const RECORD_SYNC_ENABLED = true as const;
+export { RECORD_SYNC_ENABLED } from '../sync-v2/rollout.ts';
 
 interface TauriWindow extends Window {
   __TAURI_INTERNALS__?: unknown;

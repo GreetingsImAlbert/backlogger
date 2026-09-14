@@ -25,6 +25,7 @@ import {
   RecordSyncWorker,
   bindRepositoryToRecordSync,
   buildLegacyBootstrapPreview,
+  presentRecordSyncStatus,
   type LegacyBootstrapPreview,
   type RecordSyncBinding,
   type RecordSyncState,
@@ -778,11 +779,7 @@ function syncStatusLabel(): string {
   if (!syncReady) return syncLoadError ? 'Unavailable' : 'Loading…';
   if (authState.status === 'signing-in') return 'Signing in';
   if (capabilities.recordSync) {
-    if (!hasRecordSyncBinding()) return 'Not logged in';
-    if (recordSyncState?.status === 'paused') return 'Paused';
-    if (recordSyncState?.status === 'catching-up') return 'Syncing…';
-    if (recordSyncState?.status === 'error' || recordSyncState?.status === 'degraded') return 'Sync failed';
-    return 'Connected';
+    return presentRecordSyncStatus(recordSyncState, recordOutboxCount, hasRecordSyncBinding()).label;
   }
   if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Not logged in';
   if (syncState.status === 'paused') return 'Paused';
@@ -797,13 +794,7 @@ function syncStatusDetail(): string {
   if (!authState.configured) return 'Sync is not configured for this build.';
   if (authState.status === 'signing-in') return 'Complete Google sign-in in your browser.';
   if (capabilities.recordSync) {
-    if (!hasRecordSyncBinding()) return 'Log in with Google, then start sync for this notebook.';
-    if (recordSyncState?.status === 'paused') return `${recordOutboxCount} local change${recordOutboxCount === 1 ? '' : 's'} waiting while sync is paused.`;
-    if (recordSyncState?.lastError) return recordSyncState.lastError;
-    if (recordSyncState?.status === 'catching-up') return 'Reconciling local and cloud record changes.';
-    return recordOutboxCount
-      ? `${recordOutboxCount} local change${recordOutboxCount === 1 ? '' : 's'} waiting to upload.`
-      : 'Local changes are saved immediately and synced in the background.';
+    return presentRecordSyncStatus(recordSyncState, recordOutboxCount, hasRecordSyncBinding()).detail;
   }
   if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Log in with Google to sync this notebook.';
   const pending = syncState.pendingSnapshots.length;
@@ -1709,7 +1700,7 @@ async function bindSupabaseAccount(): Promise<void> {
     }
     const leaves = snapshotLeaves(snapshots);
     if (leaves.length !== 1 || !hasCompleteSnapshotAncestry(leaves[0], snapshots)) {
-      throw new Error('The cloud notebook has multiple or incomplete branches; resolve it before connecting this device.');
+      throw new Error('Cloud history needs recovery. Local data was kept; use the current sync protocol or restore a trusted export.');
     }
     const action = await askFetchConfirmation();
     if (!action) return;

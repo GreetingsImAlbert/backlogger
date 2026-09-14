@@ -7,3 +7,5 @@ export * from './supabase-transport.ts';
 export * from './worker.ts';
 export * from './realtime.ts';
 export * from './bootstrap.ts';
+export * from './rollout.ts';
+export * from './status.ts';

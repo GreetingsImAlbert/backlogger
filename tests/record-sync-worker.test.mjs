@@ -192,6 +192,30 @@ test('delta pull sorts pages, tolerates gaps and exact duplicates, and commits r
   assert.equal((await repository.readModel()).syncState.status, 'live');
 });
 
+test('an interrupted delta transaction advances neither records nor cursor and retries safely', async () => {
+  const server = new MemoryRecordServer();
+  server.seed(category({ id: 'category-interrupted', changeSeq: 4 }), 4);
+  const transport = new MemoryRecordTransport(server);
+  const { repository, store } = await boundRepository('delta-interrupted');
+  const save = store.save.bind(store);
+  let cycleSaves = 0;
+  store.save = async snapshot => {
+    cycleSaves += 1;
+    if (cycleSaves === 2) throw new Error('Injected delta transaction failure.');
+    return save(snapshot);
+  };
+
+  await assert.rejects(worker(repository, transport).runCycle(), /injected delta transaction failure/i);
+  let model = await repository.readModel();
+  assert.equal(model.syncState.lastChangeSeq, 0);
+  assert.equal(model.records.categories.length, 0);
+
+  await worker(repository, transport).runCycle();
+  model = await repository.readModel();
+  assert.equal(model.syncState.lastChangeSeq, 4);
+  assert.deepEqual(model.records.categories.map(record => record.id), ['category-interrupted']);
+});
+
 test('offline failure survives restart and the same durable mutation is published later', async () => {
   const server = new MemoryRecordServer();
   const transport = new MemoryRecordTransport(server);

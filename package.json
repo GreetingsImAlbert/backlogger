@@ -8,6 +8,7 @@
     "check": "tsc --noEmit",
     "test": "node --test tests/*.test.mjs",
     "build": "npm run check && vite build",
+    "build:legacy-sync": "set VITE_RECORD_SYNC_PROTOCOL=legacy&& npm run build",
     "preview": "vite preview --host 127.0.0.1",
     "android:dev": "set BACKLOGGER_DEV_HOST=0.0.0.0&& tauri android dev",
     "android:build": "tauri android build --debug --apk --target x86_64 --ci",
@@ -16,6 +17,7 @@
     "supabase:test:db": "npx supabase test db --local",
     "supabase:types:local": "npx supabase gen types --lang typescript --local > supabase/database.types.ts",
     "security:secrets": "node scripts/verify-no-secrets.mjs",
+    "windows:build:legacy-sync": "set VITE_RECORD_SYNC_PROTOCOL=legacy&& tauri build --ci",
     "tauri": "tauri"
   },
   "devDependencies": {
