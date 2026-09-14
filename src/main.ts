@@ -23,9 +23,11 @@ import {
   SupabaseRecordBootstrapGateway,
   SupabaseRecordTransport,
   RecordSyncWorker,
+  RecordSyncStartupGate,
   bindRepositoryToRecordSync,
   buildLegacyBootstrapPreview,
   presentRecordSyncStatus,
+  recordSyncStartupRetryDelay,
   type LegacyBootstrapPreview,
   type RecordSyncBinding,
   type RecordSyncState,
@@ -66,6 +68,9 @@ let recordSyncState: RecordSyncState | null = null;
 let recordOutboxCount = 0;
 let recordSyncWorker: RecordSyncWorker | null = null;
 let recordRealtime: SupabaseRealtimeManager | null = null;
+const recordStartupGate = new RecordSyncStartupGate();
+let recordInspectionRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let recordInspectionRetryAttempt = 0;
 type SessionPhase = 'loading' | 'fetching' | 'ready' | 'offline' | 'closing';
 interface AvailableUpdate {
   snapshot: SyncSnapshot;
@@ -1764,6 +1769,25 @@ async function disconnectSync(): Promise<void> {
   await enqueueSyncMutation(() => disconnectSyncUnsafe());
 }
 
+function clearRecordInspectionRetry(resetAttempts = true): void {
+  if (recordInspectionRetryTimer !== null) clearTimeout(recordInspectionRetryTimer);
+  recordInspectionRetryTimer = null;
+  if (resetAttempts) recordInspectionRetryAttempt = 0;
+}
+
+function scheduleRecordInspectionRetry(error: unknown): void {
+  const binding = currentRecordBinding();
+  if (!binding || authState.status !== 'signed-in' || authState.userId !== binding.accountId) return;
+  const delay = recordSyncStartupRetryDelay(error, recordInspectionRetryAttempt);
+  if (delay === null) return;
+  clearRecordInspectionRetry(false);
+  recordInspectionRetryAttempt += 1;
+  recordInspectionRetryTimer = setTimeout(() => {
+    recordInspectionRetryTimer = null;
+    void inspectAuthenticatedAccount();
+  }, delay);
+}
+
 async function inspectRecordAuthenticatedAccount(): Promise<void> {
   if (!localRepository || authState.status !== 'signed-in' || !authState.userId) return;
   const accountId = authState.userId;
@@ -1771,7 +1795,9 @@ async function inspectRecordAuthenticatedAccount(): Promise<void> {
     const location = currentSupabaseLocation();
     const gateway = new SupabaseRecordBootstrapGateway(accountId, { projectRef: location.projectRef });
     const cloud = await withSyncTimeout(gateway.inspectNotebook());
+    if (authState.status !== 'signed-in' || authState.userId !== accountId) return;
     const legacy = cloud ? null : await readLegacyBootstrap(location);
+    if (authState.status !== 'signed-in' || authState.userId !== accountId) return;
     recordCloudInspection = { accountId, notebookId: cloud?.notebook_id ?? null, legacyExists: Boolean(legacy?.manifest), error: null };
     const binding = currentRecordBinding();
     if (!binding) return;
@@ -1786,9 +1812,22 @@ async function inspectRecordAuthenticatedAccount(): Promise<void> {
       return;
     }
     if (!recordRealtime && recordSyncState?.status !== 'paused') await startRecordSyncRuntime(binding);
+    clearRecordInspectionRetry();
   } catch (error) {
-    recordCloudInspection = { accountId, notebookId: null, legacyExists: false, error: errorText(error) };
-    await stopRecordSyncRuntime();
+    if (authState.status !== 'signed-in' || authState.userId !== accountId) return;
+    const message = errorText(error);
+    recordCloudInspection = { accountId, notebookId: null, legacyExists: false, error: message };
+    const retryDelay = recordSyncStartupRetryDelay(error, recordInspectionRetryAttempt);
+    const binding = currentRecordBinding();
+    if (retryDelay !== null && binding?.accountId === accountId) {
+      if (localRepository && recordSyncState) {
+        await localRepository.setSyncState({ ...recordSyncState, status: 'degraded', lastError: message });
+      }
+      scheduleRecordInspectionRetry(error);
+    } else {
+      clearRecordInspectionRetry();
+      await stopRecordSyncRuntime();
+    }
   } finally {
     await refreshLocalProjection();
     syncDialogRefresh?.();
@@ -1798,7 +1837,7 @@ async function inspectRecordAuthenticatedAccount(): Promise<void> {
 
 async function inspectAuthenticatedAccount(): Promise<void> {
   if (!capabilities.supabaseSync || !syncReady || !storageReady || authState.status !== 'signed-in' || !authState.userId) return;
-  if (capabilities.recordSync) return inspectRecordAuthenticatedAccount();
+  if (capabilities.recordSync) return recordStartupGate.run(inspectRecordAuthenticatedAccount);
   if (cloudInspectionInFlight) return cloudInspectionInFlight;
   const accountId = authState.userId;
   const operation = enqueueSyncMutation(async () => {
@@ -1851,6 +1890,7 @@ async function handleAuthStateChange(next: AuthState): Promise<void> {
     if (next.status === 'signing-in') signInStartedAt ??= Date.now();
     else signInStartedAt = null;
     if (next.status === 'signed-out') {
+      clearRecordInspectionRetry();
       await stopRecordSyncRuntime();
       if (localRepository && recordSyncState) {
         await localRepository.setSyncState({ ...recordSyncState, status: 'disconnected', lastError: null });
@@ -2776,7 +2816,16 @@ const refreshDateState = () => {
 };
 window.addEventListener('focus', () => {
   refreshDateState();
+  if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in' && !recordRealtime) {
+    void inspectAuthenticatedAccount();
+  }
   void checkForSharedUpdate();
+});
+window.addEventListener('online', () => {
+  if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in' && !recordRealtime) {
+    clearRecordInspectionRetry();
+    void inspectAuthenticatedAccount();
+  }
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
