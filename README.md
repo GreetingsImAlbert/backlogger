@@ -1,12 +1,31 @@
 # Backlogger
 
-Backlogger is a compact, offline-first task list for Windows and Android. Local mode needs no account or hosted service: install the app and use it. Windows additionally offers optional cloud sync through Supabase with Google login.
+Backlogger is a small, no-fuss task notebook for Windows and Android. Organize tasks into categories, choose the days you want to work on them, and keep deadlines visible without turning everything into a complicated project-management system.
 
-Backlogger supports categories, ordered tasks, scheduled work dates, independent deadlines, themes, autosave, recovery, and JSON import/export. Windows and Android share this repository but have independent release versions.
+Your tasks are saved directly on your device. There is no required account, subscription, or internet connection—just install it and start writing. Windows also has optional Google login for syncing through Supabase.
+
+## Highlights
+
+- Categories and freely ordered tasks
+- Multiple scheduled work dates and independent deadlines
+- Today and Tomorrow views
+- Drag-and-drop prioritization with keyboard-friendly alternatives
+- Light/dark mode and multiple color themes
+- Automatic local saving and recovery, with JSON import/export on Windows
+- Optional live Windows sync while keeping offline editing available
+
+## Download
+
+Download the latest build from [GitHub Releases](../../releases).
+
+- **Windows:** run the `.exe` installer. Releases are currently unsigned, so Windows may show an Unknown publisher or SmartScreen warning.
+- **Android:** install the Android APK. The current Android release supports local use; cloud sync and document import/export are still being implemented.
+
+Windows and Android versions are released independently even though they share this repository.
 
 Licensed under the [MIT License](LICENSE).
 
-## Run locally
+## Development setup
 
 Install Node.js, then run:
 
@@ -23,9 +42,9 @@ For the Windows app, install the [Tauri Windows prerequisites](https://v2.tauri.
 npm.cmd run tauri -- dev
 ```
 
-## Optional Supabase sync
+## Optional Windows sync
 
-Windows users may choose **Log in to Sync**, authenticate with Google, and explicitly start syncing. Logging out disconnects the account but keeps the local notebook. If cloud and local histories differ, the app offers **Fetch** to replace the local notebook or **Merge** to union their categories and tasks. Pending work and the authenticated session survive restarts; local mode remains available when Supabase is unavailable or not configured.
+Windows users can choose **Log in to Sync** and authenticate with Google. Login only checks for an existing notebook; creating the first cloud notebook still requires **Start sync** confirmation. After connection, edits save locally first and sync automatically in the background. Record-level conflict handling, soft deletes, Realtime updates, and periodic catch-up run without manual Fetch/Merge steps. Logging out keeps the local notebook, and offline edits remain queued for later.
 
 For development:
 
@@ -86,7 +105,8 @@ Android currently has native local persistence; cloud sync and document import/e
 ## Project layout
 
 - `src/`: TypeScript/CSS interface, domain logic, local storage, and sync orchestration.
-- `src/sync.ts`: sync state, snapshots, manifests, ancestry, and merge behavior.
-- `src/sync/`: the Supabase transport and provider-neutral coordinator.
+- `src/local-db/`: SQLite-backed local records, preferences, recovery, sync bases, outbox, and cursor.
+- `src/sync-v2/`: record contracts, validation, merge/order rules, Supabase transport, worker, Realtime lifecycle, and rollout controls.
+- `src/sync.ts` and `src/sync/`: read-only legacy migration and temporary rollback support.
 - `src-tauri/`: shared native host, platform configuration, and app-data/document commands.
 - `supabase/`: database migrations, pgTAP tests, generated types, and local configuration.

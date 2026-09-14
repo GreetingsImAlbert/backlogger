@@ -4,7 +4,7 @@
 
 - Backlogger is an offline-first Tauri 2 app with a plain TypeScript/Vite/CSS interface. Windows and Android share this repository.
 - Keep the application identifier `local.backlogger.desktop` and the existing Windows app-data location unchanged.
-- `mobile-implementation.md` is the single Android plan and includes setup gates, implementation milestones, verification, and release criteria. `REMOVED.md` is historical context, not an active plan.
+- `mobile-implementation.md` is the only active implementation plan and covers Android setup, milestones, verification, and release criteria.
 
 ## Commands
 
@@ -17,6 +17,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
 - Windows release: `npm.cmd run tauri -- build --ci`; NSIS output is under `src-tauri/target/release/bundle/nsis/`.
+- Temporary Windows sync rollback build: `npm.cmd run windows:build:legacy-sync`. The normal build defaults to the v2 record protocol.
 - Android first setup: `npm.cmd run tauri -- android init --ci --skip-targets-install`. The generated `src-tauri/gen/` tree is ignored.
 - Android development: `npm.cmd run android:dev`. Emulator debug APK: `npm.cmd run android:build`; the current script targets x86_64 and is not a signed production build.
 - Android builds on Windows require Android Studio/SDK/NDK, Rust Android targets, and Windows Developer Mode for symlinks.
@@ -50,19 +51,22 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 
 ## Architecture and invariants
 
-- `src/main.ts` owns UI orchestration; keep domain logic testable in focused modules such as `dates.ts`, `storage.ts`, `reorder.ts`, and `sync.ts`.
+- `src/main.ts` owns UI orchestration; keep domain logic testable in focused modules such as `dates.ts`, `storage.ts`, `reorder.ts`, `local-db/`, and `sync-v2/`.
 - Calendar values are date-only `YYYY-MM-DD` strings. Scheduled dates and deadlines are independent, and weekday notation never implies recurrence.
 - Preserve stable IDs, canonical category/task ordering, serialized saves, schema validation, backups, explicit recovery, and the desktop single-instance guard.
 - Task drag-and-drop stays within its category. Keep Move up/down actions as the keyboard and non-drag fallback.
-- Device preferences, credentials, transport bindings, device identity, and pending publication state never belong in portable notebook exports or shared snapshots.
-- Android has native local persistence. Supabase sync and document import/export remain disabled there until a revised mobile plan implements and verifies them.
+- Device preferences, credentials, transport bindings, device identity, acknowledged bases, cursors, and outbox state never belong in portable notebook exports or shared cloud records.
+- Android has native local persistence. Supabase sync and document import/export remain disabled there until their `mobile-implementation.md` milestones implement and verify them.
 
 ## Sync safety
 
-- Local app data is authoritative. Optional Windows cloud sync uses the signed-in user's Supabase notebook, immutable snapshots, and a versioned manifest.
-- Schema-1/2 folder locations are migration input only: disconnect them without accessing or changing the retired provider data.
-- Validate notebook identity and complete ancestry. Use ancestry—not timestamps or device revisions—to reconcile versions. Missing, partial, invalid, or unavailable remote data never means an empty notebook.
-- Preserve pending work, concurrent heads, and unresolved conflicts across restarts. Never overwrite an immutable snapshot or publish to an unconfirmed account.
+- The UI reads and writes only through the local SQLite repository. Optional Windows sync reconciles those records with the signed-in user's canonical Supabase v2 notebook in the background.
+- Preserve stable record IDs, per-field clocks, acknowledged bases, soft-delete tombstones, the durable outbox, and the server `change_seq` cursor across restarts.
+- Pull ordered ledger changes by cursor and apply records plus cursor atomically. Push through optimistic version checks; stale writes use the tested three-way merge and bounded retry rules.
+- Realtime events are wake-ups only. Validate and fetch ledger changes before touching local state, and keep periodic polling as the recovery path.
+- Login is read-only. Creating the first v2 notebook requires explicit **Start sync** confirmation. Never publish to an unconfirmed account/project/notebook binding.
+- Missing, partial, invalid, unauthorized, or unavailable cloud data never means an empty notebook and never authorizes local replacement or deletion.
+- Legacy snapshots/manifests and schema-1/2 folder state are read-only migration or rollback inputs. Do not dual-write or remove them during the staged rollout; cleanup requires a stable release and explicit user approval.
 
 ## Working practice
 
@@ -71,4 +75,4 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 - The user creates Git commits manually; do not commit or amend history unless explicitly requested.
 - A sole user prompt of `cm` means: provide a concise commit message covering every uncommitted change since the last commit, following the repository's existing title, blank line, and bullet format. Summarize major changes rather than listing implementation details. Always place the entire commit message inside a fenced `text` code block.
 - Run the checks relevant to every changed layer. Record each mobile milestone's concise handoff and evidence beneath that milestone in `mobile-implementation.md`.
-- Do not recreate the retired `PLAN.md`, `PROGRESS.md`, `feature.md`, `feature_drop.md`, or `FEATURES.md` files.
+- Do not recreate the retired `PLAN.md`, `PROGRESS.md`, `feature.md`, `feature_drop.md`, `FEATURES.md`, `REMOVED.md`, `supabase-migration.md`, or `realtime.md` files.
