@@ -186,7 +186,7 @@ test('legacy fixtures cover complete, concurrent, orphaned and incomplete graphs
   assert.equal(incomplete.snapshots.has(legacySyncGraphs.missingAncestry.missingSnapshotId), false);
 });
 
-test('record sync stays disabled for every runtime until cutover', () => {
-  assert.equal(RECORD_SYNC_ENABLED, false);
+test('record sync is enabled for the Windows cutover but remains unavailable in browser preview', () => {
+  assert.equal(RECORD_SYNC_ENABLED, true);
   assert.equal(platformCapabilities().recordSync, false);
 });

@@ -18,6 +18,17 @@ import { SupabaseSyncTransport } from './sync/supabase-transport';
 import type { SyncTransport } from './sync/transport';
 import { cancelGoogleSignIn, getAuthState, initializeAuth, signOut as signOutAuth, startGoogleSignIn, subscribeAuthState, type AuthState } from './supabase/auth';
 import { getConfiguredSupabaseProject } from './supabase/client';
+import {
+  SupabaseRealtimeManager,
+  SupabaseRecordBootstrapGateway,
+  SupabaseRecordTransport,
+  RecordSyncWorker,
+  bindRepositoryToRecordSync,
+  buildLegacyBootstrapPreview,
+  type LegacyBootstrapPreview,
+  type RecordSyncBinding,
+  type RecordSyncState,
+} from './sync-v2';
 
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('App container is missing.');
@@ -48,7 +59,12 @@ let syncPublishTimer: ReturnType<typeof setTimeout> | undefined;
 let authState: AuthState = getAuthState();
 let signInStartedAt: number | null = null;
 let cloudInspection: { accountId: string; manifest: SyncManifest | null; error: string | null } | null = null;
+let recordCloudInspection: { accountId: string; notebookId: string | null; legacyExists: boolean; error: string | null } | null = null;
 let cloudInspectionInFlight: Promise<void> | null = null;
+let recordSyncState: RecordSyncState | null = null;
+let recordOutboxCount = 0;
+let recordSyncWorker: RecordSyncWorker | null = null;
+let recordRealtime: SupabaseRealtimeManager | null = null;
 type SessionPhase = 'loading' | 'fetching' | 'ready' | 'offline' | 'closing';
 interface AvailableUpdate {
   snapshot: SyncSnapshot;
@@ -718,7 +734,25 @@ function cloudLocation(location: SyncState['location'] = syncState.location): Su
 }
 
 function hasCloudBinding(): boolean {
-  return capabilities.supabaseSync && Boolean(cloudLocation()) && syncState.status !== 'disconnected';
+  return !capabilities.recordSync && capabilities.supabaseSync && Boolean(cloudLocation()) && syncState.status !== 'disconnected';
+}
+
+function currentRecordBinding(): RecordSyncBinding | null {
+  if (!capabilities.recordSync || !recordSyncState?.accountId || !recordSyncState.projectRef || !recordSyncState.notebookId) return null;
+  return {
+    accountId: recordSyncState.accountId,
+    projectRef: recordSyncState.projectRef,
+    notebookId: recordSyncState.notebookId,
+  };
+}
+
+function hasRecordSyncBinding(): boolean {
+  const binding = currentRecordBinding();
+  return Boolean(binding && authState.status === 'signed-in' && authState.userId === binding.accountId);
+}
+
+function hasActiveSyncBinding(): boolean {
+  return capabilities.recordSync ? hasRecordSyncBinding() : hasCloudBinding();
 }
 
 function currentSupabaseLocation(): SupabaseLocation {
@@ -743,6 +777,13 @@ function syncStatusLabel(): string {
   if (!capabilities.cloudSync) return 'Not logged in';
   if (!syncReady) return syncLoadError ? 'Unavailable' : 'Loading…';
   if (authState.status === 'signing-in') return 'Signing in';
+  if (capabilities.recordSync) {
+    if (!hasRecordSyncBinding()) return 'Not logged in';
+    if (recordSyncState?.status === 'paused') return 'Paused';
+    if (recordSyncState?.status === 'catching-up') return 'Syncing…';
+    if (recordSyncState?.status === 'error' || recordSyncState?.status === 'degraded') return 'Sync failed';
+    return 'Connected';
+  }
   if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Not logged in';
   if (syncState.status === 'paused') return 'Paused';
   if (syncState.conflicts.length) return 'Conflicts';
@@ -755,6 +796,15 @@ function syncStatusDetail(): string {
   if (syncLoadError) return `Sync settings could not be loaded: ${syncLoadError}`;
   if (!authState.configured) return 'Sync is not configured for this build.';
   if (authState.status === 'signing-in') return 'Complete Google sign-in in your browser.';
+  if (capabilities.recordSync) {
+    if (!hasRecordSyncBinding()) return 'Log in with Google, then start sync for this notebook.';
+    if (recordSyncState?.status === 'paused') return `${recordOutboxCount} local change${recordOutboxCount === 1 ? '' : 's'} waiting while sync is paused.`;
+    if (recordSyncState?.lastError) return recordSyncState.lastError;
+    if (recordSyncState?.status === 'catching-up') return 'Reconciling local and cloud record changes.';
+    return recordOutboxCount
+      ? `${recordOutboxCount} local change${recordOutboxCount === 1 ? '' : 's'} waiting to upload.`
+      : 'Local changes are saved immediately and synced in the background.';
+  }
   if (authState.status !== 'signed-in' || !syncState.location || syncState.status === 'disconnected') return 'Log in with Google to sync this notebook.';
   const pending = syncState.pendingSnapshots.length;
   if (syncState.conflicts.length) return `${syncState.conflicts.length} conflict${syncState.conflicts.length === 1 ? '' : 's'} need attention.`;
@@ -1470,7 +1520,143 @@ async function askStartSyncConfirmation(): Promise<boolean> {
   });
 }
 
+async function askRecordBootstrapConfirmation(preview: LegacyBootstrapPreview | null): Promise<boolean> {
+  return new Promise(resolve => {
+    const editor = openDialog(preview ? 'Migrate cloud sync?' : 'Start cloud sync?');
+    if (preview) {
+      editor.body.append(
+        element('p', '', `The migration will preserve ${preview.categoryCount} categories and ${preview.taskCount} tasks from this device and every complete legacy cloud branch.`),
+        element('p', 'advisory', 'Legacy snapshots do not contain deletion history or per-field edit clocks, so exact historical conflict recovery is impossible. Same-ID legacy differences use the newest snapshot, while this device’s values and all unique items are preserved.'),
+      );
+      if (preview.missingSnapshotIds.length) {
+        editor.body.append(element('p', 'advisory', `Unavailable legacy history: ${preview.missingSnapshotIds.join(', ')}. Complete branches are preserved; missing history is never treated as an empty notebook.`));
+      }
+      editor.save.textContent = 'Migrate and start sync';
+    } else {
+      editor.body.append(
+        element('p', '', 'No Backlogger cloud notebook exists for this Google account yet.'),
+        element('p', 'advisory', 'Start sync with this device to create it from the current local notebook. Nothing is uploaded before you confirm.'),
+      );
+      editor.save.textContent = 'Start sync with this device';
+    }
+    let settled = false;
+    const finish = (choice: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(choice);
+    };
+    editor.dialog.addEventListener('close', () => finish(false), { once: true });
+    editor.form.addEventListener('submit', event => {
+      event.preventDefault();
+      finish(true);
+      editor.dialog.close();
+    });
+  });
+}
+
+async function stopRecordSyncRuntime(): Promise<void> {
+  const realtime = recordRealtime;
+  recordRealtime = null;
+  recordSyncWorker?.stopPeriodicPull();
+  recordSyncWorker = null;
+  if (realtime) await realtime.stop();
+}
+
+async function startRecordSyncRuntime(binding: RecordSyncBinding): Promise<void> {
+  if (!localRepository) throw new Error('The local repository is not open.');
+  await stopRecordSyncRuntime();
+  const worker = new RecordSyncWorker(localRepository, new SupabaseRecordTransport(binding), {
+    onLocalCommit: async () => {
+      await refreshLocalProjection();
+      syncDialogRefresh?.();
+      render();
+    },
+  });
+  const realtime = new SupabaseRealtimeManager(binding, worker);
+  recordSyncWorker = worker;
+  recordRealtime = realtime;
+  await realtime.start();
+  await refreshLocalProjection();
+}
+
+async function readLegacyBootstrap(location: SupabaseLocation): Promise<{
+  manifest: SyncManifest | null;
+  preview: LegacyBootstrapPreview | null;
+}> {
+  const coordinator = new SyncCoordinator(new SupabaseSyncTransport(location));
+  const resource = await withSyncTimeout(coordinator.readManifestResource());
+  if (!resource) return { manifest: null, preview: null };
+  const snapshots = await withSyncTimeout(coordinator.readSnapshotIndex(
+    new Set(resource.manifest.prunedSnapshotIds),
+    resource.manifest.notebookId,
+  ));
+  return {
+    manifest: resource.manifest,
+    preview: buildLegacyBootstrapPreview(notebook, resource.manifest, snapshots),
+  };
+}
+
+async function bindRecordSyncAccount(): Promise<void> {
+  if (!localRepository) throw new Error('The local repository is not open.');
+  const location = currentSupabaseLocation();
+  const existingBinding = currentRecordBinding();
+  if (existingBinding && existingBinding.accountId !== location.accountId) {
+    throw new Error('This device is already bound to a different Google account. Log back into that account or export your local notebook before changing accounts.');
+  }
+  const gateway = new SupabaseRecordBootstrapGateway(location.accountId, { projectRef: location.projectRef });
+  const cloudNotebook = await withSyncTimeout(gateway.inspectNotebook());
+  recordCloudInspection = {
+    accountId: location.accountId,
+    notebookId: cloudNotebook?.notebook_id ?? null,
+    legacyExists: false,
+    error: null,
+  };
+  if (cloudNotebook) {
+    if (existingBinding && existingBinding.notebookId !== cloudNotebook.notebook_id) {
+      throw new Error('This device is bound to a different cloud notebook. Local data was not changed.');
+    }
+    const binding = { accountId: location.accountId, projectRef: location.projectRef, notebookId: cloudNotebook.notebook_id };
+    await bindRepositoryToRecordSync(localRepository, binding);
+    await refreshLocalProjection();
+    await startRecordSyncRuntime(binding);
+    setStatusMessage('Cloud sync connected.');
+    return;
+  }
+
+  const legacy = await readLegacyBootstrap(location);
+  recordCloudInspection = { accountId: location.accountId, notebookId: null, legacyExists: Boolean(legacy.manifest), error: null };
+  if (!(await askRecordBootstrapConfirmation(legacy.preview))) return;
+  if (legacy.preview && notebookFingerprint(legacy.preview.notebook) !== notebookFingerprint(notebook)) {
+    await localRepository.replaceNotebook({
+      notebook: legacy.preview.notebook,
+      editedAt: new Date().toISOString(),
+      deviceId: localDeviceId,
+      recoveryBackup: {
+        documentJson: JSON.stringify(makePortableDocument(notebook, revision), null, 2),
+        reason: 'before-record-sync-bootstrap',
+      },
+    });
+    await refreshLocalProjection();
+  }
+  const model = await localRepository.readModel();
+  const notebookId = legacy.manifest?.notebookId ?? existingBinding?.notebookId ?? crypto.randomUUID();
+  try {
+    await withSyncTimeout(gateway.initializeNotebook(notebookId, model.records));
+  } catch (error) {
+    const racedNotebook = await withSyncTimeout(gateway.inspectNotebook());
+    if (!racedNotebook) throw error;
+    if (racedNotebook.notebook_id !== notebookId) throw new Error('Another cloud notebook appeared while sync was starting. Local data was kept; retry to inspect it safely.');
+  }
+  const binding = { accountId: location.accountId, projectRef: location.projectRef, notebookId };
+  await bindRepositoryToRecordSync(localRepository, binding);
+  await refreshLocalProjection();
+  await startRecordSyncRuntime(binding);
+  recordCloudInspection = { accountId: location.accountId, notebookId, legacyExists: Boolean(legacy.manifest), error: null };
+  setStatusMessage(legacy.manifest ? 'Legacy cloud data was preserved and migrated to live sync.' : 'Cloud sync started with this device.');
+}
+
 async function bindSupabaseAccount(): Promise<void> {
+  if (capabilities.recordSync) return bindRecordSyncAccount();
   const location = currentSupabaseLocation();
   await enqueueSyncMutation(async () => {
     const checkedAt = startSyncCheck();
@@ -1587,8 +1773,41 @@ async function disconnectSync(): Promise<void> {
   await enqueueSyncMutation(() => disconnectSyncUnsafe());
 }
 
+async function inspectRecordAuthenticatedAccount(): Promise<void> {
+  if (!localRepository || authState.status !== 'signed-in' || !authState.userId) return;
+  const accountId = authState.userId;
+  try {
+    const location = currentSupabaseLocation();
+    const gateway = new SupabaseRecordBootstrapGateway(accountId, { projectRef: location.projectRef });
+    const cloud = await withSyncTimeout(gateway.inspectNotebook());
+    const legacy = cloud ? null : await readLegacyBootstrap(location);
+    recordCloudInspection = { accountId, notebookId: cloud?.notebook_id ?? null, legacyExists: Boolean(legacy?.manifest), error: null };
+    const binding = currentRecordBinding();
+    if (!binding) return;
+    if (binding.accountId !== accountId) {
+      recordCloudInspection.error = 'This device is bound to a different Google account.';
+      await stopRecordSyncRuntime();
+      return;
+    }
+    if (!cloud || cloud.notebook_id !== binding.notebookId) {
+      recordCloudInspection.error = 'The bound cloud notebook is unavailable. Local data was kept.';
+      await stopRecordSyncRuntime();
+      return;
+    }
+    if (!recordRealtime && recordSyncState?.status !== 'paused') await startRecordSyncRuntime(binding);
+  } catch (error) {
+    recordCloudInspection = { accountId, notebookId: null, legacyExists: false, error: errorText(error) };
+    await stopRecordSyncRuntime();
+  } finally {
+    await refreshLocalProjection();
+    syncDialogRefresh?.();
+    render();
+  }
+}
+
 async function inspectAuthenticatedAccount(): Promise<void> {
   if (!capabilities.supabaseSync || !syncReady || !storageReady || authState.status !== 'signed-in' || !authState.userId) return;
+  if (capabilities.recordSync) return inspectRecordAuthenticatedAccount();
   if (cloudInspectionInFlight) return cloudInspectionInFlight;
   const accountId = authState.userId;
   const operation = enqueueSyncMutation(async () => {
@@ -1636,6 +1855,23 @@ async function inspectAuthenticatedAccount(): Promise<void> {
 }
 
 async function handleAuthStateChange(next: AuthState): Promise<void> {
+  if (capabilities.recordSync) {
+    authState = next;
+    if (next.status === 'signing-in') signInStartedAt ??= Date.now();
+    else signInStartedAt = null;
+    if (next.status === 'signed-out') {
+      await stopRecordSyncRuntime();
+      if (localRepository && recordSyncState) {
+        await localRepository.setSyncState({ ...recordSyncState, status: 'disconnected', lastError: null });
+        await refreshLocalProjection();
+      }
+    } else if (next.status === 'signed-in' && next.userId) {
+      await inspectAuthenticatedAccount();
+    }
+    syncDialogRefresh?.();
+    render();
+    return;
+  }
   await enqueueSyncMutation(async () => {
     authState = next;
     if (next.status === 'signing-in') signInStartedAt ??= Date.now();
@@ -1656,6 +1892,15 @@ async function handleAuthStateChange(next: AuthState): Promise<void> {
 }
 
 async function toggleSyncPause(): Promise<void> {
+  if (capabilities.recordSync) {
+    if (!localRepository || !recordSyncState || !hasRecordSyncBinding()) throw new Error('Log in to sync first.');
+    const paused = recordSyncState.status !== 'paused';
+    if (paused) await recordRealtime?.pause();
+    await localRepository.setSyncState({ ...recordSyncState, status: paused ? 'paused' : 'catching-up', lastError: null });
+    await refreshLocalProjection();
+    if (!paused) await recordRealtime?.resume();
+    return;
+  }
   await enqueueSyncMutation(async () => {
     if (!hasCloudBinding() || syncState.status === 'disconnected') throw new Error('Log in to sync first.');
     syncState.status = syncState.status === 'paused' ? 'connected' : 'paused';
@@ -1671,6 +1916,13 @@ async function toggleSyncPause(): Promise<void> {
 }
 
 async function syncNow(): Promise<number> {
+  if (capabilities.recordSync) {
+    if (recordSyncState?.status === 'paused') throw new Error('Resume cloud sync before checking for updates.');
+    if (!recordSyncWorker || !hasRecordSyncBinding()) throw new Error('Log in to sync first.');
+    const result = await recordSyncWorker.runCycle();
+    await refreshLocalProjection();
+    return result.pulled;
+  }
   return enqueueSyncMutation(async () => {
     if (syncState.status === 'paused') throw new Error('Resume cloud sync before checking for updates.');
     if (!hasCloudBinding() || syncState.status === 'disconnected') throw new Error('Log in to sync first.');
@@ -1705,31 +1957,42 @@ function openSyncDialog() {
   function refresh() {
     statusLine.textContent = `${syncStatusLabel()} · ${syncStatusDetail()}`;
     const signedIn = authState.status === 'signed-in' && Boolean(authState.userId);
-    const connected = hasCloudBinding();
+    const connected = hasActiveSyncBinding();
     loginButton.hidden = signedIn;
     loginButton.disabled = !capabilities.supabaseSync || !authState.configured || authState.status === 'signing-in' || !syncReady;
     cancelLoginButton.hidden = authState.status !== 'signing-in';
     startButton.hidden = !signedIn || connected;
     startButton.disabled = !syncReady || Boolean(cloudInspectionInFlight);
     syncNowButton.hidden = !connected;
-    syncNowButton.disabled = !connected || syncState.status === 'paused';
+    syncNowButton.disabled = !connected || (capabilities.recordSync ? recordSyncState?.status === 'paused' : syncState.status === 'paused');
     pauseButton.hidden = !connected;
     pauseButton.disabled = !connected;
-    resolveButton.hidden = !connected;
-    resolveButton.disabled = !syncState.conflicts.length;
+    resolveButton.hidden = capabilities.recordSync || !connected;
+    resolveButton.disabled = capabilities.recordSync || !syncState.conflicts.length;
     logoutButton.hidden = !signedIn;
     logoutButton.disabled = authState.status === 'signing-in';
-    pauseButton.textContent = syncState.status === 'paused' ? 'Resume' : 'Pause';
+    pauseButton.textContent = (capabilities.recordSync ? recordSyncState?.status : syncState.status) === 'paused' ? 'Resume' : 'Pause';
     editor.save.disabled = false;
     if (!authState.configured) accountLine.textContent = 'Sync is not configured for this build.';
     else if (signedIn) {
       const email = authState.email ?? 'Google account';
-      const inspection = cloudInspection?.accountId === authState.userId ? cloudInspection : null;
-      accountLine.textContent = inspection?.error
-        ? `Signed in as ${email}. ${inspection.error}`
-        : inspection && !inspection.manifest
-          ? `Signed in as ${email}. No cloud notebook exists yet.`
-          : `Signed in as ${email}.`;
+      if (capabilities.recordSync) {
+        const inspection = recordCloudInspection?.accountId === authState.userId ? recordCloudInspection : null;
+        accountLine.textContent = inspection?.error
+          ? `Signed in as ${email}. ${inspection.error}`
+          : inspection?.notebookId
+            ? `Signed in as ${email}. Live cloud notebook found.`
+            : inspection?.legacyExists
+              ? `Signed in as ${email}. Legacy cloud data is ready to migrate.`
+              : `Signed in as ${email}. No live cloud notebook exists yet.`;
+      } else {
+        const inspection = cloudInspection?.accountId === authState.userId ? cloudInspection : null;
+        accountLine.textContent = inspection?.error
+          ? `Signed in as ${email}. ${inspection.error}`
+          : inspection && !inspection.manifest
+            ? `Signed in as ${email}. No cloud notebook exists yet.`
+            : `Signed in as ${email}.`;
+      }
     } else if (authState.status === 'loading') accountLine.textContent = 'Checking your Google sign-in…';
     else if (authState.status === 'signing-in') accountLine.textContent = 'Complete Google sign-in in your browser.';
     else accountLine.textContent = authState.error ?? 'Not logged in.';
@@ -1756,7 +2019,7 @@ function openSyncDialog() {
     try {
       await bindSupabaseAccount();
       refresh();
-      if (hasCloudBinding()) editor.dialog.close();
+      if (hasActiveSyncBinding()) editor.dialog.close();
       void attemptPendingSync();
     } catch (error) {
       editor.error.textContent = `Could not start cloud sync: ${errorText(error)}`;
@@ -1793,7 +2056,7 @@ function openSyncDialog() {
     editor.error.textContent = '';
     try {
       await toggleSyncPause();
-      setStatusMessage(syncState.status === 'paused' ? 'Cloud sync paused; local saves continue.' : 'Cloud sync resumed.');
+      setStatusMessage((capabilities.recordSync ? recordSyncState?.status : syncState.status) === 'paused' ? 'Cloud sync paused; local saves continue.' : 'Cloud sync resumed.');
       refresh();
     } catch (error) {
       editor.error.textContent = `Could not change sync state: ${errorText(error)}`;
@@ -1804,8 +2067,9 @@ function openSyncDialog() {
   async function logout() {
     editor.error.textContent = '';
     try {
+      if (capabilities.recordSync) await stopRecordSyncRuntime();
       await signOutAuth();
-      await disconnectSync();
+      if (!capabilities.recordSync) await disconnectSync();
       setStatusMessage('Logged out. Local tasks and recoverable sync state were kept.');
       refresh();
     } catch (error) {
@@ -1831,6 +2095,8 @@ async function refreshLocalProjection(): Promise<void> {
   theme = model.preferences.theme;
   colorTheme = model.preferences.colorTheme;
   localDeviceId = model.syncState.deviceId;
+  recordSyncState = model.syncState;
+  recordOutboxCount = (await localRepository.listOutbox()).length;
   applyTheme();
 }
 
@@ -1875,10 +2141,17 @@ async function performLocalWrite(
       capabilities.nativeLocalStorage ? 'Your backlog is stored in this device database.' : 'Preview data is stored in this browser.',
     );
     if (options.contentChanged) {
-      scheduleSyncPublication(
-        saveSequence,
-        options.publishImmediately ? 0 : SYNC_PUBLICATION_DEBOUNCE_MS,
-      );
+      if (capabilities.recordSync) {
+        void recordSyncWorker?.runCycle().catch(async () => {
+          await refreshLocalProjection();
+          render();
+        });
+      } else {
+        scheduleSyncPublication(
+          saveSequence,
+          options.publishImmediately ? 0 : SYNC_PUBLICATION_DEBOUNCE_MS,
+        );
+      }
     }
     render();
   } catch (error) {
@@ -2263,7 +2536,7 @@ function render() {
     importButton.title = 'Import and export will be available in a later Android milestone.';
     exportButton.title = 'Import and export will be available in a later Android milestone.';
   }
-  syncButton.textContent = hasCloudBinding() ? 'Sync' : 'Log in to Sync';
+  syncButton.textContent = hasActiveSyncBinding() ? 'Sync' : 'Log in to Sync';
   syncButton.disabled = !storageReady || closeInProgress || !capabilities.cloudSync || !syncReady;
   undoButton.disabled = !editingReady;
   renderStatusBar();
@@ -2523,6 +2796,15 @@ document.addEventListener('visibilitychange', () => {
 setInterval(refreshDateState, 30_000);
 
 async function attemptPendingSync() {
+  if (capabilities.recordSync) {
+    if (recordSyncState?.status !== 'paused' && recordSyncWorker && hasRecordSyncBinding()) {
+      await recordSyncWorker.runCycle().catch(async () => {
+        await refreshLocalProjection();
+        render();
+      });
+    }
+    return;
+  }
   if (taskEditorIsOpen()) {
     syncDeferred = true;
     return;
@@ -2549,8 +2831,8 @@ async function loadInitialData() {
       syncReady = true;
       syncLoadError = null;
     } catch (error) {
-      syncReady = false;
-      syncLoadError = errorText(error);
+      syncReady = capabilities.recordSync;
+      syncLoadError = capabilities.recordSync ? null : errorText(error);
     }
     storageReady = true;
     const localContentFingerprint = notebookFingerprint(notebook);
@@ -2562,7 +2844,8 @@ async function loadInitialData() {
     setStorageNotice('Local data ready', capabilities.nativeLocalStorage ? 'Your backlog is stored in this device database.' : 'Preview data will be stored in this browser.');
     sessionPhase = syncLoadError ? 'offline' : 'ready';
     render();
-    if (syncReady && syncState.status === 'connected' && authState.status === 'signed-in') void inspectAuthenticatedAccount();
+    if (syncReady && authState.status === 'signed-in'
+      && (capabilities.recordSync ? Boolean(currentRecordBinding()) : syncState.status === 'connected')) void inspectAuthenticatedAccount();
     else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : '');
   } catch (error) {
     storageReady = true;

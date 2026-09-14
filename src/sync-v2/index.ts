@@ -6,3 +6,4 @@ export * from './transport.ts';
 export * from './supabase-transport.ts';
 export * from './worker.ts';
 export * from './realtime.ts';
+export * from './bootstrap.ts';

@@ -71,6 +71,8 @@ function mapError(error: unknown, operation: string): RecordTransportError {
   return new RecordTransportError('server', `Could not ${operation}.`, true, error);
 }
 
+export { mapError as mapSupabaseRecordError };
+
 function invalid(message: string): RecordTransportError {
   return new RecordTransportError('invalid', message, false);
 }

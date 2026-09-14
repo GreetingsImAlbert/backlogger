@@ -1,6 +1,6 @@
 # Local-first record sync implementation plan
 
-Status: Milestones 0–6 are implemented on Windows. The UI commits through the SQLite-backed local repository; record sync remains disabled while the existing Supabase snapshot protocol consumes only committed local projections. Local-only use requires no account or network.
+Status: Milestones 0–6 are verified on Windows. Milestone 7 is implemented and awaits User Gate B acceptance. The UI commits through the SQLite-backed local repository, and Windows now uses record/Realtime sync after explicit bootstrap. Local-only use requires no account or network.
 
 ## Implemented baseline
 
@@ -11,7 +11,7 @@ Status: Milestones 0–6 are implemented on Windows. The UI commits through the 
 - Three-way reconciliation uploads local-only changes, applies server-only changes, merges different fields, resolves the same field by clock then device ID, and makes deletion win over edits.
 - Category deletion cascades task tombstones. Import replacement and undo preserve tombstone history; portable exports contain active categories/tasks and revision only.
 - The original JSON file and legacy Supabase snapshot tables remain untouched migration inputs. Never dual-write after cutover.
-- `platformCapabilities().recordSync` remains disabled until the explicit cutover milestone.
+- `platformCapabilities().recordSync` is enabled only on Windows; Android and browser preview remain disabled.
 
 ## Execution rules
 
@@ -124,6 +124,13 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 The user exports the current notebook, confirms a backup of legacy cloud rows, and authorizes migration first on a disposable account. Test one-head, multi-head, orphan, and incomplete-history fixtures before current-user data.
 
 **Done when:** a brand-new device can safely join an account containing any supported legacy state without manual Supabase edits or data loss.
+
+### Milestone 7 implementation handoff
+
+- Windows discovers v2 read-only before legacy data, binds existing v2 notebooks directly, and uses the durable worker plus one Realtime channel.
+- First-time initialization requires confirmation. Legacy bootstrap unions local data with every complete leaf, reports exact missing ancestry, creates a local recovery backup, and initializes v2 atomically.
+- Legacy snapshot tables are read-only migration inputs after cutover; routine Fetch/Merge branch repair and close-time snapshot publishing are bypassed.
+- Added fixture coverage for multi-head, deterministic same-ID resolution, incomplete ancestry, atomic bootstrap payloads, and idempotent local binding. User Gate B remains required before rollout acceptance.
 
 ## Milestone 8 — Windows failure testing and staged rollout
 

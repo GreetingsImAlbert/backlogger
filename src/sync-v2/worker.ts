@@ -170,6 +170,7 @@ export class RecordSyncWorker {
       };
       if (bindingMatches(localBinding, this.binding)) transaction.setSyncState({ ...state, status, lastError });
     });
+    await this.onLocalCommit();
   }
 
   private validationNow(): number {
