@@ -14,7 +14,9 @@ test('Windows rollout preserves the released identity, app-data database, and pl
   const windowsConfig = JSON.parse(windowsConfigText);
 
   assert.equal(baseConfig.identifier, 'local.backlogger.desktop');
-  assert.equal(windowsConfig.version, '0.1.4');
+  assert.equal(windowsConfig.version, '0.1.5');
+  assert.match(baseConfig.app.security.csp, /connect-src[^;]*https:\/\/\*\.supabase\.co/);
+  assert.match(baseConfig.app.security.csp, /connect-src[^;]*wss:\/\/\*\.supabase\.co/);
   assert.match(rustSource, /LOCAL_DATABASE_URL:\s*&str\s*=\s*"sqlite:backlogger-v2\.db"/);
 });
 

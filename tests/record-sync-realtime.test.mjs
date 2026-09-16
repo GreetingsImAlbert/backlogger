@@ -168,7 +168,7 @@ test('subscribes to both record tables before cursor catch-up and uses events on
   assert.deepEqual(new Set(channel.bindings.map(item => item.filter.event)), new Set(['INSERT', 'UPDATE', 'DELETE']));
   assert.deepEqual(new Set(channel.bindings.map(item => item.filter.table)), new Set(['sync_v2_categories', 'sync_v2_tasks']));
   assert.ok(channel.bindings.every(item => item.filter.filter === 'notebook_id=eq.notebook-a'));
-  assert.deepEqual(client.events.slice(0, 2), ['token:token-a', 'channel']);
+  assert.deepEqual(client.events.slice(0, 2), ['token:undefined', 'channel']);
 
   channel.status('SUBSCRIBED');
   await start;
@@ -209,7 +209,7 @@ test('auth refresh updates the channel JWT and sign-out tears the channel down b
   const refreshed = { access_token: 'token-b', user: { id: BINDING.accountId } };
   client.authEvent('TOKEN_REFRESHED', refreshed);
   await wait(0);
-  assert.deepEqual(client.tokens, ['token-a', 'token-b']);
+  assert.deepEqual(client.tokens, [undefined, undefined]);
 
   client.authEvent('SIGNED_OUT', null);
   await wait(0);
@@ -258,5 +258,46 @@ test('visibility and network lifecycle remove stale channels and subscribe befor
   lifecycle.emit('online');
   await wait(0);
   assert.equal(client.channels.length, 3);
+  await instance.stop();
+});
+
+test('manual pause removes the channel and resume subscribes with callback-managed auth', async () => {
+  const client = new FakeClient();
+  const worker = new FakeWorker();
+  const instance = manager(client, worker);
+  const first = await subscribe(instance, client);
+
+  await instance.pause();
+  assert.ok(client.removed.includes(first));
+  assert.equal(worker.periodicStops, 1);
+
+  const resumed = instance.resume();
+  await wait(0);
+  assert.equal(client.channels.length, 2);
+  client.channels[1].status('SUBSCRIBED');
+  await resumed;
+  assert.deepEqual(client.tokens, [undefined]);
+  assert.equal(worker.cycles, 2);
+  await instance.stop();
+});
+
+test('pausing a pending subscription cancels it so resume cannot inherit a stuck connection', async () => {
+  const client = new FakeClient();
+  const worker = new FakeWorker();
+  const instance = manager(client, worker);
+  const starting = instance.start();
+  await wait(0);
+  const pendingChannel = client.channels[0];
+
+  await instance.pause();
+  await starting;
+  assert.ok(client.removed.includes(pendingChannel));
+
+  const resumed = instance.resume();
+  await wait(0);
+  assert.equal(client.channels.length, 2);
+  client.channels[1].status('SUBSCRIBED');
+  await resumed;
+  assert.equal(worker.cycles, 1);
   await instance.stop();
 });

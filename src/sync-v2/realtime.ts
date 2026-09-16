@@ -86,6 +86,7 @@ export class SupabaseRealtimeManager {
   private readonly reconnectMaxMs: number;
   private channel: RealtimeChannelLike | null = null;
   private connectPromise: Promise<void> | null = null;
+  private cancelPendingConnect: (() => void) | null = null;
   private authUnsubscribe: (() => void) | null = null;
   private wakeTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -179,6 +180,8 @@ export class SupabaseRealtimeManager {
 
   private async removeCurrentChannel(expectedGeneration?: number): Promise<void> {
     if (expectedGeneration !== undefined && expectedGeneration !== this.generation) return;
+    this.cancelPendingConnect?.();
+    this.cancelPendingConnect = null;
     const channel = this.channel;
     this.channel = null;
     this.generation += 1;
@@ -215,11 +218,22 @@ export class SupabaseRealtimeManager {
     this.channel = channel;
     const generation = ++this.generation;
     this.registerWakeups(channel, generation);
-    await new Promise<void>((resolve, reject) => {
+    let cancelConnect: (() => void) | null = null;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (error) reject(error);
+          else resolve();
+        };
+        cancelConnect = () => finish(new Error('Realtime connection canceled.'));
+        this.cancelPendingConnect = cancelConnect;
       channel.subscribe((status, error) => {
         if (generation !== this.generation) return;
         if (status === 'SUBSCRIBED') {
-          resolve();
+          finish();
           return;
         }
         const message = status === 'TIMED_OUT'
@@ -228,9 +242,12 @@ export class SupabaseRealtimeManager {
             ? 'Realtime connection closed.'
             : 'Realtime connection failed.';
         void this.channelFailed(generation, message);
-        reject(error ?? new Error(message));
+        finish(error ?? new Error(message));
       });
-    });
+      });
+    } finally {
+      if (this.cancelPendingConnect === cancelConnect) this.cancelPendingConnect = null;
+    }
     if (generation !== this.generation || !this.started || !this.foreground) return;
     this.reconnectAttempt = 0;
     this.clearReconnectTimer();
@@ -243,6 +260,7 @@ export class SupabaseRealtimeManager {
     if (!this.started || !this.foreground || !this.networkOnline || this.channel) return Promise.resolve();
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = this.openChannel().catch(async error => {
+      if (!this.started || !this.foreground || !this.networkOnline) return;
       await this.worker.setRealtimeDegraded('Realtime is unavailable; periodic sync is continuing.');
       this.worker.startPeriodicPull();
       this.scheduleReconnect();
@@ -265,7 +283,7 @@ export class SupabaseRealtimeManager {
         return;
       }
       if (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
-        void this.client.realtime.setAuth(session.access_token).then(() => {
+        void this.client.realtime.setAuth().then(() => {
           if (!this.channel && this.started && this.foreground && this.networkOnline) {
             return this.connect();
           }
@@ -290,7 +308,10 @@ export class SupabaseRealtimeManager {
       await this.worker.setRealtimeDegraded('The signed-in account changed.');
       return;
     }
-    await this.client.realtime.setAuth(response.data.session.access_token);
+    // Keep Supabase's access-token callback as the source of truth. Passing the
+    // restored token explicitly can leave Realtime using a stale manual token
+    // even though Auth has refreshed the persisted session.
+    await this.client.realtime.setAuth();
     if (this.foreground && this.networkOnline) await this.connect().catch(() => undefined);
   }
 

@@ -1925,11 +1925,19 @@ async function handleAuthStateChange(next: AuthState): Promise<void> {
 async function toggleSyncPause(): Promise<void> {
   if (capabilities.recordSync) {
     if (!localRepository || !recordSyncState || !hasRecordSyncBinding()) throw new Error('Log in to sync first.');
+    const binding = currentRecordBinding();
+    if (!binding) throw new Error('Log in to sync first.');
     const paused = recordSyncState.status !== 'paused';
     if (paused) await recordRealtime?.pause();
     await localRepository.setSyncState({ ...recordSyncState, status: paused ? 'paused' : 'catching-up', lastError: null });
     await refreshLocalProjection();
-    if (!paused) await recordRealtime?.resume();
+    syncDialogRefresh?.();
+    render();
+    if (!paused) {
+      if (recordRealtime) await recordRealtime.resume();
+      else await startRecordSyncRuntime(binding);
+      await refreshLocalProjection();
+    }
     return;
   }
   await enqueueSyncMutation(async () => {
@@ -1981,12 +1989,17 @@ function openSyncDialog() {
   const pauseButton = button(syncState.status === 'paused' ? 'Resume' : 'Pause', () => void togglePause());
   const resolveButton = button('Merge', () => void mergeStoredConflicts());
   const logoutButton = button('Log out', () => void logout());
+  let pauseTransition: 'pausing' | 'resuming' | null = null;
   controls.append(loginButton, cancelLoginButton, startButton, syncNowButton, pauseButton, resolveButton, logoutButton);
   editor.body.append(intro, statusLine, accountLine, controls);
   editor.save.textContent = 'Close';
 
   function refresh() {
-    statusLine.textContent = `${syncStatusLabel()} · ${syncStatusDetail()}`;
+    statusLine.textContent = pauseTransition === 'resuming'
+      ? 'Syncing… · Reconnecting to cloud sync and checking for updates.'
+      : pauseTransition === 'pausing'
+        ? 'Pausing… · Finishing the current sync transition.'
+        : `${syncStatusLabel()} · ${syncStatusDetail()}`;
     const signedIn = authState.status === 'signed-in' && Boolean(authState.userId);
     const connected = hasActiveSyncBinding();
     loginButton.hidden = signedIn;
@@ -1997,12 +2010,16 @@ function openSyncDialog() {
     syncNowButton.hidden = !connected;
     syncNowButton.disabled = !connected || (capabilities.recordSync ? recordSyncState?.status === 'paused' : syncState.status === 'paused');
     pauseButton.hidden = !connected;
-    pauseButton.disabled = !connected;
+    pauseButton.disabled = !connected || pauseTransition !== null;
     resolveButton.hidden = capabilities.recordSync || !connected;
     resolveButton.disabled = capabilities.recordSync || !syncState.conflicts.length;
     logoutButton.hidden = !signedIn;
     logoutButton.disabled = authState.status === 'signing-in';
-    pauseButton.textContent = (capabilities.recordSync ? recordSyncState?.status : syncState.status) === 'paused' ? 'Resume' : 'Pause';
+    pauseButton.textContent = pauseTransition === 'resuming'
+      ? 'Resuming…'
+      : pauseTransition === 'pausing'
+        ? 'Pausing…'
+        : (capabilities.recordSync ? recordSyncState?.status : syncState.status) === 'paused' ? 'Resume' : 'Pause';
     editor.save.disabled = false;
     if (!authState.configured) accountLine.textContent = 'Sync is not configured for this build.';
     else if (signedIn) {
@@ -2085,12 +2102,16 @@ function openSyncDialog() {
 
   async function togglePause() {
     editor.error.textContent = '';
+    const currentlyPaused = (capabilities.recordSync ? recordSyncState?.status : syncState.status) === 'paused';
+    pauseTransition = currentlyPaused ? 'resuming' : 'pausing';
+    refresh();
     try {
       await toggleSyncPause();
       setStatusMessage((capabilities.recordSync ? recordSyncState?.status : syncState.status) === 'paused' ? 'Cloud sync paused; local saves continue.' : 'Cloud sync resumed.');
-      refresh();
     } catch (error) {
       editor.error.textContent = `Could not change sync state: ${errorText(error)}`;
+    } finally {
+      pauseTransition = null;
       refresh();
     }
   }

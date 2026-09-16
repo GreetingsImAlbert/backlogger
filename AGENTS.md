@@ -71,6 +71,7 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 ## Working practice
 
 - Preserve unrelated changes in the working tree and keep secrets, tokens, signing keys, and machine-specific credentials out of Git.
+- If Computer Use through `cua_repl` reports `Trusted RPC service is not configured: sky`, use the `computer-use` skill for native Windows automation through trusted `node_repl` and `@oai/sky`, not `cua_repl`. If `node_repl` is not directly visible, inspect the callable tool inventory for `mcp__node_repl__js` and invoke it. Follow the skill's initialization, observation, input, and approval rules.
 - The user runs Supabase migrations, resets, links, pushes, and database tests manually; prepare the files and commands, but do not run remote or destructive Supabase operations on their behalf.
 - The user creates Git commits manually; do not commit or amend history unless explicitly requested.
 - A sole user prompt of `cm` means: provide a concise commit message covering every uncommitted change since the last commit, following the repository's existing title, blank line, and bullet format. Summarize major changes rather than listing implementation details. Always place the entire commit message inside a fenced `text` code block.
