@@ -56,7 +56,7 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 - Preserve stable IDs, canonical category/task ordering, serialized saves, schema validation, backups, explicit recovery, and the desktop single-instance guard.
 - Task drag-and-drop stays within its category. Keep Move up/down actions as the keyboard and non-drag fallback.
 - Device preferences, credentials, transport bindings, device identity, acknowledged bases, cursors, and outbox state never belong in portable notebook exports or shared cloud records.
-- Android has native local persistence. Supabase sync and document import/export remain disabled there until their `mobile-implementation.md` milestones implement and verify them.
+- Android has native local persistence and Supabase v2 polling sync. Realtime and document import/export remain disabled there until their `mobile-implementation.md` milestones implement and verify them.
 
 ## Sync safety
 

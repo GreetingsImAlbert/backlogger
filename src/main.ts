@@ -26,8 +26,12 @@ import {
   RecordSyncStartupGate,
   bindRepositoryToRecordSync,
   buildLegacyBootstrapPreview,
+  pauseRecordSyncExecution,
   presentRecordSyncStatus,
   recordSyncStartupRetryDelay,
+  resumeRecordSyncExecution,
+  startRecordSyncExecution,
+  stopRecordSyncExecution,
   type LegacyBootstrapPreview,
   type RecordSyncBinding,
   type RecordSyncState,
@@ -802,8 +806,8 @@ function syncStatusDetail(): string {
   if (authState.status === 'signing-in') return 'Complete Google sign-in in your browser.';
   if (!capabilities.cloudSync) {
     return authState.status === 'signed-in'
-      ? 'Google sign-in is ready. Android cloud data remains disabled in this milestone.'
-      : 'Log in with Google. Android cloud data remains disabled in this milestone.';
+      ? 'Google sign-in is ready, but cloud data is unavailable on this device.'
+      : 'Log in with Google when cloud data becomes available on this device.';
   }
   if (capabilities.recordSync) {
     return presentRecordSyncStatus(recordSyncState, recordOutboxCount, hasRecordSyncBinding()).detail;
@@ -1558,11 +1562,11 @@ async function askRecordBootstrapConfirmation(preview: LegacyBootstrapPreview | 
 }
 
 async function stopRecordSyncRuntime(): Promise<void> {
+  const worker = recordSyncWorker;
   const realtime = recordRealtime;
   recordRealtime = null;
-  recordSyncWorker?.stopPeriodicPull();
   recordSyncWorker = null;
-  if (realtime) await realtime.stop();
+  await stopRecordSyncExecution(worker, realtime);
 }
 
 async function startRecordSyncRuntime(binding: RecordSyncBinding): Promise<void> {
@@ -1575,11 +1579,16 @@ async function startRecordSyncRuntime(binding: RecordSyncBinding): Promise<void>
       render();
     },
   });
-  const realtime = new SupabaseRealtimeManager(binding, worker);
+  const realtime = capabilities.realtimeSync ? new SupabaseRealtimeManager(binding, worker) : null;
   recordSyncWorker = worker;
   recordRealtime = realtime;
-  await realtime.start();
+  await startRecordSyncExecution(worker, realtime);
   await refreshLocalProjection();
+}
+
+async function legacyCloudNotebookExists(location: SupabaseLocation): Promise<boolean> {
+  const coordinator = new SyncCoordinator(new SupabaseSyncTransport(location));
+  return Boolean(await withSyncTimeout(coordinator.readManifestResource()));
 }
 
 async function readLegacyBootstrap(location: SupabaseLocation): Promise<{
@@ -1626,7 +1635,16 @@ async function bindRecordSyncAccount(): Promise<void> {
     return;
   }
 
-  const legacy = await readLegacyBootstrap(location);
+  const legacy = capabilities.legacySnapshotMigration
+    ? await readLegacyBootstrap(location)
+    : { manifest: null, preview: null };
+  const blockedLegacyExists = capabilities.legacySnapshotMigration
+    ? false
+    : await legacyCloudNotebookExists(location);
+  if (blockedLegacyExists) {
+    recordCloudInspection = { accountId: location.accountId, notebookId: null, legacyExists: true, error: null };
+    throw new Error('This account still uses legacy cloud sync. Open the current Windows app once to migrate it before connecting Android.');
+  }
   recordCloudInspection = { accountId: location.accountId, notebookId: null, legacyExists: Boolean(legacy.manifest), error: null };
   if (!(await askRecordBootstrapConfirmation(legacy.preview))) return;
   if (legacy.preview && notebookFingerprint(legacy.preview.notebook) !== notebookFingerprint(notebook)) {
@@ -1803,9 +1821,9 @@ async function inspectRecordAuthenticatedAccount(): Promise<void> {
     const gateway = new SupabaseRecordBootstrapGateway(accountId, { projectRef: location.projectRef });
     const cloud = await withSyncTimeout(gateway.inspectNotebook());
     if (authState.status !== 'signed-in' || authState.userId !== accountId) return;
-    const legacy = cloud ? null : await readLegacyBootstrap(location);
+    const legacyExists = cloud ? false : await legacyCloudNotebookExists(location);
     if (authState.status !== 'signed-in' || authState.userId !== accountId) return;
-    recordCloudInspection = { accountId, notebookId: cloud?.notebook_id ?? null, legacyExists: Boolean(legacy?.manifest), error: null };
+    recordCloudInspection = { accountId, notebookId: cloud?.notebook_id ?? null, legacyExists, error: null };
     const binding = currentRecordBinding();
     if (!binding) return;
     if (binding.accountId !== accountId) {
@@ -1818,7 +1836,7 @@ async function inspectRecordAuthenticatedAccount(): Promise<void> {
       await stopRecordSyncRuntime();
       return;
     }
-    if (!recordRealtime && recordSyncState?.status !== 'paused') await startRecordSyncRuntime(binding);
+    if (!recordSyncWorker && recordSyncState?.status !== 'paused') await startRecordSyncRuntime(binding);
     clearRecordInspectionRetry();
   } catch (error) {
     if (authState.status !== 'signed-in' || authState.userId !== accountId) return;
@@ -1844,7 +1862,21 @@ async function inspectRecordAuthenticatedAccount(): Promise<void> {
 
 async function inspectAuthenticatedAccount(): Promise<void> {
   if (!capabilities.supabaseSync || !syncReady || !storageReady || authState.status !== 'signed-in' || !authState.userId) return;
-  if (capabilities.recordSync) return recordStartupGate.run(inspectRecordAuthenticatedAccount);
+  if (capabilities.recordSync) {
+    if (cloudInspectionInFlight) return cloudInspectionInFlight;
+    const operation = recordStartupGate.run(inspectRecordAuthenticatedAccount);
+    let tracked: Promise<void>;
+    tracked = operation.finally(() => {
+      if (cloudInspectionInFlight === tracked) {
+        cloudInspectionInFlight = null;
+        syncDialogRefresh?.();
+        render();
+      }
+    });
+    cloudInspectionInFlight = tracked;
+    await tracked;
+    return;
+  }
   if (cloudInspectionInFlight) return cloudInspectionInFlight;
   const accountId = authState.userId;
   const operation = enqueueSyncMutation(async () => {
@@ -1935,14 +1967,17 @@ async function toggleSyncPause(): Promise<void> {
     const binding = currentRecordBinding();
     if (!binding) throw new Error('Log in to sync first.');
     const paused = recordSyncState.status !== 'paused';
-    if (paused) await recordRealtime?.pause();
+    if (paused && recordSyncWorker) await pauseRecordSyncExecution(recordSyncWorker, recordRealtime);
     await localRepository.setSyncState({ ...recordSyncState, status: paused ? 'paused' : 'catching-up', lastError: null });
     await refreshLocalProjection();
     syncDialogRefresh?.();
     render();
     if (!paused) {
-      if (recordRealtime) await recordRealtime.resume();
-      else await startRecordSyncRuntime(binding);
+      if (recordSyncWorker) {
+        await resumeRecordSyncExecution(recordSyncWorker, recordRealtime);
+      } else {
+        await startRecordSyncRuntime(binding);
+      }
       await refreshLocalProjection();
     }
     return;
@@ -1992,7 +2027,8 @@ function openSyncDialog() {
   const loginButton = button('Continue with Google', () => void login());
   const cancelLoginButton = button('Cancel sign-in', () => cancelPendingLogin());
   const startButton = button('Start sync', () => void connect());
-  const syncNowButton = button('Check for updates', () => void runSyncNow());
+  const pollingRecordSync = capabilities.recordSync && !capabilities.realtimeSync;
+  const syncNowButton = button(pollingRecordSync ? 'Retry' : 'Check for updates', () => void runSyncNow());
   const pauseButton = button(syncState.status === 'paused' ? 'Resume' : 'Pause', () => void togglePause());
   const resolveButton = button('Merge', () => void mergeStoredConflicts());
   const logoutButton = button('Log out', () => void logout());
@@ -2014,7 +2050,8 @@ function openSyncDialog() {
     cancelLoginButton.hidden = authState.status !== 'signing-in';
     startButton.hidden = !capabilities.cloudSync || !signedIn || connected;
     startButton.disabled = !capabilities.cloudSync || !syncReady || Boolean(cloudInspectionInFlight);
-    syncNowButton.hidden = !connected;
+    const recordSyncFailed = recordSyncState?.status === 'degraded' || recordSyncState?.status === 'error';
+    syncNowButton.hidden = !connected || (pollingRecordSync && !recordSyncFailed);
     syncNowButton.disabled = !connected || (capabilities.recordSync ? recordSyncState?.status === 'paused' : syncState.status === 'paused');
     pauseButton.hidden = !connected;
     pauseButton.disabled = !connected || pauseTransition !== null;
@@ -2032,7 +2069,7 @@ function openSyncDialog() {
     else if (signedIn) {
       const email = authState.email ?? 'Google account';
       if (!capabilities.cloudSync) {
-        accountLine.textContent = `Signed in as ${email}. Cloud data remains disabled on Android until the next milestone.`;
+        accountLine.textContent = `Signed in as ${email}. Cloud data is unavailable on this device.`;
       } else if (capabilities.recordSync) {
         const inspection = recordCloudInspection?.accountId === authState.userId ? recordCloudInspection : null;
         accountLine.textContent = inspection?.error
@@ -2040,7 +2077,9 @@ function openSyncDialog() {
           : inspection?.notebookId
             ? `Signed in as ${email}. Live cloud notebook found.`
             : inspection?.legacyExists
-              ? `Signed in as ${email}. Legacy cloud data is ready to migrate.`
+              ? capabilities.legacySnapshotMigration
+                ? `Signed in as ${email}. Legacy cloud data is ready to migrate.`
+                : `Signed in as ${email}. Migrate this legacy cloud notebook once from the current Windows app before connecting Android.`
               : `Signed in as ${email}. No live cloud notebook exists yet.`;
       } else {
         const inspection = cloudInspection?.accountId === authState.userId ? cloudInspection : null;
@@ -2203,10 +2242,12 @@ async function performLocalWrite(
     );
     if (options.contentChanged) {
       if (capabilities.recordSync) {
-        void recordSyncWorker?.runCycle().catch(async () => {
-          await refreshLocalProjection();
-          render();
-        });
+        if (recordSyncState?.status !== 'paused') {
+          void recordSyncWorker?.runCycle().catch(async () => {
+            await refreshLocalProjection();
+            render();
+          });
+        }
       } else {
         scheduleSyncPublication(
           saveSequence,
@@ -2597,7 +2638,7 @@ function render() {
     importButton.title = 'Import and export will be available in a later Android milestone.';
     exportButton.title = 'Import and export will be available in a later Android milestone.';
   }
-  syncButton.textContent = hasActiveSyncBinding() || (authState.status === 'signed-in' && !capabilities.cloudSync)
+  syncButton.textContent = hasActiveSyncBinding() || authState.status === 'signed-in'
     ? 'Sync settings'
     : 'Log in to Sync';
   syncButton.disabled = !storageReady || closeInProgress || !capabilities.supabaseAuth || !syncReady;
@@ -2848,21 +2889,31 @@ const refreshDateState = () => {
 };
 window.addEventListener('focus', () => {
   refreshDateState();
-  if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in' && !recordRealtime) {
-    void inspectAuthenticatedAccount();
+  if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in') {
+    if (!recordSyncWorker) void inspectAuthenticatedAccount();
+    else if (!capabilities.realtimeSync) void attemptPendingSync();
   }
-  void checkForSharedUpdate();
+  if (!capabilities.recordSync) void checkForSharedUpdate();
 });
 window.addEventListener('online', () => {
-  if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in' && !recordRealtime) {
-    clearRecordInspectionRetry();
-    void inspectAuthenticatedAccount();
+  if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in') {
+    if (!recordSyncWorker) {
+      clearRecordInspectionRetry();
+      void inspectAuthenticatedAccount();
+    } else if (!capabilities.realtimeSync) {
+      void attemptPendingSync();
+    }
   }
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     refreshDateState();
-    void checkForSharedUpdate();
+    if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in') {
+      if (!recordSyncWorker) void inspectAuthenticatedAccount();
+      else if (!capabilities.realtimeSync) void attemptPendingSync();
+    } else if (!capabilities.recordSync) {
+      void checkForSharedUpdate();
+    }
   }
 });
 setInterval(refreshDateState, 30_000);
@@ -2918,7 +2969,7 @@ async function loadInitialData() {
     sessionPhase = syncLoadError ? 'offline' : 'ready';
     render();
     if (syncReady && authState.status === 'signed-in'
-      && (capabilities.recordSync ? Boolean(currentRecordBinding()) : syncState.status === 'connected')) void inspectAuthenticatedAccount();
+      && (capabilities.recordSync || syncState.status === 'connected')) void inspectAuthenticatedAccount();
     else setStatusMessage(syncLoadError ? 'Working offline. Sync settings could not be loaded.' : '');
   } catch (error) {
     storageReady = true;

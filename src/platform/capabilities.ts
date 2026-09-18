@@ -17,10 +17,14 @@ export interface PlatformCapabilities {
   supabaseAuth: boolean;
   /** Provider-neutral cloud-sync entry point. */
   cloudSync: boolean;
-  /** Supabase transport is Windows-only until Android callback/lifecycle work is verified. */
+  /** Supabase-backed data access is available for this runtime. */
   supabaseSync: boolean;
-  /** Record-level Supabase sync, currently enabled only on Windows. */
+  /** Record-level Supabase sync through the shared cursor/OCC protocol. */
   recordSync: boolean;
+  /** Realtime is enabled separately from record sync so Android can begin with polling. */
+  realtimeSync: boolean;
+  /** Legacy snapshot migration remains a Windows-only compatibility path. */
+  legacySnapshotMigration: boolean;
   desktopClose: boolean;
   mobileLifecycle: boolean;
 }
@@ -51,6 +55,8 @@ export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind())
       cloudSync: true,
       supabaseSync: true,
       recordSync: RECORD_SYNC_ENABLED,
+      realtimeSync: RECORD_SYNC_ENABLED,
+      legacySnapshotMigration: RECORD_SYNC_ENABLED,
       desktopClose: true,
       mobileLifecycle: false,
     };
@@ -62,9 +68,11 @@ export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind())
       nativeDocuments: false,
       documentImportExport: false,
       supabaseAuth: true,
-      cloudSync: false,
-      supabaseSync: false,
-      recordSync: false,
+      cloudSync: true,
+      supabaseSync: true,
+      recordSync: true,
+      realtimeSync: false,
+      legacySnapshotMigration: false,
       desktopClose: false,
       mobileLifecycle: true,
     };
@@ -79,6 +87,8 @@ export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind())
       cloudSync: false,
       supabaseSync: false,
       recordSync: false,
+      realtimeSync: false,
+      legacySnapshotMigration: false,
       desktopClose: false,
       mobileLifecycle: true,
     };
@@ -92,6 +102,8 @@ export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind())
     cloudSync: false,
     supabaseSync: false,
     recordSync: false,
+    realtimeSync: false,
+    legacySnapshotMigration: false,
     desktopClose: false,
     mobileLifecycle: false,
   };

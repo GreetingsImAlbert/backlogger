@@ -192,7 +192,7 @@ test('runtime detection distinguishes packaged Android from desktop and browser 
   assert.equal(detectRuntimeKind(true, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), 'desktop');
 });
 
-test('Android exposes auth without enabling cloud records while Windows keeps the v2 cutover', () => {
+test('Android enables polling record sync while Windows keeps Realtime and legacy migration', () => {
   assert.equal(RECORD_SYNC_ENABLED, true);
   assert.equal(platformCapabilities().recordSync, false);
   assert.deepEqual(platformCapabilities('android'), {
@@ -201,9 +201,11 @@ test('Android exposes auth without enabling cloud records while Windows keeps th
     nativeDocuments: false,
     documentImportExport: false,
     supabaseAuth: true,
-    cloudSync: false,
-    supabaseSync: false,
-    recordSync: false,
+    cloudSync: true,
+    supabaseSync: true,
+    recordSync: true,
+    realtimeSync: false,
+    legacySnapshotMigration: false,
     desktopClose: false,
     mobileLifecycle: true,
   });
@@ -212,4 +214,6 @@ test('Android exposes auth without enabling cloud records while Windows keeps th
   assert.equal(desktop.cloudSync, true);
   assert.equal(desktop.supabaseSync, true);
   assert.equal(desktop.recordSync, true);
+  assert.equal(desktop.realtimeSync, true);
+  assert.equal(desktop.legacySnapshotMigration, true);
 });
