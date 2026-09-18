@@ -1,6 +1,6 @@
 # Android implementation plan
 
-Status: Milestones 1–4 are complete and accepted. Milestone 5 foreground Realtime and lifecycle recovery are implemented; hosted Realtime acceptance is still required. Android document import/export remains disabled. Windows and Android share the record-level Supabase v2 protocol, polling recovery, restored-session handling, and Realtime wake-ups rather than the retired snapshot protocol.
+Status: Milestones 1–5 are complete and accepted. Milestone 6 document-provider import/export and mobile layout work are implemented; final provider/accessibility acceptance remains. Windows and Android share the record-level Supabase v2 protocol, polling recovery, restored-session handling, and Realtime wake-ups rather than the retired snapshot protocol.
 
 Backlogger remains one Tauri 2 repository. Windows and Android share TypeScript, CSS, Rust, SQLite schema, and sync modules, but their release versions may differ. Local-only use must always work without an account or network.
 
@@ -96,7 +96,7 @@ The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realti
 
 **Prerequisites:** Gates A–B. **Likely files:** `src/supabase/auth.ts`, `src/platform/capabilities.ts`, `src/main.ts`, `src-tauri/Cargo.toml`, `src-tauri/src/lib.rs`, `src-tauri/tauri.conf.json`, `src-tauri/capabilities/mobile.json`, focused auth/capability tests.
 
-1. Make `tauri-plugin-deep-link` and `tauri-plugin-opener` dependencies and initialization available on Android. Keep dialog, desktop single-instance handling, and the loopback listener implementation/command registration desktop-only.
+1. Make `tauri-plugin-deep-link`, `tauri-plugin-opener`, and the document dialog bridge available on Android. Keep desktop single-instance handling and the loopback listener implementation/command registration desktop-only.
 2. In tracked Tauri config, add a mobile deep-link entry limited to scheme `backlogger`, host `auth`, and path `/callback`. Add `deep-link:default` and a narrowly scoped `opener:allow-open-url` for the Supabase authorize endpoint to `mobile.json`; do not rely on hand-edited generated manifests.
 3. Select OAuth behavior from `platformCapabilities().runtime`, not merely “is Tauri”: desktop starts the loopback listener, Android uses exactly `backlogger://auth/callback`, and browser preview stays local-only. Android must never invoke `start_oauth_callback_listener`.
 4. Open the authorization URL in the system browser. Keep Supabase PKCE, `skipBrowserRedirect`, `openid email profile`, pending-flow expiry, exact scheme/host/path validation, and one-time code exchange.
@@ -190,6 +190,15 @@ The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realti
 **Verify:** provider round trip, cancellation, denied/revoked access, unwritable destination, malformed/future JSON, interruption, recovery, rotation, keyboard, smallest viewport, TalkBack, and touch reorder.
 
 **Done when:** documents and mobile UI work without raw paths, inaccessible controls, data loss, or Windows regression.
+
+### Milestone 6 handoff
+
+- Enabled Android system document providers through `tauri-plugin-dialog` and `tauri-plugin-fs`. Android picker results remain `content://` references and are read/written through content streams; Windows continues using its existing filesystem commands.
+- Enabled Android `nativeDocuments` and `documentImportExport` only after the provider round trip. Import still validates and previews before the existing recovery-backed `LocalRepository` replacement; cancellation is a no-op and portable exports exclude preferences, auth, sync, and device state.
+- Added safe-area and dynamic-viewport dialog sizing, keyboard/landscape spacing, touch-scroll behavior that leaves drag handles isolated, and an accessible hidden import control. Updated the viewport for cutout-safe Android layouts.
+- Verification passed: TypeScript, 131 tests, production build, Rust format/check, secret scan, Windows NSIS build, and x86_64 debug APK build. API 36 x86_64 emulator `emulator-5554` installed and launched the APK; export opened the Android `ACTION_CREATE_DOCUMENT` provider and wrote a 362-byte portable JSON, import reopened it through `ACTION_GET_CONTENT`, previewed the validated replacement, and saved it. Picker cancellation returned without an error status. Crash log was empty for the flow.
+- Emulator APK: `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`; SHA-256 `2C16C6978A3559DA1FCCBBA3DFB54EC45716C4225912498162E0A9C958EB107E`.
+- Remaining user acceptance: denied/revoked provider access, unwritable destinations, malformed/future files, interrupted import/export, rotation, smallest supported viewport, keyboard focus, font scaling, TalkBack, and touch reorder. Milestone 7 can begin after those checks pass.
 
 ## Milestone 7 — Windows/Android acceptance
 

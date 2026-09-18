@@ -448,6 +448,7 @@ const importInput = element('input');
 importInput.type = 'file';
 importInput.accept = 'application/json,.json';
 importInput.hidden = true;
+importInput.setAttribute('aria-label', 'Choose a Backlogger JSON file');
 importInput.addEventListener('change', () => {
   const file = importInput.files?.[0];
   importInput.value = '';
@@ -531,7 +532,7 @@ function taskCount(categories: Notebook['categories']): number {
 
 async function exportCurrentDocument() {
   if (!capabilities.documentImportExport) {
-    setStatusMessage('Import and export will be available on Android in a later milestone.');
+    setStatusMessage('Import and export are unavailable on this platform.');
     return;
   }
   const stored = makePortableDocument(notebook, revision);
@@ -558,6 +559,7 @@ async function exportCurrentDocument() {
     }
     setStatusMessage(`Exported ${taskCount(stored.categories)} task(s) in ${stored.categories.length} categor${stored.categories.length === 1 ? 'y' : 'ies'}.`);
   } catch (error) {
+    if (isDocumentPickerCancellation(error)) return;
     setStatusMessage(`Export failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -648,10 +650,10 @@ async function inspectImport(file: File) {
 
 async function startImport() {
   if (!capabilities.documentImportExport) {
-    setStatusMessage('Import and export will be available on Android in a later milestone.');
+    setStatusMessage('Import and export are unavailable on this platform.');
     return;
   }
-  if (storageKind() !== 'desktop') {
+  if (!capabilities.nativeDocuments || storageKind() === 'browser') {
     importInput.click();
     return;
   }
@@ -660,14 +662,23 @@ async function startImport() {
       title: 'Import Backlogger',
       multiple: false,
       directory: false,
+      pickerMode: 'document',
       filters: [{ name: 'Backlogger JSON', extensions: ['json'] }],
     });
     if (typeof path !== 'string') return;
     const imported = parseImportPayload(await readDocumentFile(path));
-    showImportDialog(path.split(/[\\/]/).pop() ?? path, imported.document, imported.syncSnapshot);
+    const fileName = /^content:\/\//i.test(path)
+      ? 'selected Backlogger document'
+      : path.split(/[\\/]/).pop() ?? path;
+    showImportDialog(fileName, imported.document, imported.syncSnapshot);
   } catch (error) {
+    if (isDocumentPickerCancellation(error)) return;
     setStatusMessage(`Import failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function isDocumentPickerCancellation(error: unknown): boolean {
+  return /cancel(?:ed|led)|user aborted/i.test(errorText(error));
 }
 
 function errorText(error: unknown): string {
@@ -2641,8 +2652,8 @@ function render() {
   allView.disabled = todayView.disabled = tomorrowView.disabled = !editingReady;
   importButton.disabled = exportButton.disabled = !editingReady || !capabilities.documentImportExport;
   if (!capabilities.documentImportExport) {
-    importButton.title = 'Import and export will be available in a later Android milestone.';
-    exportButton.title = 'Import and export will be available in a later Android milestone.';
+    importButton.title = 'Import is unavailable on this platform.';
+    exportButton.title = 'Export is unavailable on this platform.';
   }
   syncButton.textContent = hasActiveSyncBinding() || authState.status === 'signed-in'
     ? 'Sync settings'

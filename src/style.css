@@ -203,7 +203,7 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
 .conflict-item strong { font-size: 12px; font-weight: 600; }
 .conflict-values { display: grid; gap: 4px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .conflict-values p { font-size: 11px; }
-.editor { color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px; width: min(440px, calc(100% - 24px)); max-height: calc(100% - 24px); overflow-y: auto; box-shadow: var(--shadow); }
+.editor { color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px; width: min(440px, calc(100% - 24px)); max-height: min(calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)), 720px); overflow-y: auto; overscroll-behavior: contain; scroll-padding-block: 16px; box-shadow: var(--shadow); }
 .editor::backdrop { background: #0008; }
 .editor h2 { font-size: 18px; font-weight: 600; margin: 0 0 24px; overflow-wrap: anywhere; letter-spacing: -.3px; }
 .editor p { margin: 0; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
@@ -243,9 +243,24 @@ h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.5px; }
   .editor { padding: 18px; }
   .task { padding-left: 4px; }
 }
+@media (max-width: 480px) {
+  .editor { width: calc(100% - 16px); padding: 20px 18px calc(20px + env(safe-area-inset-bottom, 0px)); max-height: calc(100dvh - 16px - env(safe-area-inset-top, 0px)); }
+  .editor h2 { margin-bottom: 20px; }
+  .editor-actions { gap: 6px; }
+  .editor-actions > button { min-width: 96px; }
+}
+@media (orientation: landscape) and (max-height: 520px) {
+  .notebook { padding-top: calc(10px + env(safe-area-inset-top, 0px)); padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px)); }
+  .editor { max-height: calc(100dvh - 12px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); }
+  .editor h2 { margin-bottom: 14px; }
+  .editor-body { gap: 12px; }
+  .editor-actions { margin-top: 16px; }
+}
 @media (pointer: coarse) {
   button, .action-menu > summary { min-height: 44px; }
   .icon-button { width: 44px; height: 44px; padding: 11px; }
   .drag-handle { width: 44px; height: 44px; padding: 14px; }
   .day-button { min-height: 44px; }
+  .task { touch-action: pan-y; }
+  .task-content, .task-edit, .category-heading { touch-action: manipulation; }
 }

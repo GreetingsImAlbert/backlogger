@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { normalizeDates, parseDate } from './dates.ts';
 import type { Category, Notebook, Task } from './model.ts';
 import { isTauriRuntime } from './platform/capabilities.ts';
@@ -257,10 +258,16 @@ export async function writeStoredDocument(document: StoredDocument): Promise<voi
 
 export async function readDocumentFile(path: string): Promise<string> {
   if (!isTauriRuntime()) throw new Error('Native file reading is unavailable in the browser preview.');
+  if (/^content:\/\//i.test(path)) return readTextFile(path);
   return invoke<string>('read_document_file', { path });
 }
 
 export async function writeDocumentFile(path: string, raw: string): Promise<void> {
   if (!isTauriRuntime()) throw new Error('Native file writing is unavailable in the browser preview.');
+  if (/^content:\/\//i.test(path)) {
+    JSON.parse(raw);
+    await writeTextFile(path, raw);
+    return;
+  }
   await invoke('write_document_file', { path, document: raw });
 }

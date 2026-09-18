@@ -65,8 +65,8 @@ export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind())
     return {
       runtime,
       nativeLocalStorage: true,
-      nativeDocuments: false,
-      documentImportExport: false,
+      nativeDocuments: true,
+      documentImportExport: true,
       supabaseAuth: true,
       cloudSync: true,
       supabaseSync: true,

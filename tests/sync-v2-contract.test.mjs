@@ -198,8 +198,8 @@ test('Android and Windows enable Realtime while legacy migration remains desktop
   assert.deepEqual(platformCapabilities('android'), {
     runtime: 'android',
     nativeLocalStorage: true,
-    nativeDocuments: false,
-    documentImportExport: false,
+    nativeDocuments: true,
+    documentImportExport: true,
     supabaseAuth: true,
     cloudSync: true,
     supabaseSync: true,

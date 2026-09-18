@@ -380,10 +380,11 @@ pub fn run() {
         }));
     }
     builder = builder.plugin(tauri_plugin_deep_link::init());
+    builder = builder.plugin(tauri_plugin_dialog::init());
+    builder = builder.plugin(tauri_plugin_fs::init());
     builder = builder.plugin(tauri_plugin_opener::init());
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_dialog::init());
         builder = builder.setup(|_app| {
             #[cfg(all(debug_assertions, windows))]
             {
