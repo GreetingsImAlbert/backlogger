@@ -192,7 +192,7 @@ test('runtime detection distinguishes packaged Android from desktop and browser 
   assert.equal(detectRuntimeKind(true, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), 'desktop');
 });
 
-test('Android enables polling record sync while Windows keeps Realtime and legacy migration', () => {
+test('Android and Windows enable Realtime while legacy migration remains desktop-only', () => {
   assert.equal(RECORD_SYNC_ENABLED, true);
   assert.equal(platformCapabilities().recordSync, false);
   assert.deepEqual(platformCapabilities('android'), {
@@ -204,7 +204,7 @@ test('Android enables polling record sync while Windows keeps Realtime and legac
     cloudSync: true,
     supabaseSync: true,
     recordSync: true,
-    realtimeSync: false,
+    realtimeSync: true,
     legacySnapshotMigration: false,
     desktopClose: false,
     mobileLifecycle: true,

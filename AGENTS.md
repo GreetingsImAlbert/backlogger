@@ -56,14 +56,14 @@ cmd /c "npx.cmd supabase gen types typescript --linked > supabase/database.types
 - Preserve stable IDs, canonical category/task ordering, serialized saves, schema validation, backups, explicit recovery, and the desktop single-instance guard.
 - Task drag-and-drop stays within its category. Keep Move up/down actions as the keyboard and non-drag fallback.
 - Device preferences, credentials, transport bindings, device identity, acknowledged bases, cursors, and outbox state never belong in portable notebook exports or shared cloud records.
-- Android has native local persistence and Supabase v2 polling sync. Realtime and document import/export remain disabled there until their `mobile-implementation.md` milestones implement and verify them.
+- Android has native local persistence and foreground Supabase v2 sync with Realtime plus polling recovery. Document import/export remains disabled until its `mobile-implementation.md` milestone.
 
 ## Sync safety
 
-- The UI reads and writes only through the local SQLite repository. Optional Windows sync reconciles those records with the signed-in user's canonical Supabase v2 notebook in the background.
+- The UI reads and writes only through the local SQLite repository. Optional Windows and Android sync reconcile those records with the signed-in user's canonical Supabase v2 notebook in the background.
 - Preserve stable record IDs, per-field clocks, acknowledged bases, soft-delete tombstones, the durable outbox, and the server `change_seq` cursor across restarts.
 - Pull ordered ledger changes by cursor and apply records plus cursor atomically. Push through optimistic version checks; stale writes use the tested three-way merge and bounded retry rules.
-- Realtime events are wake-ups only. Validate and fetch ledger changes before touching local state, and keep periodic polling as the recovery path.
+- Realtime events are wake-ups only. Validate and fetch ledger changes before touching local state, keep periodic polling as the recovery path, and keep Android Realtime foreground-only.
 - Login is read-only. Creating the first v2 notebook requires explicit **Start sync** confirmation. Never publish to an unconfirmed account/project/notebook binding.
 - Missing, partial, invalid, unauthorized, or unavailable cloud data never means an empty notebook and never authorizes local replacement or deletion.
 - Legacy snapshots/manifests and schema-1/2 folder state are read-only migration or rollback inputs. Do not dual-write or remove them during the staged rollout; cleanup requires a stable release and explicit user approval.

@@ -141,6 +141,7 @@ function manager(client, worker, options = {}) {
     client,
     lifecycle: null,
     eventDebounceMs: 5,
+    connectTimeoutMs: 50,
     reconnectBaseMs: 5,
     reconnectMaxMs: 10,
     ...options,
@@ -299,5 +300,50 @@ test('pausing a pending subscription cancels it so resume cannot inherit a stuck
   client.channels[1].status('SUBSCRIBED');
   await resumed;
   assert.equal(worker.cycles, 1);
+  await instance.stop();
+});
+
+test('manual pause is not undone by focus or visibility lifecycle events', async () => {
+  const client = new FakeClient();
+  const worker = new FakeWorker();
+  const lifecycle = new FakeLifecycle();
+  const instance = manager(client, worker, { lifecycle });
+  await subscribe(instance, client);
+
+  await instance.pause();
+  lifecycle.visible = false;
+  lifecycle.emit('visibilitychange');
+  lifecycle.visible = true;
+  lifecycle.emit('visibilitychange');
+  lifecycle.emit('focus');
+  lifecycle.online = false;
+  lifecycle.emit('offline');
+  await wait(10);
+  assert.equal(client.channels.length, 1);
+  assert.equal(worker.realtimeStates.at(-1), null);
+
+  lifecycle.online = true;
+  const resumed = instance.resume();
+  await wait(0);
+  assert.equal(client.channels.length, 2);
+  client.channels[1].status('SUBSCRIBED');
+  await resumed;
+  await instance.stop();
+});
+
+test('a silent subscription times out into polling and removes its stale channel', async () => {
+  const client = new FakeClient();
+  const worker = new FakeWorker();
+  const instance = manager(client, worker, {
+    connectTimeoutMs: 5,
+    reconnectBaseMs: 100,
+    reconnectMaxMs: 100,
+  });
+
+  await instance.start();
+  assert.equal(client.channels.length, 1);
+  assert.deepEqual(client.removed, [client.channels[0]]);
+  assert.ok(worker.periodicStarts.includes(true));
+  assert.match(worker.realtimeStates.at(-1), /periodic sync is continuing/i);
   await instance.stop();
 });

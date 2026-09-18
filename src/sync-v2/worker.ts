@@ -33,6 +33,7 @@ export interface RecordSyncCycleRunner {
   runCycle(): Promise<RecordSyncCycleResult>;
   startPeriodicPull(runImmediately?: boolean): void;
   stopPeriodicPull(): void;
+  markCatchingUp(): Promise<void>;
   setRealtimeDegraded(message: string | null): Promise<void>;
 }
 
@@ -327,6 +328,10 @@ export class RecordSyncWorker {
     if (this.timer === null) return;
     clearInterval(this.timer);
     this.timer = null;
+  }
+
+  async markCatchingUp(): Promise<void> {
+    await this.setStatus('catching-up', null);
   }
 
   async setRealtimeDegraded(message: string | null): Promise<void> {

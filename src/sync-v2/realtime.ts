@@ -43,6 +43,7 @@ export interface RecordSyncLifecycleSource {
 export interface SupabaseRealtimeManagerOptions {
   client?: RealtimeClientLike;
   eventDebounceMs?: number;
+  connectTimeoutMs?: number;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
   lifecycle?: RecordSyncLifecycleSource | null;
@@ -82,6 +83,7 @@ export class SupabaseRealtimeManager {
   private readonly client: RealtimeClientLike;
   private readonly lifecycle: RecordSyncLifecycleSource | null;
   private readonly eventDebounceMs: number;
+  private readonly connectTimeoutMs: number;
   private readonly reconnectBaseMs: number;
   private readonly reconnectMaxMs: number;
   private channel: RealtimeChannelLike | null = null;
@@ -93,6 +95,7 @@ export class SupabaseRealtimeManager {
   private generation = 0;
   private reconnectAttempt = 0;
   private started = false;
+  private manuallyPaused = false;
   private foreground = true;
   private networkOnline = true;
 
@@ -107,6 +110,7 @@ export class SupabaseRealtimeManager {
     if (!client) throw new Error('Supabase sync is not configured.');
     this.client = asClient(client);
     this.eventDebounceMs = positiveInteger(options.eventDebounceMs, 75, 'event debounce');
+    this.connectTimeoutMs = positiveInteger(options.connectTimeoutMs, 12_000, 'connection timeout');
     this.reconnectBaseMs = positiveInteger(options.reconnectBaseMs, 1_000, 'reconnect delay');
     this.reconnectMaxMs = positiveInteger(options.reconnectMaxMs, 30_000, 'maximum reconnect delay');
     if (this.reconnectMaxMs < this.reconnectBaseMs) {
@@ -118,23 +122,55 @@ export class SupabaseRealtimeManager {
   }
 
   private readonly handleFocus = () => {
-    if (this.lifecycle?.isVisible() !== false) void this.resume();
+    if (this.lifecycle?.isVisible() !== false) void this.setLifecycleForeground(true);
   };
 
   private readonly handleOnline = () => {
-    this.networkOnline = true;
-    if (this.lifecycle?.isVisible() !== false) void this.resume();
+    void this.setLifecycleOnline(true);
   };
 
   private readonly handleOffline = () => {
-    this.networkOnline = false;
-    void this.disconnect('Realtime is offline.', true);
+    void this.setLifecycleOnline(false);
   };
 
   private readonly handleVisibility = () => {
-    if (this.lifecycle?.isVisible() === false) void this.pause();
-    else void this.resume();
+    void this.setLifecycleForeground(this.lifecycle?.isVisible() !== false);
   };
+
+  private canConnect(): boolean {
+    return this.started && !this.manuallyPaused && this.foreground && this.networkOnline;
+  }
+
+  private async suspendChannel(): Promise<void> {
+    this.clearWakeTimer();
+    this.clearReconnectTimer();
+    this.worker.stopPeriodicPull();
+    await this.removeCurrentChannel();
+  }
+
+  private async setLifecycleForeground(foreground: boolean): Promise<void> {
+    if (this.foreground === foreground) return;
+    this.foreground = foreground;
+    if (!foreground) {
+      await this.suspendChannel();
+      return;
+    }
+    if (this.canConnect()) await this.connect().catch(() => undefined);
+  }
+
+  private async setLifecycleOnline(online: boolean): Promise<void> {
+    if (this.networkOnline === online) return;
+    this.networkOnline = online;
+    if (!online) {
+      if (this.manuallyPaused) {
+        await this.suspendChannel();
+        return;
+      }
+      await this.disconnect('Realtime is offline.', true);
+      return;
+    }
+    if (this.canConnect()) await this.connect().catch(() => undefined);
+  }
 
   private installLifecycle(): void {
     this.lifecycle?.addEventListener('focus', this.handleFocus);
@@ -161,7 +197,7 @@ export class SupabaseRealtimeManager {
   }
 
   private scheduleWake(): void {
-    if (!this.started || !this.foreground || !this.networkOnline || this.wakeTimer !== null) return;
+    if (!this.canConnect() || this.wakeTimer !== null) return;
     this.wakeTimer = setTimeout(() => {
       this.wakeTimer = null;
       void this.worker.runCycle().catch(() => undefined);
@@ -169,7 +205,7 @@ export class SupabaseRealtimeManager {
   }
 
   private scheduleReconnect(): void {
-    if (!this.started || !this.foreground || !this.networkOnline || this.reconnectTimer !== null) return;
+    if (!this.canConnect() || this.reconnectTimer !== null) return;
     const delay = Math.min(this.reconnectBaseMs * (2 ** this.reconnectAttempt), this.reconnectMaxMs);
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
@@ -211,7 +247,7 @@ export class SupabaseRealtimeManager {
   }
 
   private async openChannel(): Promise<void> {
-    if (!this.started || !this.foreground || !this.networkOnline || this.channel) return;
+    if (!this.canConnect() || this.channel) return;
     const channel = this.client.channel(`backlogger-sync-v2:${this.binding.notebookId}`, {
       config: { postgres_changes_options: { wait: true, timeout: 10_000 } },
     });
@@ -222,33 +258,36 @@ export class SupabaseRealtimeManager {
     try {
       await new Promise<void>((resolve, reject) => {
         let settled = false;
+        let timeout: ReturnType<typeof setTimeout> | null = null;
         const finish = (error?: Error) => {
           if (settled) return;
           settled = true;
+          if (timeout !== null) clearTimeout(timeout);
           if (error) reject(error);
           else resolve();
         };
         cancelConnect = () => finish(new Error('Realtime connection canceled.'));
         this.cancelPendingConnect = cancelConnect;
-      channel.subscribe((status, error) => {
-        if (generation !== this.generation) return;
-        if (status === 'SUBSCRIBED') {
-          finish();
-          return;
-        }
-        const message = status === 'TIMED_OUT'
-          ? 'Realtime connection timed out.'
-          : status === 'CLOSED'
-            ? 'Realtime connection closed.'
-            : 'Realtime connection failed.';
-        void this.channelFailed(generation, message);
-        finish(error ?? new Error(message));
-      });
+        timeout = setTimeout(() => finish(new Error('Realtime connection timed out.')), this.connectTimeoutMs);
+        channel.subscribe((status, error) => {
+          if (generation !== this.generation) return;
+          if (status === 'SUBSCRIBED') {
+            finish();
+            return;
+          }
+          const message = status === 'TIMED_OUT'
+            ? 'Realtime connection timed out.'
+            : status === 'CLOSED'
+              ? 'Realtime connection closed.'
+              : 'Realtime connection failed.';
+          void this.channelFailed(generation, message);
+          finish(error ?? new Error(message));
+        });
       });
     } finally {
       if (this.cancelPendingConnect === cancelConnect) this.cancelPendingConnect = null;
     }
-    if (generation !== this.generation || !this.started || !this.foreground) return;
+    if (generation !== this.generation || !this.canConnect()) return;
     this.reconnectAttempt = 0;
     this.clearReconnectTimer();
     await this.worker.setRealtimeDegraded(null);
@@ -257,12 +296,13 @@ export class SupabaseRealtimeManager {
   }
 
   private connect(): Promise<void> {
-    if (!this.started || !this.foreground || !this.networkOnline || this.channel) return Promise.resolve();
+    if (!this.canConnect() || this.channel) return Promise.resolve();
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = this.openChannel().catch(async error => {
-      if (!this.started || !this.foreground || !this.networkOnline) return;
+      if (!this.canConnect()) return;
       await this.worker.setRealtimeDegraded('Realtime is unavailable; periodic sync is continuing.');
       this.worker.startPeriodicPull();
+      if (this.channel) await this.removeCurrentChannel();
       this.scheduleReconnect();
       throw error;
     }).finally(() => {
@@ -284,7 +324,7 @@ export class SupabaseRealtimeManager {
       }
       if (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
         void this.client.realtime.setAuth().then(() => {
-          if (!this.channel && this.started && this.foreground && this.networkOnline) {
+          if (!this.channel && this.canConnect()) {
             return this.connect();
           }
           return undefined;
@@ -312,23 +352,20 @@ export class SupabaseRealtimeManager {
     // restored token explicitly can leave Realtime using a stale manual token
     // even though Auth has refreshed the persisted session.
     await this.client.realtime.setAuth();
-    if (this.foreground && this.networkOnline) await this.connect().catch(() => undefined);
+    if (this.canConnect()) await this.connect().catch(() => undefined);
   }
 
   async pause(): Promise<void> {
-    this.foreground = false;
-    this.clearWakeTimer();
-    this.clearReconnectTimer();
-    this.worker.stopPeriodicPull();
-    await this.removeCurrentChannel();
+    this.manuallyPaused = true;
+    await this.suspendChannel();
   }
 
   async resume(): Promise<void> {
     if (!this.started) return;
+    this.manuallyPaused = false;
     this.foreground = this.lifecycle?.isVisible() ?? true;
     this.networkOnline = this.lifecycle?.isOnline() ?? true;
-    if (!this.foreground || !this.networkOnline) return;
-    await this.connect().catch(() => undefined);
+    if (this.canConnect()) await this.connect().catch(() => undefined);
   }
 
   private async disconnect(message: string, stopPolling: boolean): Promise<void> {
@@ -342,6 +379,7 @@ export class SupabaseRealtimeManager {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    this.manuallyPaused = true;
     this.removeLifecycle();
     this.authUnsubscribe?.();
     this.authUnsubscribe = null;

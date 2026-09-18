@@ -1,6 +1,6 @@
 # Android implementation plan
 
-Status: Milestones 1–3 are complete and accepted. Milestone 4 polling-based Android record sync is implemented; hosted Windows↔Android acceptance is still required. Android Realtime and document import/export remain disabled. Windows already ships the record-level Supabase v2 protocol, restored-session recovery, and Realtime reconnect fixes described below; Android reuses those paths rather than the retired snapshot protocol.
+Status: Milestones 1–4 are complete and accepted. Milestone 5 foreground Realtime and lifecycle recovery are implemented; hosted Realtime acceptance is still required. Android document import/export remains disabled. Windows and Android share the record-level Supabase v2 protocol, polling recovery, restored-session handling, and Realtime wake-ups rather than the retired snapshot protocol.
 
 Backlogger remains one Tauri 2 repository. Windows and Android share TypeScript, CSS, Rust, SQLite schema, and sync modules, but their release versions may differ. Local-only use must always work without an account or network.
 
@@ -90,7 +90,7 @@ Android must reuse these existing components unchanged unless an Android-specifi
 - `rollout.ts` and `status.ts`: staged protocol selection and concise status presentation.
 - Startup restoration coalesces duplicate auth events, retries transient inspection failures, and recreates a missing runtime on Resume. Android must preserve these close/reopen guarantees.
 
-The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realtime publication are authoritative. Android has `cloudSync`, `supabaseSync`, and `recordSync` enabled from Milestone 4, while `realtimeSync` remains disabled until Milestone 5.
+The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realtime publication are authoritative. Android has `cloudSync`, `supabaseSync`, and `recordSync` enabled from Milestone 4; Milestone 5 enables foreground `realtimeSync` while retaining polling recovery.
 
 ## Milestone 3 — Android Google login and deep-link return
 
@@ -146,8 +146,7 @@ The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realti
 - Verification passed: TypeScript, 125 tests, production build, Rust format/check, secret scan, x86_64 debug build, and ARM64 optimized build. API 36/x86_64 emulator install/launch, v2 UI gating, signed-out local editing, force-stop persistence, and empty crash/token/Realtime log checks passed.
 - Emulator APK: `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`; SHA-256 `D7935E6C402171906B32E2F03DC3206058173793917321FAF84F41A1510D219F`.
 - ARM64 optimized APK: `src-tauri/gen/android/app/build/outputs/apk/universal/release/Backlogger_0.1.0_android-arm64-m4.apk`; 17.16 MiB; SHA-256 `0E49B3AC948ECA403BD92D9E555428870124222C2A8BEA31342E8EC8241AF202`. It uses the existing Android debug certificate for local testing; production signing remains Gate D/Milestone 8.
-- Remaining user acceptance: use Gate C's disposable account to verify read-only login inspection, explicit first initialization or existing-v2 join, Windows↔Android polling convergence, offline edits, Pause/Resume, force-stop/reopen, wrong-account safety, and owned `sync_v2_*` rows only. Confirm Android opens no Realtime channel before accepting Milestone 4.
-- Milestone 5 must keep the polling worker as the correctness path and enable `realtimeSync` only after Android foreground/background lifecycle proof.
+- User acceptance completed: read-only login inspection, explicit initialization/existing-v2 join, Windows↔Android polling convergence, offline edits, Pause/Resume, force-stop/reopen, wrong-account safety, and owned `sync_v2_*` rows passed before Milestone 5 began.
 
 ## Milestone 5 — Android lifecycle, Realtime, and durable recovery
 
@@ -165,6 +164,17 @@ The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realti
 **Verify:** clean close/reopen while still signed in, Home/resume, rotation, offline edits, network switching, blocked/dropped WSS, token refresh, repeated rapid Pause/Resume, logout, process kill, and restart catch-up. Prove no duplicate channel, stale connect promise, duplicate/recreated record, lost acknowledged edit, tombstone resurrection, infinite retry, or close-event dependency.
 
 **Done when:** connected changes normally arrive within seconds, while disabling Realtime changes latency—not correctness.
+
+### Milestone 5 handoff
+
+- Enabled Android `realtimeSync` while retaining periodic cursor pulls as the correctness path. Realtime payloads remain coalesced wake-ups; the worker performs subscribe → pull → push → final pull.
+- Added `AppLifecycleCoordinator` and `RecordSyncExecutionController` to serialize native-focus, WebView-visibility, network, background, foreground, Pause/Resume, and stop transitions. Backgrounding removes the channel and polling; foregrounding shows `Syncing…`, creates one fresh channel, and catches up. Manual Pause cannot be undone by focus events.
+- Added a 12-second subscription deadline. Silent, blocked, or failed WSS connections remove the stale channel, show an explicit failure, retain foreground polling, and retry with bounded backoff. No Supabase schema or migration changed.
+- Changed files: `src/main.ts`, `src/platform/capabilities.ts`, `src/platform/lifecycle.ts`, `src/sync-v2/realtime.ts`, `src/sync-v2/runtime.ts`, `src/sync-v2/worker.ts`, focused tests, `AGENTS.md`, and this plan.
+- Verification passed: TypeScript, 131 tests, production build, Rust format/check, secret scan, x86_64 debug APK, and optimized ARM64 APK. API 36/x86_64 emulator evidence covered Home/resume in the same process, native/DOM lifecycle signals, rotation, force-stop/reopen persistence, and an empty crash buffer.
+- Emulator APK: `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`; SHA-256 `DF8B2393FAC69EF0C6005CD017A4CC61D5C98E479BC1A190F516EC7B9C5C69B9`.
+- ARM64 optimized APK: `src-tauri/gen/android/app/build/outputs/apk/universal/release/Backlogger_0.1.0_android-arm64-m5.apk`; 17.16 MiB; SHA-256 `B222CFBBC3A9B850C6CE98E6AF21288BEE748BAE8D4B118E419E5BD996BB9E8A`. It uses the existing Android debug certificate for local testing; production signing remains Gate D/Milestone 8.
+- Remaining user acceptance: with the same disposable account on Windows and Android, verify edits arrive both ways within seconds, Home/resume reconnects without login, rapid Pause/Resume settles, offline edits catch up, and a blocked socket still converges by polling. Milestone 6 may reuse the lifecycle/runtime interfaces but must not change sync semantics.
 
 ## Milestone 6 — Android document import/export and mobile UX
 

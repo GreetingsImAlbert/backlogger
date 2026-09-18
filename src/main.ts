@@ -9,6 +9,7 @@ import {
   readLegacyRecoveryCandidate,
   type LocalRepository,
 } from './local-db';
+import { AppLifecycleCoordinator } from './platform/lifecycle';
 import { platformCapabilities } from './platform/capabilities';
 import { reorderCategories, reorderTasksWithinCategory, type DropPosition } from './reorder';
 import { makePortableDocument, makeStoredDocument, parsePortableText, readDocumentFile, setNativeTheme, storageKind, writeDocumentFile, type ColorTheme, type PortableDocument, type StoredDocument, type Theme, type ViewMode } from './storage';
@@ -23,15 +24,12 @@ import {
   SupabaseRecordBootstrapGateway,
   SupabaseRecordTransport,
   RecordSyncWorker,
+  RecordSyncExecutionController,
   RecordSyncStartupGate,
   bindRepositoryToRecordSync,
   buildLegacyBootstrapPreview,
-  pauseRecordSyncExecution,
   presentRecordSyncStatus,
   recordSyncStartupRetryDelay,
-  resumeRecordSyncExecution,
-  startRecordSyncExecution,
-  stopRecordSyncExecution,
   type LegacyBootstrapPreview,
   type RecordSyncBinding,
   type RecordSyncState,
@@ -72,7 +70,8 @@ let cloudInspectionInFlight: Promise<void> | null = null;
 let recordSyncState: RecordSyncState | null = null;
 let recordOutboxCount = 0;
 let recordSyncWorker: RecordSyncWorker | null = null;
-let recordRealtime: SupabaseRealtimeManager | null = null;
+let recordSyncRuntime: RecordSyncExecutionController | null = null;
+let appLifecycle: AppLifecycleCoordinator | null = null;
 const recordStartupGate = new RecordSyncStartupGate();
 let recordInspectionRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let recordInspectionRetryAttempt = 0;
@@ -1562,11 +1561,10 @@ async function askRecordBootstrapConfirmation(preview: LegacyBootstrapPreview | 
 }
 
 async function stopRecordSyncRuntime(): Promise<void> {
-  const worker = recordSyncWorker;
-  const realtime = recordRealtime;
-  recordRealtime = null;
+  const runtime = recordSyncRuntime;
+  recordSyncRuntime = null;
   recordSyncWorker = null;
-  await stopRecordSyncExecution(worker, realtime);
+  await runtime?.stop();
 }
 
 async function startRecordSyncRuntime(binding: RecordSyncBinding): Promise<void> {
@@ -1579,10 +1577,16 @@ async function startRecordSyncRuntime(binding: RecordSyncBinding): Promise<void>
       render();
     },
   });
-  const realtime = capabilities.realtimeSync ? new SupabaseRealtimeManager(binding, worker) : null;
+  const realtime = capabilities.realtimeSync
+    ? new SupabaseRealtimeManager(binding, worker, { lifecycle: capabilities.mobileLifecycle ? null : undefined })
+    : null;
+  const lifecycle = capabilities.mobileLifecycle
+    ? appLifecycle?.snapshot() ?? { foreground: true, online: navigator.onLine }
+    : { foreground: true, online: true };
+  const runtime = new RecordSyncExecutionController(worker, realtime, lifecycle);
   recordSyncWorker = worker;
-  recordRealtime = realtime;
-  await startRecordSyncExecution(worker, realtime);
+  recordSyncRuntime = runtime;
+  await runtime.start();
   await refreshLocalProjection();
 }
 
@@ -1967,14 +1971,14 @@ async function toggleSyncPause(): Promise<void> {
     const binding = currentRecordBinding();
     if (!binding) throw new Error('Log in to sync first.');
     const paused = recordSyncState.status !== 'paused';
-    if (paused && recordSyncWorker) await pauseRecordSyncExecution(recordSyncWorker, recordRealtime);
+    if (paused && recordSyncRuntime) await recordSyncRuntime.pause();
     await localRepository.setSyncState({ ...recordSyncState, status: paused ? 'paused' : 'catching-up', lastError: null });
     await refreshLocalProjection();
     syncDialogRefresh?.();
     render();
     if (!paused) {
-      if (recordSyncWorker) {
-        await resumeRecordSyncExecution(recordSyncWorker, recordRealtime);
+      if (recordSyncRuntime) {
+        await recordSyncRuntime.resume();
       } else {
         await startRecordSyncRuntime(binding);
       }
@@ -2242,7 +2246,9 @@ async function performLocalWrite(
     );
     if (options.contentChanged) {
       if (capabilities.recordSync) {
-        if (recordSyncState?.status !== 'paused') {
+        const lifecycle = appLifecycle?.snapshot();
+        const networkAvailable = !capabilities.mobileLifecycle || Boolean(lifecycle?.foreground && lifecycle.online);
+        if (recordSyncState?.status !== 'paused' && networkAvailable) {
           void recordSyncWorker?.runCycle().catch(async () => {
             await refreshLocalProjection();
             render();
@@ -2887,15 +2893,63 @@ const refreshDateState = () => {
     render();
   }
 };
+
+async function handleMobileForegroundChanged(foreground: boolean): Promise<void> {
+  if (!capabilities.mobileLifecycle) return;
+  if (!foreground) {
+    await recordSyncRuntime?.setForeground(false);
+    return;
+  }
+  refreshDateState();
+  if (!capabilities.recordSync || !currentRecordBinding() || authState.status !== 'signed-in') return;
+  if (!recordSyncWorker) await inspectAuthenticatedAccount();
+  else await recordSyncRuntime?.setForeground(true);
+}
+
+async function handleMobileOnlineChanged(online: boolean): Promise<void> {
+  if (!capabilities.mobileLifecycle || !capabilities.recordSync) return;
+  if (!online) {
+    await recordSyncRuntime?.setOnline(false);
+    return;
+  }
+  if (!currentRecordBinding() || authState.status !== 'signed-in') return;
+  if (!recordSyncWorker) {
+    clearRecordInspectionRetry();
+    await inspectAuthenticatedAccount();
+  } else {
+    await recordSyncRuntime?.setOnline(true);
+  }
+}
+
+appLifecycle = new AppLifecycleCoordinator({
+  onForegroundChanged: handleMobileForegroundChanged,
+  onOnlineChanged: handleMobileOnlineChanged,
+}, {
+  documentVisible: document.visibilityState !== 'hidden',
+  nativeFocused: true,
+  online: navigator.onLine,
+});
+
 window.addEventListener('focus', () => {
   refreshDateState();
+  if (capabilities.mobileLifecycle) {
+    void appLifecycle?.setNativeFocused(true).catch(() => undefined);
+    return;
+  }
   if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in') {
     if (!recordSyncWorker) void inspectAuthenticatedAccount();
     else if (!capabilities.realtimeSync) void attemptPendingSync();
   }
   if (!capabilities.recordSync) void checkForSharedUpdate();
 });
+window.addEventListener('blur', () => {
+  if (capabilities.mobileLifecycle) void appLifecycle?.setNativeFocused(false).catch(() => undefined);
+});
 window.addEventListener('online', () => {
+  if (capabilities.mobileLifecycle) {
+    void appLifecycle?.setOnline(true).catch(() => undefined);
+    return;
+  }
   if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in') {
     if (!recordSyncWorker) {
       clearRecordInspectionRetry();
@@ -2905,7 +2959,14 @@ window.addEventListener('online', () => {
     }
   }
 });
+window.addEventListener('offline', () => {
+  if (capabilities.mobileLifecycle) void appLifecycle?.setOnline(false).catch(() => undefined);
+});
 document.addEventListener('visibilitychange', () => {
+  if (capabilities.mobileLifecycle) {
+    void appLifecycle?.setDocumentVisible(document.visibilityState !== 'hidden').catch(() => undefined);
+    return;
+  }
   if (document.visibilityState === 'visible') {
     refreshDateState();
     if (capabilities.recordSync && currentRecordBinding() && authState.status === 'signed-in') {
@@ -2921,6 +2982,8 @@ setInterval(refreshDateState, 30_000);
 async function attemptPendingSync() {
   if (!capabilities.cloudSync) return;
   if (capabilities.recordSync) {
+    const lifecycle = appLifecycle?.snapshot();
+    if (capabilities.mobileLifecycle && (!lifecycle?.foreground || !lifecycle.online)) return;
     if (recordSyncState?.status !== 'paused' && recordSyncWorker && hasRecordSyncBinding()) {
       await recordSyncWorker.runCycle().catch(async () => {
         await refreshLocalProjection();
@@ -3004,11 +3067,12 @@ async function installNativeAuthReturnHandler() {
   if (capabilities.runtime !== 'android') return;
   await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
     if (focused) scheduleAbandonedSignInCancellation();
+    void appLifecycle?.setNativeFocused(focused).catch(() => undefined);
   });
 }
 
 void installNativeAuthReturnHandler().catch(() => {
-  // DOM focus remains the fallback; authentication stays manually cancelable.
+  // DOM focus/visibility remain the fallback; authentication stays manually cancelable.
 });
 void loadInitialData();
 void initializeAuth().catch(() => undefined);

@@ -21,7 +21,7 @@ export interface PlatformCapabilities {
   supabaseSync: boolean;
   /** Record-level Supabase sync through the shared cursor/OCC protocol. */
   recordSync: boolean;
-  /** Realtime is enabled separately from record sync so Android can begin with polling. */
+  /** Realtime is a foreground optimization; cursor polling remains the recovery path. */
   realtimeSync: boolean;
   /** Legacy snapshot migration remains a Windows-only compatibility path. */
   legacySnapshotMigration: boolean;
@@ -71,7 +71,7 @@ export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind())
       cloudSync: true,
       supabaseSync: true,
       recordSync: true,
-      realtimeSync: false,
+      realtimeSync: true,
       legacySnapshotMigration: false,
       desktopClose: false,
       mobileLifecycle: true,

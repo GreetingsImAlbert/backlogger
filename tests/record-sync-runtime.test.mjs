@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  RecordSyncExecutionController,
   pauseRecordSyncExecution,
   resumeRecordSyncExecution,
   startRecordSyncExecution,
@@ -19,6 +20,12 @@ function makeWorker(events, { fail = false } = {}) {
     },
     stopPeriodicPull() {
       events.push('stop-poll');
+    },
+    async markCatchingUp() {
+      events.push('syncing');
+    },
+    async setRealtimeDegraded(message) {
+      events.push(`degraded:${message}`);
     },
   };
 }
@@ -71,4 +78,49 @@ test('Realtime runtime delegates lifecycle without starting polling directly', a
     'realtime:resume',
     'stop-poll', 'realtime:stop',
   ]);
+});
+
+test('execution controller serializes foreground, network, and manual pause transitions', async () => {
+  const events = [];
+  const worker = makeWorker(events);
+  const realtime = makeRealtime(events);
+  const runtime = new RecordSyncExecutionController(worker, realtime);
+
+  await runtime.start();
+  await runtime.setForeground(false);
+  await runtime.setForeground(false);
+  await runtime.setForeground(true);
+  await runtime.pause();
+  await runtime.setForeground(false);
+  await runtime.setForeground(true);
+  await runtime.resume();
+  await runtime.setOnline(false);
+  await runtime.setOnline(true);
+  await runtime.stop();
+
+  assert.deepEqual(events, [
+    'syncing', 'realtime:start',
+    'realtime:pause',
+    'syncing', 'realtime:resume',
+    'realtime:pause',
+    'syncing', 'realtime:resume',
+    'realtime:pause', 'degraded:Cloud sync is offline.',
+    'syncing', 'realtime:resume',
+    'stop-poll', 'realtime:stop',
+  ]);
+});
+
+test('execution controller defers startup until a background or offline app becomes active', async () => {
+  const events = [];
+  const runtime = new RecordSyncExecutionController(makeWorker(events), null, {
+    foreground: false,
+    online: false,
+  });
+
+  await runtime.start();
+  await runtime.setOnline(true);
+  await runtime.setForeground(true);
+
+  assert.deepEqual(events, ['degraded:Cloud sync is offline.', 'syncing', 'poll:false', 'cycle']);
+  await runtime.stop();
 });
