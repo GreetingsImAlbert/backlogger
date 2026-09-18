@@ -13,6 +13,8 @@ export interface PlatformCapabilities {
   nativeLocalStorage: boolean;
   nativeDocuments: boolean;
   documentImportExport: boolean;
+  /** Google/Supabase authentication can be exposed without enabling cloud data access. */
+  supabaseAuth: boolean;
   /** Provider-neutral cloud-sync entry point. */
   cloudSync: boolean;
   /** Supabase transport is Windows-only until Android callback/lifecycle work is verified. */
@@ -27,22 +29,25 @@ export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean((window as TauriWindow).__TAURI_INTERNALS__);
 }
 
-function runtimeKind(): RuntimeKind {
-  if (!isTauriRuntime()) return 'browser';
-  const userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent.toLowerCase();
+export function detectRuntimeKind(
+  tauriRuntime = isTauriRuntime(),
+  userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent,
+): RuntimeKind {
+  if (!tauriRuntime) return 'browser';
+  userAgent = userAgent.toLowerCase();
   if (userAgent.includes('android')) return 'android';
   if (userAgent.includes('iphone') || userAgent.includes('ipad') || userAgent.includes('ipod')) return 'ios';
   return 'desktop';
 }
 
-export function platformCapabilities(): PlatformCapabilities {
-  const runtime = runtimeKind();
+export function platformCapabilities(runtime: RuntimeKind = detectRuntimeKind()): PlatformCapabilities {
   if (runtime === 'desktop') {
     return {
       runtime,
       nativeLocalStorage: true,
       nativeDocuments: true,
       documentImportExport: true,
+      supabaseAuth: true,
       cloudSync: true,
       supabaseSync: true,
       recordSync: RECORD_SYNC_ENABLED,
@@ -50,12 +55,27 @@ export function platformCapabilities(): PlatformCapabilities {
       mobileLifecycle: false,
     };
   }
-  if (runtime === 'android' || runtime === 'ios') {
+  if (runtime === 'android') {
     return {
       runtime,
       nativeLocalStorage: true,
       nativeDocuments: false,
       documentImportExport: false,
+      supabaseAuth: true,
+      cloudSync: false,
+      supabaseSync: false,
+      recordSync: false,
+      desktopClose: false,
+      mobileLifecycle: true,
+    };
+  }
+  if (runtime === 'ios') {
+    return {
+      runtime,
+      nativeLocalStorage: true,
+      nativeDocuments: false,
+      documentImportExport: false,
+      supabaseAuth: false,
       cloudSync: false,
       supabaseSync: false,
       recordSync: false,
@@ -68,6 +88,7 @@ export function platformCapabilities(): PlatformCapabilities {
     nativeLocalStorage: false,
     nativeDocuments: false,
     documentImportExport: true,
+    supabaseAuth: false,
     cloudSync: false,
     supabaseSync: false,
     recordSync: false,

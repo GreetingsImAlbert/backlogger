@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AuthCallbackValidationError,
+  oauthRedirectForRuntime,
   parseAuthCallbackUrl,
   sanitizeAuthError,
 } from '../src/supabase/auth.ts';
@@ -72,4 +73,19 @@ test('OAuth cancellation is mapped to a sanitized callback error', () => {
   });
   assert.equal(sanitizeAuthError(new Error('exchange failed for access_token=secret-value')), 'Google sign-in could not be completed. Please try again.');
   assert.equal(sanitizeAuthError(new Error('network timeout')), 'Could not reach Supabase. Check your connection and try again.');
+});
+
+test('Android uses the custom callback without starting the Windows loopback listener', async () => {
+  let desktopListenerCalls = 0;
+  const desktopCallback = async () => {
+    desktopListenerCalls += 1;
+    return 'http://127.0.0.1:17428/auth/callback';
+  };
+
+  assert.equal(await oauthRedirectForRuntime('android', desktopCallback), 'backlogger://auth/callback');
+  assert.equal(desktopListenerCalls, 0);
+  assert.equal(await oauthRedirectForRuntime('desktop', desktopCallback), 'http://127.0.0.1:17428/auth/callback');
+  assert.equal(desktopListenerCalls, 1);
+  await assert.rejects(() => oauthRedirectForRuntime('browser', desktopCallback), /unavailable on this device/);
+  assert.equal(desktopListenerCalls, 1);
 });

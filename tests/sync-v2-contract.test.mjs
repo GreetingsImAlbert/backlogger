@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { platformCapabilities, RECORD_SYNC_ENABLED } from '../src/platform/capabilities.ts';
+import { detectRuntimeKind, platformCapabilities, RECORD_SYNC_ENABLED } from '../src/platform/capabilities.ts';
 import {
   parseChangeCursor,
   parseLocalSyncRecord,
@@ -186,7 +186,30 @@ test('legacy fixtures cover complete, concurrent, orphaned and incomplete graphs
   assert.equal(incomplete.snapshots.has(legacySyncGraphs.missingAncestry.missingSnapshotId), false);
 });
 
-test('record sync is enabled for the Windows cutover but remains unavailable in browser preview', () => {
+test('runtime detection distinguishes packaged Android from desktop and browser preview', () => {
+  assert.equal(detectRuntimeKind(false, 'Mozilla/5.0 (Linux; Android 16)'), 'browser');
+  assert.equal(detectRuntimeKind(true, 'Mozilla/5.0 (Linux; Android 16)'), 'android');
+  assert.equal(detectRuntimeKind(true, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), 'desktop');
+});
+
+test('Android exposes auth without enabling cloud records while Windows keeps the v2 cutover', () => {
   assert.equal(RECORD_SYNC_ENABLED, true);
   assert.equal(platformCapabilities().recordSync, false);
+  assert.deepEqual(platformCapabilities('android'), {
+    runtime: 'android',
+    nativeLocalStorage: true,
+    nativeDocuments: false,
+    documentImportExport: false,
+    supabaseAuth: true,
+    cloudSync: false,
+    supabaseSync: false,
+    recordSync: false,
+    desktopClose: false,
+    mobileLifecycle: true,
+  });
+  const desktop = platformCapabilities('desktop');
+  assert.equal(desktop.supabaseAuth, true);
+  assert.equal(desktop.cloudSync, true);
+  assert.equal(desktop.supabaseSync, true);
+  assert.equal(desktop.recordSync, true);
 });

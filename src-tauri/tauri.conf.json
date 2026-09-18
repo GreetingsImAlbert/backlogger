@@ -24,6 +24,13 @@
   },
   "plugins": {
     "deep-link": {
+      "mobile": [
+        {
+          "scheme": ["backlogger"],
+          "host": "auth",
+          "path": ["/callback"]
+        }
+      ],
       "desktop": {
         "schemes": ["backlogger"]
       }

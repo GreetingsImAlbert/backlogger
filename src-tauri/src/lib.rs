@@ -6,16 +6,24 @@ use sqlx::Executor;
 use std::{
     fs,
     io::{ErrorKind, Write},
-    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+};
+#[cfg(desktop)]
+use std::{
+    net::{TcpListener, TcpStream},
     sync::atomic::{AtomicBool, Ordering},
 };
-use tauri::{AppHandle, Emitter, Manager};
+#[cfg(desktop)]
+use tauri::Emitter;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_sql::{DbInstances, DbPool, Migration, MigrationKind};
 
-const OAUTH_CALLBACK_ADDRESS: &str = "127.0.0.1:17428";
-const OAUTH_CALLBACK_URL: &str = "http://127.0.0.1:17428/auth/callback";
 const LOCAL_DATABASE_URL: &str = "sqlite:backlogger-v2.db";
+#[cfg(desktop)]
+const OAUTH_CALLBACK_ADDRESS: &str = "127.0.0.1:17428";
+#[cfg(desktop)]
+const OAUTH_CALLBACK_URL: &str = "http://127.0.0.1:17428/auth/callback";
+#[cfg(desktop)]
 static OAUTH_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn local_database_migrations() -> Vec<Migration> {
@@ -105,6 +113,7 @@ async fn execute_local_database_transaction(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(desktop)]
 fn oauth_response(stream: &mut TcpStream, status: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
@@ -114,6 +123,7 @@ fn oauth_response(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.flush();
 }
 
+#[cfg(desktop)]
 fn handle_oauth_request(app: &AppHandle, mut stream: TcpStream) {
     use std::io::Read;
 
@@ -147,6 +157,7 @@ fn handle_oauth_request(app: &AppHandle, mut stream: TcpStream) {
     }
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn start_oauth_callback_listener(app: AppHandle) -> Result<String, String> {
     if OAUTH_LISTENER_STARTED.load(Ordering::Acquire) {
@@ -367,8 +378,11 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }));
-        builder = builder.plugin(tauri_plugin_deep_link::init());
-        builder = builder.plugin(tauri_plugin_opener::init());
+    }
+    builder = builder.plugin(tauri_plugin_deep_link::init());
+    builder = builder.plugin(tauri_plugin_opener::init());
+    #[cfg(desktop)]
+    {
         builder = builder.plugin(tauri_plugin_dialog::init());
         builder = builder.setup(|_app| {
             #[cfg(all(debug_assertions, windows))]
@@ -379,21 +393,38 @@ pub fn run() {
             Ok(())
         });
     }
+
+    #[cfg(desktop)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        load_notebook,
+        load_notebook_backup,
+        read_legacy_notebook_for_migration,
+        save_notebook,
+        load_sync_state,
+        save_sync_state,
+        backup_sync_state,
+        set_app_theme,
+        read_document_file,
+        write_document_file,
+        start_oauth_callback_listener,
+        execute_local_database_transaction
+    ]);
+    #[cfg(mobile)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        load_notebook,
+        load_notebook_backup,
+        read_legacy_notebook_for_migration,
+        save_notebook,
+        load_sync_state,
+        save_sync_state,
+        backup_sync_state,
+        set_app_theme,
+        read_document_file,
+        write_document_file,
+        execute_local_database_transaction
+    ]);
+
     builder
-        .invoke_handler(tauri::generate_handler![
-            load_notebook,
-            load_notebook_backup,
-            read_legacy_notebook_for_migration,
-            save_notebook,
-            load_sync_state,
-            save_sync_state,
-            backup_sync_state,
-            set_app_theme,
-            read_document_file,
-            write_document_file,
-            start_oauth_callback_listener,
-            execute_local_database_transaction
-        ])
         .run(tauri::generate_context!())
         .expect("error while running Backlogger");
 }

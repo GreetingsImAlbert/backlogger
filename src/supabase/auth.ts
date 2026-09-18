@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import type { Database } from '../../supabase/database.types.ts';
-import { isTauriRuntime } from '../platform/capabilities.ts';
+import { platformCapabilities, type RuntimeKind } from '../platform/capabilities.ts';
 import { getConfiguredSupabaseProject, getSupabaseClient, getSupabaseConfigState } from './client.ts';
 import { SUPABASE_CALLBACK_URL, SUPABASE_PROVIDER, type SupabaseConfigState } from './config.ts';
 
@@ -46,6 +46,7 @@ let authClient: SupabaseClient<Database> | null = null;
 let authUnsubscribe: (() => void) | null = null;
 let deepLinkUnsubscribe: (() => void) | null = null;
 let callbackFallbackUnsubscribe: (() => void) | null = null;
+let callbackOperations = 0;
 let pendingFlowInMemory = false;
 let flowStartedFrom: AuthStatus = 'signed-out';
 const consumedCodes = new Set<string>();
@@ -184,16 +185,23 @@ function isSupabaseAuthorizeUrl(rawUrl: string, projectRef: string): boolean {
   }
 }
 
-async function openAuthorizationUrl(url: string): Promise<void> {
-  if (isTauriRuntime()) {
+type DesktopCallbackResolver = () => Promise<string>;
+
+export async function oauthRedirectForRuntime(
+  runtime: RuntimeKind,
+  startDesktopCallback: DesktopCallbackResolver = () => invoke<string>('start_oauth_callback_listener'),
+): Promise<string> {
+  if (runtime === 'desktop') return startDesktopCallback();
+  if (runtime === 'android') return SUPABASE_CALLBACK_URL;
+  throw new Error('Google sign-in is unavailable on this device.');
+}
+
+async function openAuthorizationUrl(url: string, runtime: RuntimeKind): Promise<void> {
+  if (runtime === 'desktop' || runtime === 'android') {
     await openUrl(url);
     return;
   }
-  if (typeof window === 'undefined' || typeof window.open !== 'function') {
-    throw new Error('An external browser is unavailable.');
-  }
-  const opened = window.open(url, '_blank', 'noopener,noreferrer');
-  if (!opened) throw new Error('The external browser could not be opened.');
+  throw new Error('Google sign-in is unavailable on this device.');
 }
 
 function configuredState(): SupabaseConfigState {
@@ -208,6 +216,10 @@ export function subscribeAuthState(listener: AuthStateListener): () => void {
   listeners.add(listener);
   listener(getAuthState());
   return () => listeners.delete(listener);
+}
+
+export function isAuthCallbackInFlight(): boolean {
+  return callbackOperations > 0;
 }
 
 export async function startGoogleSignIn(): Promise<void> {
@@ -228,9 +240,8 @@ export async function startGoogleSignIn(): Promise<void> {
   setPendingFlow(configState.config.projectRef);
   updateState({ status: 'signing-in', configured: true, error: null });
   try {
-    const redirectTo = isTauriRuntime()
-      ? await invoke<string>('start_oauth_callback_listener')
-      : SUPABASE_CALLBACK_URL;
+    const runtime = platformCapabilities().runtime;
+    const redirectTo = await oauthRedirectForRuntime(runtime);
     const { data, error } = await client.auth.signInWithOAuth({
       provider: SUPABASE_PROVIDER,
       options: {
@@ -243,7 +254,7 @@ export async function startGoogleSignIn(): Promise<void> {
     if (!data.url || !isSupabaseAuthorizeUrl(data.url, configState.config.projectRef)) {
       throw new Error('Supabase returned an unexpected authorization URL.');
     }
-    await openAuthorizationUrl(data.url);
+    await openAuthorizationUrl(data.url, runtime);
   } catch (error) {
     clearPendingFlow(configState.config.projectRef);
     updateState({ status: flowStartedFrom === 'signed-in' ? 'signed-in' : 'signed-out', error: sanitizeAuthError(error) });
@@ -306,23 +317,28 @@ async function handleIncomingUrls(urls: string[]) {
   for (const rawUrl of urls) {
     if (receivedCallbackUrls.has(rawUrl)) continue;
     receivedCallbackUrls.add(rawUrl);
+    callbackOperations += 1;
     try {
       await handleAuthCallback(rawUrl);
     } catch (error) {
       const message = error instanceof AuthCallbackValidationError ? error.message : sanitizeAuthError(error);
       updateState({ status: state.status === 'signed-in' ? 'signed-in' : 'signed-out', configured: state.configured, error: message });
+    } finally {
+      callbackOperations = Math.max(0, callbackOperations - 1);
     }
   }
 }
 
-async function installDeepLinkHandlers() {
-  if (!isTauriRuntime() || deepLinkUnsubscribe) return;
+async function installDeepLinkHandlers(runtime: RuntimeKind) {
+  if ((runtime !== 'desktop' && runtime !== 'android') || deepLinkUnsubscribe) return;
   deepLinkUnsubscribe = await onOpenUrl(urls => { void handleIncomingUrls(urls); });
-  callbackFallbackUnsubscribe = await listen<string[]>('backlogger-auth-callback', event => {
-    if (Array.isArray(event.payload)) void handleIncomingUrls(event.payload);
-  });
+  if (runtime === 'desktop') {
+    callbackFallbackUnsubscribe = await listen<string[]>('backlogger-auth-callback', event => {
+      if (Array.isArray(event.payload)) void handleIncomingUrls(event.payload);
+    });
+  }
   const currentUrls = await getCurrent();
-  if (currentUrls?.length) void handleIncomingUrls(currentUrls);
+  if (currentUrls?.length) await handleIncomingUrls(currentUrls);
 }
 
 export async function initializeAuth(): Promise<void> {
@@ -340,20 +356,23 @@ export async function initializeAuth(): Promise<void> {
       return;
     }
     authClient = client;
+    const runtime = platformCapabilities().runtime;
     const subscription = client.auth.onAuthStateChange((_event, session) => {
       applySession(session, true);
     });
     authUnsubscribe = () => subscription.data.subscription.unsubscribe();
+    let deepLinkError: string | null = null;
+    try {
+      await installDeepLinkHandlers(runtime);
+    } catch (error) {
+      deepLinkError = sanitizeAuthError(error);
+    }
     const { data, error } = await client.auth.getSession();
     if (error) {
       updateState({ status: 'signed-out', configured: true, error: sanitizeAuthError(error) });
     } else {
-      applySession(data.session, true);
-    }
-    try {
-      await installDeepLinkHandlers();
-    } catch (error) {
-      updateState({ status: state.status === 'signed-in' ? 'signed-in' : 'signed-out', configured: true, error: sanitizeAuthError(error) });
+      state = sessionState(data.session, true, deepLinkError);
+      notify();
     }
   })().catch(error => {
     initialization = null;
@@ -387,5 +406,6 @@ export function disposeAuthListeners(): void {
   deepLinkUnsubscribe = null;
   callbackFallbackUnsubscribe?.();
   callbackFallbackUnsubscribe = null;
+  callbackOperations = 0;
   initialization = null;
 }

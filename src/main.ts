@@ -16,7 +16,7 @@ import { hasCompleteSnapshotAncestry, isSnapshotAncestor, loadSyncState, makeChe
 import { SyncCoordinator } from './sync/coordinator';
 import { SupabaseSyncTransport } from './sync/supabase-transport';
 import type { SyncTransport } from './sync/transport';
-import { cancelGoogleSignIn, getAuthState, initializeAuth, signOut as signOutAuth, startGoogleSignIn, subscribeAuthState, type AuthState } from './supabase/auth';
+import { cancelGoogleSignIn, getAuthState, initializeAuth, isAuthCallbackInFlight, signOut as signOutAuth, startGoogleSignIn, subscribeAuthState, type AuthState } from './supabase/auth';
 import { getConfiguredSupabaseProject } from './supabase/client';
 import {
   SupabaseRealtimeManager,
@@ -61,6 +61,7 @@ let syncDeferred = false;
 let syncPublishTimer: ReturnType<typeof setTimeout> | undefined;
 let authState: AuthState = getAuthState();
 let signInStartedAt: number | null = null;
+let signInReturnTimer: ReturnType<typeof setTimeout> | null = null;
 let cloudInspection: { accountId: string; manifest: SyncManifest | null; error: string | null } | null = null;
 let recordCloudInspection: { accountId: string; notebookId: string | null; legacyExists: boolean; error: string | null } | null = null;
 let cloudInspectionInFlight: Promise<void> | null = null;
@@ -780,9 +781,10 @@ function syncCoordinatorFor(location: SyncState['location'] = syncState.location
 }
 
 function syncStatusLabel(): string {
-  if (!capabilities.cloudSync) return 'Not logged in';
+  if (!capabilities.supabaseAuth) return 'Not logged in';
   if (!syncReady) return syncLoadError ? 'Unavailable' : 'Loading…';
   if (authState.status === 'signing-in') return 'Signing in';
+  if (!capabilities.cloudSync) return authState.status === 'signed-in' ? 'Signed in' : 'Not logged in';
   if (capabilities.recordSync) {
     return presentRecordSyncStatus(recordSyncState, recordOutboxCount, hasRecordSyncBinding()).label;
   }
@@ -794,10 +796,15 @@ function syncStatusLabel(): string {
 }
 
 function syncStatusDetail(): string {
-  if (!capabilities.cloudSync) return 'Cloud sync is unavailable on this device.';
+  if (!capabilities.supabaseAuth) return 'Cloud sync is unavailable on this device.';
   if (syncLoadError) return `Sync settings could not be loaded: ${syncLoadError}`;
   if (!authState.configured) return 'Sync is not configured for this build.';
   if (authState.status === 'signing-in') return 'Complete Google sign-in in your browser.';
+  if (!capabilities.cloudSync) {
+    return authState.status === 'signed-in'
+      ? 'Google sign-in is ready. Android cloud data remains disabled in this milestone.'
+      : 'Log in with Google. Android cloud data remains disabled in this milestone.';
+  }
   if (capabilities.recordSync) {
     return presentRecordSyncStatus(recordSyncState, recordOutboxCount, hasRecordSyncBinding()).detail;
   }
@@ -1910,13 +1917,13 @@ async function handleAuthStateChange(next: AuthState): Promise<void> {
     syncDialogRefresh?.();
     render();
     if (next.status === 'signed-out') {
-      if (cloudLocation()) await disconnectSyncUnsafe();
+      if (capabilities.cloudSync && cloudLocation()) await disconnectSyncUnsafe();
       return;
     }
     if (next.status !== 'signed-in' || !next.userId) return;
-    if (cloudLocation() && cloudLocation()?.accountId !== next.userId) await disconnectSyncUnsafe();
+    if (capabilities.cloudSync && cloudLocation() && cloudLocation()?.accountId !== next.userId) await disconnectSyncUnsafe();
   });
-  if (next.status === 'signed-in' && next.userId) {
+  if (capabilities.supabaseSync && next.status === 'signed-in' && next.userId) {
     await inspectAuthenticatedAccount();
     if (sessionContentDirty) scheduleSyncPublication(saveSequence);
   }
@@ -1978,7 +1985,7 @@ function openSyncDialog() {
     if (syncDialogElement === editor.dialog) syncDialogElement = null;
     syncDialogRefresh = null;
   }, { once: true });
-  const intro = element('p', '', 'Sync Backlogger across your Windows devices with one Google account.');
+  const intro = element('p', '', 'Sync Backlogger across your devices with one Google account.');
   const statusLine = element('p', 'import-summary');
   const accountLine = element('p', 'import-summary');
   const controls = element('div', 'sync-controls');
@@ -2003,10 +2010,10 @@ function openSyncDialog() {
     const signedIn = authState.status === 'signed-in' && Boolean(authState.userId);
     const connected = hasActiveSyncBinding();
     loginButton.hidden = signedIn;
-    loginButton.disabled = !capabilities.supabaseSync || !authState.configured || authState.status === 'signing-in' || !syncReady;
+    loginButton.disabled = !capabilities.supabaseAuth || !authState.configured || authState.status === 'signing-in' || !syncReady;
     cancelLoginButton.hidden = authState.status !== 'signing-in';
-    startButton.hidden = !signedIn || connected;
-    startButton.disabled = !syncReady || Boolean(cloudInspectionInFlight);
+    startButton.hidden = !capabilities.cloudSync || !signedIn || connected;
+    startButton.disabled = !capabilities.cloudSync || !syncReady || Boolean(cloudInspectionInFlight);
     syncNowButton.hidden = !connected;
     syncNowButton.disabled = !connected || (capabilities.recordSync ? recordSyncState?.status === 'paused' : syncState.status === 'paused');
     pauseButton.hidden = !connected;
@@ -2024,7 +2031,9 @@ function openSyncDialog() {
     if (!authState.configured) accountLine.textContent = 'Sync is not configured for this build.';
     else if (signedIn) {
       const email = authState.email ?? 'Google account';
-      if (capabilities.recordSync) {
+      if (!capabilities.cloudSync) {
+        accountLine.textContent = `Signed in as ${email}. Cloud data remains disabled on Android until the next milestone.`;
+      } else if (capabilities.recordSync) {
         const inspection = recordCloudInspection?.accountId === authState.userId ? recordCloudInspection : null;
         accountLine.textContent = inspection?.error
           ? `Signed in as ${email}. ${inspection.error}`
@@ -2121,7 +2130,7 @@ function openSyncDialog() {
     try {
       if (capabilities.recordSync) await stopRecordSyncRuntime();
       await signOutAuth();
-      if (!capabilities.recordSync) await disconnectSync();
+      if (!capabilities.recordSync && capabilities.cloudSync) await disconnectSync();
       setStatusMessage('Logged out. Local tasks and recoverable sync state were kept.');
       refresh();
     } catch (error) {
@@ -2588,8 +2597,10 @@ function render() {
     importButton.title = 'Import and export will be available in a later Android milestone.';
     exportButton.title = 'Import and export will be available in a later Android milestone.';
   }
-  syncButton.textContent = hasActiveSyncBinding() ? 'Sync' : 'Log in to Sync';
-  syncButton.disabled = !storageReady || closeInProgress || !capabilities.cloudSync || !syncReady;
+  syncButton.textContent = hasActiveSyncBinding() || (authState.status === 'signed-in' && !capabilities.cloudSync)
+    ? 'Sync settings'
+    : 'Log in to Sync';
+  syncButton.disabled = !storageReady || closeInProgress || !capabilities.supabaseAuth || !syncReady;
   undoButton.disabled = !editingReady;
   renderStatusBar();
   if (notebook.categories.length === 0) {
@@ -2857,6 +2868,7 @@ document.addEventListener('visibilitychange', () => {
 setInterval(refreshDateState, 30_000);
 
 async function attemptPendingSync() {
+  if (!capabilities.cloudSync) return;
   if (capabilities.recordSync) {
     if (recordSyncState?.status !== 'paused' && recordSyncWorker && hasRecordSyncBinding()) {
       await recordSyncWorker.runCycle().catch(async () => {
@@ -2923,14 +2935,29 @@ applyTheme();
 render();
 setStorageNotice('Loading local data…', 'Checking this device for a saved backlog.');
 subscribeAuthState(next => { void handleAuthStateChange(next); });
-window.addEventListener('focus', () => {
+function scheduleAbandonedSignInCancellation() {
   const pendingSince = signInStartedAt;
   if (authState.status !== 'signing-in' || pendingSince === null || Date.now() - pendingSince < 1500) return;
-  window.setTimeout(() => {
-    if (authState.status !== 'signing-in' || signInStartedAt !== pendingSince) return;
+  if (signInReturnTimer) window.clearTimeout(signInReturnTimer);
+  signInReturnTimer = window.setTimeout(() => {
+    signInReturnTimer = null;
+    if (authState.status !== 'signing-in' || signInStartedAt !== pendingSince || isAuthCallbackInFlight()) return;
     cancelGoogleSignIn();
     setStatusMessage('Google sign-in canceled. You can try again.');
-  }, 500);
+  }, capabilities.runtime === 'android' ? 3000 : 500);
+}
+
+window.addEventListener('focus', scheduleAbandonedSignInCancellation);
+
+async function installNativeAuthReturnHandler() {
+  if (capabilities.runtime !== 'android') return;
+  await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    if (focused) scheduleAbandonedSignInCancellation();
+  });
+}
+
+void installNativeAuthReturnHandler().catch(() => {
+  // DOM focus remains the fallback; authentication stays manually cancelable.
 });
 void loadInitialData();
 void initializeAuth().catch(() => undefined);
