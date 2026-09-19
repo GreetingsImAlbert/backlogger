@@ -20,6 +20,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 - Temporary Windows sync rollback build: `npm.cmd run windows:build:legacy-sync`. The normal build defaults to the v2 record protocol.
 - Android first setup: `npm.cmd run tauri -- android init --ci --skip-targets-install`. The generated `src-tauri/gen/` tree is ignored.
 - Android development: `npm.cmd run android:dev`. Emulator debug APK: `npm.cmd run android:build`; the current script targets x86_64 and is not a signed production build.
+- Android arm64 release: set `BACKLOGGER_ANDROID_KEYSTORE`, `BACKLOGGER_ANDROID_KEY_ALIAS`, `BACKLOGGER_ANDROID_STORE_PASSWORD`, and `BACKLOGGER_ANDROID_KEY_PASSWORD` in the current PowerShell session, then run `npm.cmd run android:release`; use `npm.cmd run android:release:aab` only when an AAB is needed. Keep the keystore outside the repository and never commit generated signing properties or passwords.
 - Android builds on Windows require Android Studio/SDK/NDK, Rust Android targets, and Windows Developer Mode for symlinks.
 
 ## Supabase workflow

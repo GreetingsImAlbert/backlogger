@@ -11,15 +11,15 @@ Your tasks are saved directly on your device. There is no required account, subs
 - Today and Tomorrow views
 - Drag-and-drop prioritization with keyboard-friendly alternatives
 - Light/dark mode and multiple color themes
-- Automatic local saving and recovery, with JSON import/export on Windows
-- Optional live Windows sync while keeping offline editing available
+- Automatic local saving and recovery, with JSON import/export on Windows and Android
+- Optional live Windows/Android sync while keeping offline editing available
 
 ## Download
 
 Download the latest build from [GitHub Releases](../../releases).
 
 - **Windows:** run the `.exe` installer. Releases are currently unsigned, so Windows may show an Unknown publisher or SmartScreen warning.
-- **Android:** install the Android APK. The current Android release supports local use; cloud sync and document import/export are still being implemented.
+- **Android:** install the arm64 release APK on a physical Android phone. Android builds are released independently from Windows.
 
 Windows and Android versions are released independently even though they share this repository.
 
@@ -100,7 +100,13 @@ npm.cmd run android:dev
 npm.cmd run android:build
 ```
 
-Android currently has native local persistence; cloud sync and document import/export remain disabled pending the milestones in [mobile-implementation.md](mobile-implementation.md). The current debug build targets x86_64 and is not a signed production release.
+`android:build` creates an unsigned x86_64 debug APK for an emulator. For a physical arm64 release APK, create the external production keystore and set the four `BACKLOGGER_ANDROID_*` signing variables described in [mobile-implementation.md](mobile-implementation.md), then run:
+
+```powershell
+npm.cmd run android:release
+```
+
+The optional Play Store bundle command is `npm.cmd run android:release:aab`. The release script writes only ignored generated signing properties, keeps the keystore outside the repository, verifies the APK signature, and prints the artifact hash. Android local persistence, document import/export, and optional foreground Supabase sync are enabled; sync still requires login and remains unnecessary for local use.
 
 ## Project layout
 

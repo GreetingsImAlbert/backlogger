@@ -1,6 +1,6 @@
 # Android implementation plan
 
-Status: Milestones 1–5 are complete and accepted. Milestone 6 document-provider import/export and mobile layout work are implemented; final provider/accessibility acceptance remains. Windows and Android share the record-level Supabase v2 protocol, polling recovery, restored-session handling, and Realtime wake-ups rather than the retired snapshot protocol.
+Status: Milestones 1–7 are complete and accepted. Milestone 8 release wiring is implemented; production keystore setup and physical-device release evidence remain. Windows and Android share the record-level Supabase v2 protocol, polling recovery, restored-session handling, and Realtime wake-ups rather than the retired snapshot protocol.
 
 Backlogger remains one Tauri 2 repository. Windows and Android share TypeScript, CSS, Rust, SQLite schema, and sync modules, but their release versions may differ. Local-only use must always work without an account or network.
 
@@ -198,7 +198,7 @@ The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realti
 - Added safe-area and dynamic-viewport dialog sizing, keyboard/landscape spacing, touch-scroll behavior that leaves drag handles isolated, and an accessible hidden import control. Updated the viewport for cutout-safe Android layouts.
 - Verification passed: TypeScript, 131 tests, production build, Rust format/check, secret scan, Windows NSIS build, and x86_64 debug APK build. API 36 x86_64 emulator `emulator-5554` installed and launched the APK; export opened the Android `ACTION_CREATE_DOCUMENT` provider and wrote a 362-byte portable JSON, import reopened it through `ACTION_GET_CONTENT`, previewed the validated replacement, and saved it. Picker cancellation returned without an error status. Crash log was empty for the flow.
 - Emulator APK: `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`; SHA-256 `2C16C6978A3559DA1FCCBBA3DFB54EC45716C4225912498162E0A9C958EB107E`.
-- Remaining user acceptance: denied/revoked provider access, unwritable destinations, malformed/future files, interrupted import/export, rotation, smallest supported viewport, keyboard focus, font scaling, TalkBack, and touch reorder. Milestone 7 can begin after those checks pass.
+- User acceptance completed: denied/revoked provider access, unwritable destinations, malformed/future files, interrupted import/export, rotation, smallest supported viewport, keyboard focus, font scaling, TalkBack, and touch reorder all passed. Milestone 7 is ready for cross-platform acceptance.
 
 ## Milestone 7 — Windows/Android acceptance
 
@@ -216,11 +216,35 @@ The existing `sync_v2_*` tables, ledger, sequence, RPCs, RLS, grants, and Realti
 
 **Prerequisites:** Milestone 7, Gate D, and an Android version chosen by the user.
 
-1. Add ignored external signing configuration; never commit keystore paths, aliases, or passwords.
-2. Keep Android version independent from the Windows-only override. Add repeatable signed arm64 APK and optional AAB commands.
+1. Create and back up a production upload keystore outside the repository. In PowerShell, use the JDK `keytool` (choose and store the passwords privately):
+
+   ```powershell
+   $keystorePath = Join-Path $env:USERPROFILE 'backlogger-upload.jks'
+   & "$env:JAVA_HOME\bin\keytool.exe" -genkeypair -v -keystore $keystorePath -storetype JKS -keyalg RSA -keysize 2048 -validity 10000 -alias backlogger-upload
+   ```
+
+   In the same PowerShell session, set the signing variables (the password prompts do not put the values in the command text):
+
+   ```powershell
+   $env:BACKLOGGER_ANDROID_KEYSTORE = $keystorePath
+   $env:BACKLOGGER_ANDROID_KEY_ALIAS = 'backlogger-upload'
+   $env:BACKLOGGER_ANDROID_STORE_PASSWORD = Read-Host 'Keystore password'
+   $env:BACKLOGGER_ANDROID_KEY_PASSWORD = Read-Host 'Key password'
+   ```
+
+   Do not paste passwords into chat, source, Git, or release notes. The build script writes ignored `src-tauri/gen/android/keystore.properties` and rejects a keystore located inside the repository.
+2. Keep Android version independent from the Windows-only override. The tracked Android override is currently `0.1.1` with version code `1001`; `BACKLOGGER_ANDROID_VERSION_NAME` may optionally name a one-off artifact. Run `npm.cmd run android:release` for a signed arm64 APK or `npm.cmd run android:release:aab` for an optional Play bundle.
 3. Build, SHA-256 hash, install, and test the signed APK on the physical phone; build/hash the AAB only if store distribution is planned.
 4. Repeat local persistence, force-stop, OAuth restore/cancel/logout, two-way live/offline sync, documents, rotation, keyboard, touch, font scaling, TalkBack, recovery, update install, and reinstall/reconnect.
 5. Rebuild/smoke-test Windows and update release documentation with artifact names, hashes, direct-install instructions, optional sync behavior, foreground limitations, recovery/export guidance, and signing procedure without secrets.
+
+### Milestone 8 handoff
+
+- Added `scripts/build-android-release.mjs` plus `android:release` and `android:release:aab` package commands. The script initializes the generated Android project when needed, writes ignored signing properties from environment variables, configures the generated release signing block idempotently, builds arm64, verifies APK signatures, and prints the SHA-256 hash.
+- Set the tracked Android override to version `0.1.1` with version code `1001`; the Windows-only override remains `0.1.5`.
+- Rebuilt the local-use arm64 release APK at `src-tauri/gen/android/app/build/outputs/apk/universal/release/Backlogger_0.1.1_android-arm64.apk`; 18.55 MiB; SHA-256 `FC14B158B0F97CC8ABB1B65DB7F7B5A1E85F5BE31825C8B3B62D74F79E2C0A21`. It is signed with the existing Android debug certificate for GitHub sideloading, not a production keystore.
+- Updated the Android README instructions and kept Android versioning independent from the Windows-only configuration.
+- Checks still required after signing setup: standard checks above, the signed arm64 build, physical-device acceptance, and final Windows smoke/build. No production keystore or password was created or read in this milestone.
 
 **Done when:** the signed arm64 APK passes physical-device acceptance, optional AAB is reproducible, security checks pass, and Windows remains unaffected.
 
